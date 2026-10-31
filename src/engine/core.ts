@@ -81,15 +81,13 @@ export interface Limits {
 /**
  * The floors of v2.0 (04 Table 4.10a), which the engine uses until a correct value arrives (07 [MUT-75]).
  *
- * SPEC-QUESTION: 07 [MUT-75] "MUST use the field's floor in 04 §4.10 until a non-zero value for the field arrives; for a field
- * without a floor, it uses the field's default there", with 04 §4.10 "the lower end of its range is its floor" for
- * `max_offline_seconds`, which has no row in Table 4.10a: its range is 3,600 s to 31,536,000 s and its default 2,592,000 s (04
- * [MAN-73]). Readings: (a) the floor is the lower end of the range, 1 h; (b) the field has no floor in Table 4.10a, so its
- * default stands, 30 d. The engine takes (b): with (a) a server that sent 0 would make the client end held actions and drop its
- * journal after an hour, which loses outcomes that the server still keeps. The Go server never sends 0 here, so no vector decides it.
+ * 07 [MUT-75] "MUST use the field's floor in 04 §4.10 until a non-zero value for the field arrives". For
+ * `max_offline_seconds` the floor is the lower end of its range, 3,600 s (04 §4.10 after Table 4.10b: "the lower end of its
+ * range is its floor", with [MAN-73]'s range 3,600 s to 31,536,000 s). Ruled by the spec coordinator on 2026-10-31
+ * (SPEC-QUESTIONS Q32); a 0 is also reported as a protocol error.
  */
 export const FLOOR_LIMITS: Limits = {
-  maxOfflineMs: 30 * 24 * 3600 * 1000,
+  maxOfflineMs: 3600 * 1000,
   maxMutationsPerRequest: 50,
   maxRequestBytes: 1 << 20,
   maxInflightGated: 8,
