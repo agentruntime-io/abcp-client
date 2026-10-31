@@ -1,0 +1,190 @@
+// The SYSTEM records (06 §6.7): which of a record's changes the fold applies and what each kind does besides (05 [STATE-34]).
+
+import type { KeyChange, Record as RecordMessage } from "../../gen/abpc/v2/types_pb.js";
+import { SystemKind } from "../../gen/abpc/v2/types_pb.js";
+import { JsonV1Error } from "../jsonv1/errors.js";
+import { type JsonValue, isInteger } from "../jsonv1/value.js";
+import { parse } from "../jsonv1/parse.js";
+import { refuse } from "./errors.js";
+import { expandKeyTemplate, matchKeyTemplate, parseKeyTemplate } from "./template.js";
+import type { ReplicaState } from "./state.js";
+
+/** What a SYSTEM kind does besides applying its changes (06 §6.7, 05 [STATE-34]). */
+export interface SystemEffect {
+  /** The record's DELETEs leave tombstones that carry the redaction mark (a `REDACTED` record, 05 [STATE-37]). */
+  mark: boolean;
+  /**
+   * The erased keys that the record takes: a nested marker key among them that was present just before the record gets a marked
+   * entity tombstone (05 [STATE-37], 06 [LOG-44]).
+   */
+  markKeys: ReadonlySet<string>;
+  /** For a `TEMPLATE_CONVERSION` record, gives the key that a change's key was converted from (05 [STATE-67]). */
+  keep?: (c: KeyChange) => string | undefined;
+  /** Runs after the record's changes. */
+  finish?: (st: ReplicaState) => void;
+}
+
+/** A record's applied changes, and what its SYSTEM kind does besides. */
+export interface Selection {
+  /** The indexes of the changes that the record's kind applies (05 [STATE-34]). */
+  applied: number[];
+  /** A SYSTEM record of an unknown kind that the reader skips (06 [LOG-41]). */
+  skip?: boolean;
+  sys?: SystemEffect;
+}
+
+const NO_KEYS: ReadonlySet<string> = new Set();
+
+/** The encoding of every SYSTEM body (06 [LOG-39]). */
+const BODY_ENCODING = "json/v1";
+
+/**
+ * Reads a SYSTEM record: the kinds of 06 §6.7 and their effects. SYSTEM records change keys only as the table of 06 [LOG-41]
+ * says, and the fold applies the changes of the kinds that carry any.
+ */
+export function selectSystem(rec: RecordMessage, all: () => number[]): Selection {
+  const seq = rec.seq;
+  const sys = rec.system;
+  if (sys === undefined) throw refuse("malformed", seq, "LOG-39", "a SYSTEM record with no system event");
+  const noChanges = (what: string): Selection => {
+    if (rec.changes.length > 0) {
+      // LOG-41: a SYSTEM record of this kind changes no key.
+      //
+      // SPEC-QUESTION: 06 [LOG-39] table, "Changes: none" for this kind (SPEC-QUESTIONS Q13), and 05 [STATE-34] "SYSTEM: the changes
+      // its kind defines". The text does not say what a reader that knows the kind does with changes that the kind does not
+      // define: (a) ignores them, (b) refuses the record as malformed. No server writes one; the code refuses it, as the Go server does.
+      throw refuse("malformed", seq, "LOG-41", `a ${what} record carries ${rec.changes.length} changes`);
+    }
+    return { applied: [] };
+  };
+  switch (sys.kind) {
+    case SystemKind.MANIFEST_ACTIVATED:
+      // LOG-42: no change; the version in force changes for the records after it, each of which names its own.
+      return noChanges("MANIFEST_ACTIVATED");
+    case SystemKind.SUBTREE_CLEANUP:
+      // LOG-45, STATE-44: the physical removal of rows that the subtree deletion already hid: no logical change.
+      return noChanges("SUBTREE_CLEANUP");
+    case SystemKind.LIFECYCLE:
+      return noChanges("LIFECYCLE");
+    case SystemKind.EPOCH_ADVANCED:
+      // LOG-48: the first record of a log epoch; the state takes the epoch from the record.
+      return noChanges("EPOCH_ADVANCED");
+    case SystemKind.FLOOR_RAISED:
+      return noChanges("FLOOR_RAISED");
+    case SystemKind.BLOB_DELETED:
+      return noChanges("BLOB_DELETED");
+    case SystemKind.PRUNE_FLOOR_RAISED:
+      // LOG-80: the prune floor is a fact of the log, not of the state; no change.
+      return noChanges("PRUNE_FLOOR_RAISED");
+    case SystemKind.KEY_EXPIRED:
+      // LOG-46: a reader applies the record's changes, the DELETEs of the named keys, whatever its cause.
+      return { applied: all(), sys: { mark: false, markKeys: NO_KEYS } };
+    case SystemKind.TEMPLATE_CONVERSION:
+      return selectConversion(rec, all);
+    case SystemKind.REDACTED:
+      return selectRedacted(rec, all);
+    case SystemKind.TOMBSTONES_DISCARDED:
+      return selectDiscard(rec);
+    default:
+      // LOG-41: a reader skips a SYSTEM record of a kind it does not know, unless the record must be understood or carries
+      // changes; then LOG-11 stops it.
+      if (sys.mustUnderstand || rec.changes.length > 0) {
+        throw refuse("unknown-system-kind", seq, "LOG-11", `SYSTEM kind ${sys.kind} (must_understand ${sys.mustUnderstand}, ${rec.changes.length} changes)`);
+      }
+      return { applied: [], skip: true };
+  }
+}
+
+/** Reads the body of a SYSTEM record. Readers ignore unknown members (06 [LOG-39]). */
+function readBody(rec: RecordMessage): Map<string, JsonValue> {
+  const sys = rec.system;
+  if (sys === undefined || sys.encoding !== BODY_ENCODING) {
+    throw refuse("malformed", rec.seq, "LOG-39", `SYSTEM body encoding "${sys?.encoding}"`);
+  }
+  let v: JsonValue;
+  try {
+    v = parse(sys.body);
+  } catch (e) {
+    if (e instanceof JsonV1Error) throw refuse("malformed", rec.seq, "LOG-39", `SYSTEM body: ${e.message}`);
+    throw e;
+  }
+  if (!(v instanceof Map)) throw refuse("malformed", rec.seq, "LOG-39", "SYSTEM body is not an object");
+  return v;
+}
+
+function stringMember(body: Map<string, JsonValue>, name: string, rec: RecordMessage): string {
+  const v = body.get(name);
+  if (v === undefined || v === null) return "";
+  if (typeof v !== "string") throw refuse("malformed", rec.seq, "LOG-39", `SYSTEM body: ${name} is not a string`);
+  return v;
+}
+
+function stringListMember(body: Map<string, JsonValue>, name: string, rec: RecordMessage): string[] {
+  const v = body.get(name);
+  if (v === undefined || v === null) return [];
+  if (!Array.isArray(v) || v.some((x) => typeof x !== "string")) {
+    throw refuse("malformed", rec.seq, "LOG-39", `SYSTEM body: ${name} is not a list of strings`);
+  }
+  return v as string[];
+}
+
+/**
+ * Reads a `TEMPLATE_CONVERSION` record (06 [LOG-43], 04 [MAN-66]). Its changes are applied; a key that it writes keeps the
+ * changed_at and changed_by of the key that it converted from (05 [STATE-67]), which is the source template's key bound by the
+ * same variable values as the target key (04 [MAN-66]).
+ */
+function selectConversion(rec: RecordMessage, all: () => number[]): Selection {
+  const body = readBody(rec);
+  const fromText = stringMember(body, "from_template", rec);
+  const toText = stringMember(body, "to_template", rec);
+  const from = parseKeyTemplate(fromText);
+  const to = parseKeyTemplate(toText);
+  if (from === undefined || to === undefined) {
+    throw refuse("malformed", rec.seq, "LOG-39", `TEMPLATE_CONVERSION templates "${fromText}" to "${toText}"`);
+  }
+  const keep = (c: KeyChange): string | undefined => {
+    const b = matchKeyTemplate(to, c.key);
+    return b === undefined ? undefined : expandKeyTemplate(from, b);
+  };
+  return { applied: all(), sys: { mark: false, markKeys: NO_KEYS, keep } };
+}
+
+/**
+ * Reads a `REDACTED` record (06 [LOG-44]). Its changes, the DELETEs of the redacted keys that were present and the SETs of run
+ * keys, are applied. Its DELETEs leave tombstones with the redaction mark, and every key of its `keys` that holds a key
+ * tombstone after it gets a reset seq (05 [STATE-37], [STATE-85]).
+ */
+function selectRedacted(rec: RecordMessage, all: () => number[]): Selection {
+  const body = readBody(rec);
+  const keys = stringListMember(body, "keys", rec);
+  const erased = stringListMember(body, "erased_keys", rec);
+  const markKeys = new Set<string>([...keys, ...erased]);
+  const finish = (st: ReplicaState): void => {
+    for (const k of keys) {
+      // STATE-85: the key's version after the record: the record's seq for a key that it deleted, the conversion's seq for a
+      // former path, which holds the tombstone that its conversion's DELETE gave it. Only a key tombstone carries a reset seq; a
+      // key under an entity tombstone, or with no tombstone, gets none.
+      const t = st.tombstone(k);
+      if (t !== undefined && t.kind === "key") st.setResetSeq(k, t.version);
+    }
+  };
+  return { applied: all(), sys: { mark: true, markKeys, finish } };
+}
+
+/**
+ * Reads a `TOMBSTONES_DISCARDED` record (06 [LOG-84], 05 [STATE-83]): no change, and the tombstones at or below `floor_seq` are
+ * discarded at the record.
+ */
+function selectDiscard(rec: RecordMessage): Selection {
+  if (rec.changes.length > 0) {
+    throw refuse("malformed", rec.seq, "LOG-84", `a TOMBSTONES_DISCARDED record carries ${rec.changes.length} changes`);
+  }
+  const body = readBody(rec);
+  const f = body.get("floor_seq");
+  if (typeof f !== "number" || !isInteger(f) || f < 0 || BigInt(f) >= rec.seq) {
+    // LOG-60: the floor is at or below the prune floor, which is below every later record.
+    throw refuse("malformed", rec.seq, "LOG-84", "TOMBSTONES_DISCARDED floor_seq is missing or not below the record");
+  }
+  const floor = BigInt(f);
+  return { applied: [], sys: { mark: false, markKeys: NO_KEYS, finish: (st) => st.discardTombstones(floor) } };
+}
