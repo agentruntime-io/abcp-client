@@ -27,6 +27,7 @@ export const MANIFEST: StaticManifestSpec = {
     CasSet: {},
     DocEdit: {},
     Approve: { lane: "GATED" },
+    ApproveQuiet: { lane: "GATED", logIntent: false },
     Fenced: {},
     Barrier: { barrier: true },
     Pay: { spend: true },

@@ -31,6 +31,7 @@ import {
   KeyspaceCursorSchema,
   KeyspaceLifecycle,
   RejectSchema,
+  RetryReason,
   StaleCause,
   StaleSchema,
   type KeyspaceCursor,
@@ -38,7 +39,7 @@ import {
   type SuccessorRule,
 } from "../gen/abpc/v2/types_pb.js";
 import { CloseReason, DropReason } from "../gen/abpc/v2/sync_pb.js";
-import { fullJitter, HOLD_BACKOFF, RECONNECT_BACKOFF, clampAfter } from "./backoff.js";
+import { CLIENT_BACKOFF, fullJitter, HOLD_BACKOFF, RECONNECT_BACKOFF, clampAfter, resendDelay } from "./backoff.js";
 import { codeName } from "./codes.js";
 import { makeReject } from "./endings.js";
 import { ProtocolViolation, RpcError } from "./errors.js";
@@ -106,7 +107,7 @@ export abstract class SessionLayer extends SenderLayer {
       },
       (e: unknown) => {
         this.busy--;
-        this.internalErrors.push(e);
+        this.noteInternalError(e);
       },
     );
   }
@@ -212,6 +213,9 @@ export abstract class SessionLayer extends SenderLayer {
     for (const f of follows) {
       f.onSession = true;
       f.resuming = false;
+      // 14 [CLI-24], [CLI-53], [CLI-64]: nothing is sent to the keyspace on this session until its `KeyspaceAdded` arrives with the
+      // epoch that the client follows: the server sends `Subscribed` first and `KeyspaceDropped{EPOCH_CHANGED}` after it
+      f.awaitingAdd = true;
     }
     const aborted = new Promise<{ done: true; value: undefined; aborted: true }>((resolve) => {
       ac.signal.addEventListener("abort", () => resolve({ done: true, value: undefined, aborted: true }), { once: true });
@@ -260,7 +264,10 @@ export abstract class SessionLayer extends SenderLayer {
       s.watchdog = undefined;
       s.state = "idle";
       s.id = "";
-      for (const f of this.followList()) f.onSession = false;
+      for (const f of this.followList()) {
+        f.onSession = false;
+        f.awaitingAdd = false;
+      }
       ac.abort();
     }
   }
@@ -293,6 +300,7 @@ export abstract class SessionLayer extends SenderLayer {
     for (const f of this.followList()) {
       f.onSession = false;
       f.resuming = false;
+      f.awaitingAdd = false;
     }
     switch (end.kind) {
       case "reconnect":
@@ -331,6 +339,11 @@ export abstract class SessionLayer extends SenderLayer {
         break;
       case "Unavailable":
         if (error.retry?.reason === 6 /* AUTHORIZER_UNAVAILABLE */) this.holdApp("AUTHORIZER_UNAVAILABLE", "AUTHORIZER_UNAVAILABLE");
+        else if (error.retry?.reason === RetryReason.KEYSPACE_SEEDING) {
+          // 14 [CLI-44]: a `Subscribe` that names a successor that is not seeded yet is refused as a whole; the client sends the whole
+          // `Subscribe` again, unchanged, with the backoff of [CLI-43]; a `Retry` has no age bound of its own, and no hold
+          this.sess.reconnectAfter = Math.max(clampAfter(error.retry.afterMs), fullJitter(Math.max(0, this.sess.attempts - 1), CLIENT_BACKOFF, this.random));
+        }
         break;
       case "Unimplemented":
         this.sess.fatal = true;
@@ -417,6 +430,7 @@ export abstract class SessionLayer extends SenderLayer {
     if (cur === undefined) return;
     const f = this.follows.get(cur.keyspaceId);
     if (f === undefined || !f.loaded) return;
+    f.awaitingAdd = false;
     if (cur.logEpoch !== 0 && cur.logEpoch !== f.logEpoch) {
       this.onEpochMismatch(f);
       return;
@@ -425,6 +439,7 @@ export abstract class SessionLayer extends SenderLayer {
     f.onSession = true;
     f.watermark = cur.afterSeq;
     f.resuming = false;
+    this.schedulePump(); // the epoch is the one that the client follows: the keyspace may be sent to
     if (cur.afterSeq > f.state.seq) {
       f.state.setCursor(cur.afterSeq, f.logEpoch, f.state.manifestVersion);
       await this.afterCursorMoved(f);
@@ -437,6 +452,7 @@ export abstract class SessionLayer extends SenderLayer {
     if (f === undefined) return;
     f.onSession = false;
     f.resuming = false;
+    f.awaitingAdd = false; // the drop reason decides what the client does with the keyspace now
     const successors: SuccessorRule[] = [...d.successors];
     switch (d.reason) {
       case DropReason.GRANT_CHANGED:
@@ -448,6 +464,7 @@ export abstract class SessionLayer extends SenderLayer {
         // TODO(14 [CLI-66], R/C3 §14.9): purge the purge list and quarantine the outbox; the client only holds the keyspace here
         f.stopped = "ACCESS_REVOKED";
         this.holdKeyspace("ACCESS_REVOKED", "ACCESS_REVOKED", f.id);
+        await this.retireAtOnce(f);
         return;
       case DropReason.MOVED:
         f.stopped = "MOVED";
@@ -479,6 +496,7 @@ export abstract class SessionLayer extends SenderLayer {
       case DropReason.NOT_FOUND:
         f.stopped = "NOT_FOUND";
         this.holdKeyspace("KEYSPACE_NOT_FOUND", "NOT_FOUND", f.id, this.serverNow() + this.limits.keyspaceNotFoundWaitMs);
+        await this.retireAtOnce(f);
         return;
       default:
         // 15 [COMPAT-42]: stop following, keep the local copy, hold the queued actions, report, and add the keyspace again with the hold backoff
@@ -489,12 +507,7 @@ export abstract class SessionLayer extends SenderLayer {
 
   /** 14 [CLI-7]: when the client stops following a keyspace, an action with a successful outcome in the epoch of its cursor retires at once. */
   private async retireAtOnce(f: Follow): Promise<void> {
-    for (const e of this.entriesOf(f.id)) {
-      const o = e.outcome;
-      if (o === undefined || (o.kind === "decided" && o.status !== "COMMITTED") || this.ending.has(e.mutationId) || e.stuck !== undefined) continue;
-      if (o.logEpoch === f.logEpoch) await this.retire(e);
-      else this.needEpochResolution(f);
-    }
+    await this.checkRetirements(f); // the same rule judges an outcome that is learned later (a poll, a resend)
   }
 
   /** `DELETED` (14 [CLI-7], [CLI-83]): the actions of the keyspace end; one whose outcome cannot be learned is reported as outcome unknown. */
@@ -555,36 +568,34 @@ export abstract class SessionLayer extends SenderLayer {
   }
 
   private addToSession(f: Follow): void {
-    this.detach(
-      (async () => {
-        try {
-          await this.transport.updateSubscription(create(UpdateSubscriptionRequestSchema, { sessionId: this.sess.id, add: [this.cursorOf(f)] }));
-          f.onSession = true;
-        } catch {
-          this.sess.abort?.abort(); // the session resumes from the cursors (09 [READ-57])
-        }
-      })(),
-    );
+    this.detach(this.addNow(f));
   }
 
-  /** Loads a keyspace that needs it, then adds it to the live session. */
-  private async syncAndAdd(f: Follow): Promise<void> {
-    const ok = await this.syncKeyspace(f);
-    if (!ok || this.sess.state !== "live" || !this.subscribable(f)) return;
+  /**
+   * Names the keyspace to the live session with `UpdateSubscription` and acts on the rejection of the add (09 [READ-62]). Nothing is
+   * sent to the keyspace until its `KeyspaceAdded` has come (see `runSession`).
+   */
+  private async addNow(f: Follow): Promise<void> {
+    f.awaitingAdd = true;
     let resp;
     try {
       resp = await this.transport.updateSubscription(create(UpdateSubscriptionRequestSchema, { sessionId: this.sess.id, add: [this.cursorOf(f)] }));
     } catch {
-      this.sess.abort?.abort();
+      this.sess.abort?.abort(); // the session resumes from the cursors (09 [READ-57])
       return;
     }
     await this.run(() => {
       for (const rej of resp.rejected) {
         if (rej.keyspaceId !== f.id) continue;
         if (rej.outcome.case === "retry") {
-          // KEYSPACE_SEEDING, AUTHORIZER_UNAVAILABLE: add again with the hold backoff (14 [CLI-44], Table 14.1)
-          this.holdKeyspace("UNKNOWN_DROP_REASON", "RETRY", f.id);
+          // `KEYSPACE_SEEDING`, `AUTHORIZER_UNAVAILABLE`: a `Retry`, which has no age bound of its own (14 [CLI-44], 04 Table 4.11). It is no
+          // hold of Table 14.1: the keyspace is added again, unchanged, after the larger of `after_ms` and the client backoff (14 [CLI-43])
+          const delay = resendDelay(f.addFailures++, rej.outcome.value.afterMs, this.random);
+          this.after(delay, () => {
+            if (this.sess.state === "live" && !f.onSession && this.subscribable(f)) this.addToSession(f);
+          });
         } else if (rej.outcome.case === "reject") {
+          f.awaitingAdd = false;
           const code = rej.outcome.value.code;
           if (code === Code.PERMISSION_DENIED) f.stopped = "GRANT_CHANGED";
           else if (code === Code.KEYSPACE_NOT_FOUND) {
@@ -595,7 +606,15 @@ export abstract class SessionLayer extends SenderLayer {
         return;
       }
       f.onSession = true;
+      f.addFailures = 0;
     });
+  }
+
+  /** Loads a keyspace that needs it, then adds it to the live session. */
+  private async syncAndAdd(f: Follow): Promise<void> {
+    const ok = await this.syncKeyspace(f);
+    if (!ok || this.sess.state !== "live" || !this.subscribable(f)) return;
+    await this.addNow(f);
   }
 
   /** Re-adds a keyspace after a hold (14 [CLI-45]): a load as a resume check, then the add. */
@@ -621,13 +640,17 @@ export abstract class SessionLayer extends SenderLayer {
   }
 
   protected followSuccessors(rules: readonly SuccessorRule[]): void {
+    const added: Follow[] = [];
     for (const r of rules) {
       if (r.keyspaceId === "" || this.follows.has(r.keyspaceId)) continue;
       const nf = new Follow(r.keyspaceId, this.random);
       nf.needsLoad = { cause: "COLD_LOAD", resume: false };
       this.follows.set(r.keyspaceId, nf);
+      added.push(nf);
     }
-    this.kick();
+    // 09 [READ-70]: each successor is cold-loaded and added; on a live session at once, otherwise with the next session
+    for (const nf of added) this.kick(nf);
+    if (added.length === 0) this.kick();
   }
 
   protected resumeKeyspace(f: Follow): void {
@@ -651,6 +674,16 @@ export abstract class SessionLayer extends SenderLayer {
     );
   }
 
+  /**
+   * The manifest version in force for a keyspace: the `manifest_version` of a `LoadState` (14 Table 14.1). A resume check from the
+   * cursor is the cheapest load (09 [READ-17]), a page of one entry bounds a cold one, and nothing of it is installed.
+   */
+  protected async manifestVersionInForce(f: Follow): Promise<number> {
+    const cursor = create(KeyspaceCursorSchema, f.loaded ? this.cursorFields(f) : { keyspaceId: f.id });
+    const resp = await this.transport.loadState(create(LoadStateRequestSchema, { cursor, clientId: this.clientId, pageToken: "", pageSize: 1, supportedFeatures: [...this.features] }));
+    return resp.manifestVersion;
+  }
+
   /** Loads a keyspace: the pages, then the install (14 [CLI-2], [CLI-18], 09 [READ-18]). Returns false when the load did not happen. */
   protected async syncKeyspace(f: Follow): Promise<boolean> {
     const need = f.needsLoad ?? (f.loaded ? undefined : { cause: "COLD_LOAD", resume: false });
@@ -670,6 +703,7 @@ export abstract class SessionLayer extends SenderLayer {
       return await this.run(async () => {
         try {
           const out = this.installLoad(f, pages, need.cause, need.resume);
+          f.loadFailures = 0;
           this.stopHold("PROTOCOL_ERROR", f.id);
           this.stopHold("HISTORY_DIVERGED", f.id);
           this.stopHold("UNKNOWN_DROP_REASON", f.id);
@@ -773,8 +807,15 @@ export abstract class SessionLayer extends SenderLayer {
         this.emit({ type: "protocol-error", what: "LoadState", detail: "Unimplemented (15 [COMPAT-6])", keyspaces: [f.id] });
         break;
       default:
-        // transient: the session loop tries again with the reconnect backoff
+        // transient: the session loop tries again with the reconnect backoff, and a live session loads the keyspace again with the
+        // client backoff (14 [CLI-43]): the load of a keyspace that is added to a live session is no part of the session loop
         this.sess.attempts = Math.max(this.sess.attempts, 1);
+        if (this.sess.state === "live") {
+          const delay = resendDelay(f.loadFailures++, undefined, this.random);
+          this.after(delay, () => {
+            if (this.needsLoad(f)) this.kick(f);
+          });
+        }
     }
   }
 
@@ -885,8 +926,18 @@ export abstract class SessionLayer extends SenderLayer {
       });
       return;
     }
+    // 14 [CLI-53]: the events of the answers come in the authoring order of the actions, journalled and pending alike, so an action's
+    // events (`reverted`, `conflict`, the handler, `rejected`) all come before those of the next action: each answer is acted on as a task of
+    // its own, and the conflict that it began is finished, outside the queue, before the next answer is acted on
+    for (const it of items) {
+      const ans = answers.get(it.id);
+      if (ans === undefined) continue;
+      await this.run(() => this.applyAnswer(f, it, ans));
+      await this.conflictFlows.get(it.id)?.catch(() => undefined);
+    }
     await this.run(async () => {
-      await this.applyAnswers(f, items, answers);
+      await this.flushDirty();
+      await this.checkRetirements(f);
       this.epochFlows.delete(f.id);
       // every answer is in: re-identify and re-stamp, then the keyspace is sent to again ([CLI-63], [CLI-64])
       this.reidentify("EPOCH_CHANGED");
@@ -906,23 +957,18 @@ export abstract class SessionLayer extends SenderLayer {
     });
   }
 
-  /** Acts on each answer in the authoring order, journalled and pending alike (14 [CLI-53], [CLI-38]). */
-  private async applyAnswers(f: Follow, items: readonly EarlierEpochItem[], answers: ReadonlyMap<string, GetMutationResultResponse>): Promise<void> {
-    for (const it of items) {
-      const ans = answers.get(it.id);
-      if (ans === undefined) continue;
-      if (it.kind === "pending") {
-        const e = this.entries.get(it.id);
-        if (e === undefined || this.ending.has(it.id)) continue;
-        await this.answerPending(f, e, ans);
-      } else {
-        const j = this.journal.get(it.id);
-        if (j === undefined) continue;
-        await this.answerJournal(f, j, ans);
-      }
+  /** Acts on one answer (14 [CLI-53], [CLI-38]); the answers are taken in the authoring order, journalled and pending alike. */
+  private async applyAnswer(f: Follow, it: EarlierEpochItem, ans: GetMutationResultResponse): Promise<void> {
+    if (it.kind === "pending") {
+      const e = this.entries.get(it.id);
+      if (e === undefined || this.ending.has(it.id)) return;
+      await this.answerPending(f, e, ans);
+    } else {
+      const j = this.journal.get(it.id);
+      if (j === undefined) return;
+      await this.answerJournal(f, j, ans);
     }
     await this.flushDirty();
-    await this.checkRetirements(f);
   }
 
   private async answerPending(f: Follow, e: OutboxEntry, ans: GetMutationResultResponse): Promise<void> {

@@ -201,6 +201,12 @@ function predict(st: ReplicaState, o: Overlay, ctx: PredictContext, mutationId: 
   } catch (e) {
     // 14 [CLI-20]: data that the server accepted never makes prediction throw. An INCR that leaves its range, a value that is not
     // a counter: the change has no predicted effect, and the key is shown as pending.
+    // SPEC-QUESTION: 14 [CLI-12] says that "the view of a counter is its confirmed value plus the deltas of every pending `INCR`", and
+    // 05 [STATE-28] that the server rejects an INCR whose result leaves the template's range with RANGE_EXCEEDED and applies none of its
+    // changes. Reading A (taken): an INCR that would leave the range is no part of the predicted counter (its key is shown as pending), as a
+    // CAS whose expectation fails has no predicted effect ([CLI-11]); the view never shows a value that the server will refuse.
+    // Reading B: the view is the plain sum of every pending delta, an out-of-range value included, until the server's RANGE_EXCEEDED
+    // ends that action and the view returns to the confirmed value plus the deltas that remain.
     if (!(e instanceof JsonV1Error)) {
       // any other failure is the same: no predicted effect
     }

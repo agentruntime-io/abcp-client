@@ -35,6 +35,8 @@ export interface OpTypeInfo {
   readonly spend: boolean;
   /** The templates that the op type may write (`writes`), for the local check of 14 [CLI-19]; absent: not checked. */
   readonly writes?: readonly string[];
+  /** `log_intent` (default true, 04 §4.5): with false a GATED action has no INTENT record, and its results carry `intent_seq = 0` (07 [MUT-8]). It is the server's; the fake reads it. */
+  readonly logIntent: boolean;
 }
 
 /** What the engine reads of one manifest version. */
@@ -79,6 +81,8 @@ export interface StaticOpType {
   offlineMode?: "queue_recheck" | "fail_fast";
   spend?: boolean;
   writes?: string[];
+  /** `log_intent`, default true: with false the fake server logs no INTENT record for a GATED action of the type. */
+  logIntent?: boolean;
 }
 
 export interface StaticManifestSpec {
@@ -119,6 +123,7 @@ class StaticVersion implements EngineManifest {
         barrier: o.barrier ?? false,
         offlineMode: o.offlineMode ?? "queue_recheck",
         spend: o.spend ?? false,
+        logIntent: o.logIntent ?? true,
         ...(o.writes !== undefined ? { writes: o.writes } : {}),
       };
       this.ops.set(name, info);

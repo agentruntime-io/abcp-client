@@ -2,6 +2,7 @@
 // action, stops sending in its scope (the lane, the keyspace, every keyspace of the app, or the action alone), is shown in the
 // sync status and in a `held` event, and is bounded (14 [CLI-45]).
 
+import type { Reject } from "../gen/abpc/v2/types_pb.js";
 import type { LaneName } from "./manifests.js";
 import type { HoldInfo } from "./types.js";
 
@@ -46,6 +47,8 @@ export interface Hold {
   attempts: number;
   /** The lane's head action that a probe resends. */
   probeId?: string;
+  /** The reject that started the hold, when one did: an action that the hold ends before it was ever sent is dead-lettered with it (14 [CLI-45]). */
+  reject?: Reject;
   /** The time of the next probe has come: the head action may be resent, the keyspace re-added, the call repeated. */
   probeDue?: boolean;
 }

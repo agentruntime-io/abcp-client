@@ -8,11 +8,24 @@
 //  - decide a GATED intent later, restore a keyspace (an epoch advance that voids bindings and ends intents, 07 [MUT-104]),
 //    freeze, archive, split and delete a keyspace, suspend the app, and close a session with any reason.
 //
-// What it does not do: it is no reference of the checks of 07 Table 7-1 (values are not validated against schemas, grants are
-// not judged); it checks what the engine's reactions depend on: the envelope, idempotency, lanes, the base epoch, preconditions,
-// CAS, entity tombstones, and CRDT well-formedness.
+// It answers as the Go server does on the points that a client's reactions depend on, so that a test that passes here means something:
+//
+//  - the order of 07 Table 7-1 (`server/internal/mutate/one.go`): the identity fields, the duplicate lookup, the keyspace's existence
+//    and freeze, the lane checks (a duplicate meets them too, `store/lanes.go`), the stored outcome of a duplicate, and only then
+//    KEYSPACE_ARCHIVED, the op type and its lane, the base epoch, the changes and the preconditions;
+//  - the intents of `store/gated.go`: `log_intent: false` logs no INTENT record and every result has `intent_seq` 0, a pending intent
+//    answers `Retry{LANE_NOT_READY}` while its lane wait is not satisfied (also to a resend and to `GetMutationResult`), and the
+//    in-flight cap of 07 [MUT-42] answers `Retry{RATE_LIMITED}` before registration;
+//  - the limits: a request over `max_mutations_per_request` or `max_request_bytes` is ResourceExhausted with no detail (07 [MUT-4]),
+//    an action over `max_action_bytes` is PAYLOAD_TOO_LARGE;
+//  - the lifecycle hold (11 [COORD-96]): a keyspace with an open item (a pending intent, a present hold key) cannot be archived, split or
+//    deleted; a split seeds the successors from the source at its split seq.
+//
+// What it does not do: it is no reference of the other checks of 07 Table 7-1 (values are not validated against schemas, grants are
+// not judged, key ownership and staged moves are not modelled); it checks what the engine's reactions depend on: the envelope,
+// idempotency, lanes, the base epoch, preconditions, CAS, entity tombstones, and CRDT well-formedness.
 
-import { create } from "@bufbuild/protobuf";
+import { create, toBinary } from "@bufbuild/protobuf";
 import { timestampFromMs } from "@bufbuild/protobuf/wkt";
 import * as Y from "yjs";
 import {
@@ -33,8 +46,10 @@ import {
   HeartbeatFrameSchema,
   LaneWatermarkSchema,
   LoadStateResponseSchema,
+  MutateRequestSchema,
   MutateResponseSchema,
   MutationResultSchema,
+  MutationSchema,
   RecordsFrameSchema,
   RefreshSessionResponseSchema,
   SubscribeResponseSchema,
@@ -103,13 +118,14 @@ import {
   type SuccessorRule,
 } from "../gen/abpc/v2/types_pb.js";
 import { checkWellFormed } from "../rules/crdt/index.js";
-import { applyRecord, ReplicaState, StateNull, StateValue, VersionTopology, isReservedKey, type Rule } from "../rules/fold/index.js";
+import { applyRecord, installEntry, ReplicaState, StateNull, StateValue, VersionTopology, isReservedKey, type Rule } from "../rules/fold/index.js";
 import { compareUtf8, toHex } from "../rules/bytes.js";
 import { sha256 } from "../rules/crypto.js";
 import { setHashProvider } from "../rules/crypto.js";
 import { nodeHashProvider } from "../rules/node-crypto.js";
 import { DEFAULT_CLASS } from "../engine/codes.js";
 import { appliedIndexes, planCrdt } from "../engine/crdt-view.js";
+import { matchSuccessor } from "../engine/successors.js";
 import { encodeContent } from "../engine/entry.js";
 import { RpcError, type RpcStatus } from "../engine/errors.js";
 import type { Clock } from "../engine/clock.js";
@@ -208,7 +224,22 @@ interface Binding {
   /** The outcome is final: the slot is consumed. A pending intent is bound and not consumed. */
   final: boolean;
   mutation?: Mutation;
+  /** The seq of the INTENT record; 0 for an intent of an op type with `log_intent: false` (07 [MUT-8]). */
   intentSeq?: bigint;
+  /** The keyspace's head when the intent was accepted: the position a restore judges it by (08 [GATE-93]); the INTENT's seq when logged. */
+  acceptedSeq?: bigint;
+}
+
+/** An intent that is registered and not decided (08 §8.2): what the Go store keeps in its intent entry. */
+interface PendingIntent {
+  mutation: Mutation;
+  principal: Principal;
+  intentSeq: bigint;
+  acceptedSeq: bigint;
+  /** The op type's `log_intent`. */
+  logged: boolean;
+  /** The lane wait (07 [MUT-37]): replaced by a resend while it is not satisfied (07 [MUT-39]), never unsatisfied again once it is. */
+  wait: { clientId: string; after: bigint; satisfied: boolean };
 }
 
 interface Voided {
@@ -240,7 +271,7 @@ class FakeKeyspace {
   ydocs = new Map<string, Y.Doc>();
   lastWriter = new Map<string, string>();
   /** Intents that are registered and not decided. */
-  pending = new Map<string, { mutation: Mutation; principal: Principal; intentSeq: bigint }>();
+  pending = new Map<string, PendingIntent>();
 
   constructor(
     readonly id: string,
@@ -360,6 +391,8 @@ export class FakeServer {
   readonly calls: { method: Method; sub: string; request: unknown; at: number }[] = [];
   private readonly keyspaces = new Map<string, FakeKeyspace>();
   private readonly clients = new Map<string, string>();
+  /** The newest client_id bound to each subject (07 [MUT-39]). */
+  private readonly newestClient = new Map<string, string>();
   private readonly sessions = new Set<FakeSession>();
   private injections: Injection[] = [];
   private readonly loads = new Map<string, { entries: KeyEntry[]; offset: number; checkpoint: bigint; epoch: number; manifestVersion: number }>();
@@ -518,11 +551,14 @@ export class FakeServer {
     const rowChange = create(KeyChangeSchema, { key: row, kind: ChangeKind.SET, value: new TextEncoder().encode(JSON.stringify({ status: d.status })), encoding: "json/v1" });
     const requested = p.mutation.changes;
     const committed = d.status === "COMMITTED";
+    // 06 [LOG-32]: COMMITTED: the requested changes, the effects, then the intent row; REJECTED: the intent row only, or, with `log_intent: false`,
+    // the requested changes for audit, none applied. An intent that logs no INTENT record has no intent row.
+    const changes = committed ? [...requested, ...(d.effects ?? []), ...(p.logged ? [rowChange] : [])] : p.logged ? [rowChange] : [...requested];
     const rec = this.record(k, RecordKind.DECISION, {
       principal: this.principal("gate"),
       mutationId: intentId,
       opType: p.mutation.opType,
-      changes: committed ? [...requested, ...(d.effects ?? []), rowChange] : [rowChange],
+      changes,
       decision: create(DecisionSchema, { intentId, status: committed ? DecisionStatus.COMMITTED : DecisionStatus.REJECTED, ...(d.reject !== undefined ? { reject: d.reject } : {}) }),
     });
     this.commit(k, rec);
@@ -548,7 +584,7 @@ export class FakeServer {
     for (const r of keep) this.replay(k, r);
     k.epoch++;
     k.lanes = new Map();
-    const survivingIntents: { id: string; mutation: Mutation; subject: string; intentSeq: bigint }[] = [];
+    const survivingIntents: { id: string; mutation: Mutation; subject: string; logged: boolean }[] = [];
     for (const [mid, b] of [...k.bindings]) {
       const o = b.result.outcome;
       const decidedAtOrBelow = o.case === "decided" && o.value.decisionSeq <= baseSeq;
@@ -557,9 +593,10 @@ export class FakeServer {
         if (opts.rewindBindings !== true) k.voided.set(mid, { subject: b.subject, opType: b.opType });
       } else if (b.mutation?.lane === Lane.GATED && !decidedAtOrBelow) {
         k.bindings.delete(mid);
-        const intentSeq = b.intentSeq ?? 0n;
-        const survives = intentSeq !== 0n && intentSeq <= baseSeq && opts.rewindBindings !== true;
-        if (survives && b.mutation !== undefined) survivingIntents.push({ id: mid, mutation: b.mutation, subject: b.subject, intentSeq });
+        // 08 [GATE-93]: an intent accepted at or below the restore point survives it, and ends with a REJECTED decision; one above it is voided
+        const accepted = b.acceptedSeq ?? 0n;
+        const survives = b.mutation?.lane === Lane.GATED && b.acceptedSeq !== undefined && accepted <= baseSeq && opts.rewindBindings !== true;
+        if (survives && b.mutation !== undefined) survivingIntents.push({ id: mid, mutation: b.mutation, subject: b.subject, logged: (b.intentSeq ?? 0n) !== 0n });
         else if (opts.rewindBindings !== true) k.voided.set(mid, { subject: b.subject, opType: b.opType });
       }
     }
@@ -570,7 +607,7 @@ export class FakeServer {
     for (const s of survivingIntents) {
       const reject = mkReject(Code.STALE, { stale: { cause: StaleCause.EPOCH } });
       const row = create(KeyChangeSchema, { key: `abpc.intent/${s.id}`, kind: ChangeKind.SET, value: new TextEncoder().encode(JSON.stringify({ status: "REJECTED" })), encoding: "json/v1" });
-      const rec = this.record(k, RecordKind.DECISION, { principal: this.principal("gate"), mutationId: s.id, opType: s.mutation.opType, changes: [row], decision: create(DecisionSchema, { intentId: s.id, status: DecisionStatus.REJECTED, reject }) });
+      const rec = this.record(k, RecordKind.DECISION, { principal: this.principal("gate"), mutationId: s.id, opType: s.mutation.opType, changes: s.logged ? [row] : [...s.mutation.changes], decision: create(DecisionSchema, { intentId: s.id, status: DecisionStatus.REJECTED, reject }) });
       this.commit(k, rec);
       k.bindings.set(s.id, {
         subject: s.subject,
@@ -633,25 +670,86 @@ export class FakeServer {
     this.ks(id).frozen = false;
   }
 
-  /** Archives the keyspace (12 §12.4): no action is accepted; sessions get `KeyspaceDropped{ARCHIVED}`. */
+  /**
+   * The open items of a keyspace (11 [COORD-95]), as the counts that 11 [COORD-97] gives: the PENDING intents, logged or not, and the
+   * present keys of the hold templates (`abpc.saga.v1/run/{id}/open`, `abpc.escrow.v1/{class}/{id}/open`). The fake models no key
+   * ownership (`owned_keys` is 0) and no staged move copies.
+   */
+  openItems(id: string): { pendingIntents: number; ownedKeys: number; holdKeys: number } {
+    const k = this.ks(id);
+    let holdKeys = 0;
+    for (const key of k.state.keyNames()) {
+      const parts = key.split("/");
+      const saga = parts.length === 4 && parts[0] === "abpc.saga.v1" && parts[1] === "run" && parts[3] === "open";
+      const escrow = parts.length === 4 && parts[0] === "abpc.escrow.v1" && parts[3] === "open";
+      if (saga || escrow) holdKeys++;
+    }
+    return { pendingIntents: k.pending.size, ownedKeys: 0, holdKeys };
+  }
+
+  /** 11 [COORD-96], [COORD-97]: while a keyspace has an open item, `ArchiveKeyspace`, `SplitKeyspace` and `DeleteKeyspace` (but a frozen keyspace's) are refused and change nothing. */
+  private refuseWhileOpen(k: FakeKeyspace): void {
+    const o = this.openItems(k.id);
+    if (o.pendingIntents + o.ownedKeys + o.holdKeys === 0) return;
+    const reject = mkReject(Code.ADMIN_REFUSED, { message: "the keyspace has open items", details: { reason: "LIFECYCLE_HOLD", pending_intents: String(o.pendingIntents), owned_keys: String(o.ownedKeys), hold_keys: String(o.holdKeys) } });
+    throw new RpcError("FailedPrecondition", "the keyspace has open items", { reject });
+  }
+
+  /** Archives the keyspace (12 §12.4): no action is accepted; sessions get `KeyspaceDropped{ARCHIVED}`. Refused while the keyspace has an open item (11 [COORD-96]). */
   archive(id: string, successors: SuccessorRule[] = []): void {
     const k = this.ks(id);
+    this.refuseWhileOpen(k);
     k.lifecycle = KeyspaceLifecycle.ARCHIVED;
     k.successors = successors;
     this.dropSessions(id, 6 /* ARCHIVED */, successors);
   }
 
-  /** Splits the keyspace (12 §12.5): the successors exist and are seeded from this keyspace's state by `successors`' prefixes. */
+  /**
+   * Splits the keyspace (12 §12.5): the successors that exist are seeded from this keyspace's state, each key to the successor whose
+   * rule it matches (12 [ADM-45]), at a checkpoint at the split seq S, with the versions of the source (06 [LOG-67]) and the prune floor
+   * S (13 [CONF-18]). Refused while the keyspace has an open item (11 [COORD-96]).
+   */
   split(id: string, successors: SuccessorRule[]): void {
     const k = this.ks(id);
+    this.refuseWhileOpen(k);
+    const seed = this.entriesOf(k);
     k.lifecycle = KeyspaceLifecycle.SPLIT;
     k.successors = successors;
+    for (const r of successors) {
+      const t = this.keyspaces.get(r.keyspaceId);
+      if (t === undefined) continue;
+      const st = new ReplicaState();
+      t.ydocs = new Map();
+      for (const e of seed) {
+        if (matchSuccessor(successors, e.key) !== r) continue;
+        installEntry(st, e, this.manifests, k.manifestVersion);
+        const doc = k.ydocs.get(e.key);
+        if (doc !== undefined && !e.deleted) {
+          const copy = new Y.Doc({ gc: false });
+          Y.applyUpdate(copy, Y.encodeStateAsUpdate(doc));
+          t.ydocs.set(e.key, copy);
+        }
+      }
+      st.setCursor(k.head, t.epoch, k.manifestVersion);
+      t.state = st;
+      t.log = [];
+      t.pruneFloor = k.head;
+      t.manifestVersion = k.manifestVersion;
+    }
     this.dropSessions(id, 3 /* MOVED */, successors);
   }
 
+  /** Marks a keyspace as not seeded yet, or as seeded (12 [ADM-104]): its adds and its `Subscribe` get `Retry{KEYSPACE_SEEDING}`, and its mutations too. */
+  setSeeding(id: string, seeding: boolean): void {
+    this.ks(id).seeding = seeding;
+  }
+
+  /** Deletes the keyspace (12 §12.4). Refused while the keyspace has an open item, but for a frozen keyspace (11 [COORD-96], 12 [ADM-35]). */
   deleteKeyspace(id: string): void {
     const k = this.ks(id);
+    if (!k.frozen) this.refuseWhileOpen(k);
     k.deleted = true;
+    k.pending.clear(); // the intents that a frozen keyspace's deletion abandons no longer count against the in-flight cap (07 [MUT-42])
     k.bindings.clear();
     k.voided.clear();
     this.dropSessions(id, 7 /* DELETED */, []);
@@ -898,7 +996,12 @@ export class FakeServer {
       if ((b !== undefined && b.subject === subject) || k.voided.get(id)?.subject === subject) throw new RpcError("FailedPrecondition", "frozen", { reject: mkReject(Code.HISTORY_DIVERGED) });
       return none;
     }
-    if (b !== undefined && b.subject === subject) return create(GetMutationResultResponseSchema, { known: true, result: create(MutationResultSchema, { ...b.result, duplicate: true }), voided: false });
+    if (b !== undefined && b.subject === subject) {
+      // 08 [GATE-8], [GATE-57]: a pending intent answers a Retry with the current reason, `known = true`, never `known = false`
+      const p = k.pending.get(id);
+      const result = p !== undefined ? this.pendingResult(k, id, p) : b.result;
+      return create(GetMutationResultResponseSchema, { known: true, result: create(MutationResultSchema, { ...result, duplicate: true }), voided: false });
+    }
     if (b === undefined && k.voided.get(id)?.subject === subject) return create(GetMutationResultResponseSchema, { known: false, voided: true });
     return none;
   }
@@ -922,7 +1025,9 @@ export class FakeServer {
       if (!b.final && k.pending.has(req.intentId)) {
         this.decide(req.keyspaceId, req.intentId, { status: "REJECTED", reject: mkReject(Code.CANCELLED) });
       }
-      return create(CancelIntentResponseSchema, { result: create(MutationResultSchema, { ...(k.bindings.get(req.intentId) as Binding).result, duplicate: true }) });
+      const p = k.pending.get(req.intentId);
+      const result = p !== undefined ? this.pendingResult(k, req.intentId, p) : (k.bindings.get(req.intentId) as Binding).result;
+      return create(CancelIntentResponseSchema, { result: create(MutationResultSchema, { ...result, duplicate: true }) });
     }
     const reject = mkReject(Code.CANCELLED);
     k.bindings.set(req.intentId, { subject: subjectOf(principal), content: "", opType: "", result: rejectedResult(req.intentId, reject), final: true });
@@ -1041,10 +1146,14 @@ export class FakeServer {
     if (this.maxSessions !== undefined && [...this.sessions].filter((s) => subjectOf(s.principal) === subjectOf(principal)).length >= this.maxSessions) {
       throw new RpcError("ResourceExhausted", "too many sessions", { reject: mkReject(Code.QUOTA_EXCEEDED, { details: { quota: "max_sessions_per_principal" } }) });
     }
+    // 09 [READ-32], 14 [CLI-44]: a successor that is not seeded yet refuses the whole call
+    for (const c of req.keyspaces) {
+      if (this.keyspaces.get(c.keyspaceId)?.seeding === true) throw new RpcError("Unavailable", "a successor is not seeded yet", { retry: create(RetrySchema, { reason: RetryReason.KEYSPACE_SEEDING, afterMs: 1000 }) });
+    }
     if (req.clientId !== "") {
       const bound = this.clients.get(req.clientId);
       if (bound !== undefined && bound !== subjectOf(principal)) throw new RpcError("PermissionDenied", "actor mismatch", { reject: mkReject(Code.ACTOR_MISMATCH) });
-      this.clients.set(req.clientId, subjectOf(principal));
+      this.bindClient(req.clientId, subjectOf(principal));
     }
     const session = new FakeSession(`session-${this.nextSession++}`, principal, req.clientId);
     this.sessions.add(session);
@@ -1091,7 +1200,7 @@ export class FakeServer {
     if (req.clientId !== "") {
       const bound = this.clients.get(req.clientId);
       if (bound !== undefined && bound !== subjectOf(principal)) throw new RpcError("PermissionDenied", "actor mismatch", { reject: mkReject(Code.ACTOR_MISMATCH) });
-      this.clients.set(req.clientId, subjectOf(principal));
+      this.bindClient(req.clientId, subjectOf(principal));
       s.clientId = req.clientId;
     }
     for (const id of req.remove) s.follows.delete(id);
@@ -1099,6 +1208,11 @@ export class FakeServer {
     for (const c of req.add) {
       if (!this.keyspaces.has(c.keyspaceId)) {
         rejected.push(create(UpdateSubscriptionResponse_RejectionSchema, { keyspaceId: c.keyspaceId, outcome: { case: "reject", value: mkReject(Code.KEYSPACE_NOT_FOUND) } }));
+        continue;
+      }
+      if (this.keyspaces.get(c.keyspaceId)?.seeding === true) {
+        // 12 [ADM-104], 14 [CLI-44]: not seeded yet, a Retry and never KEYSPACE_NOT_FOUND
+        rejected.push(create(UpdateSubscriptionResponse_RejectionSchema, { keyspaceId: c.keyspaceId, outcome: { case: "retry", value: create(RetrySchema, { reason: RetryReason.KEYSPACE_SEEDING, afterMs: 1000 }) } }));
         continue;
       }
       this.addFollow(s, c);
@@ -1111,9 +1225,24 @@ export class FakeServer {
 
   async mutate(principal: Principal, req: MutateRequest): Promise<MutateResponse> {
     const inj = await this.prologue("mutate", req, principal);
+    this.checkRequest(req);
     const resp = this.doMutate(principal, req, inj);
     if (inj?.behavior.kind === "lose") throw new RpcError(inj.behavior.status ?? "Unavailable", "the response was lost");
     return resp;
+  }
+
+  /**
+   * Table 7-1 step 3, as the Go server makes it (`mutate/pipeline.go`): first the count and the size limits of 07 [MUT-4], the size
+   * measured in the binary encoding, each ResourceExhausted with no detail and nothing processed; then a non-empty list, and one
+   * `client_id` for all of it (07 [MUT-3]), each InvalidArgument.
+   */
+  private checkRequest(req: MutateRequest): void {
+    const ms = req.mutations;
+    if (ms.length > Number(this.limits.maxMutationsPerRequest)) throw new RpcError("ResourceExhausted", "too many mutations in the request");
+    if (toBinary(MutateRequestSchema, req).byteLength > Number(this.limits.maxRequestBytes)) throw new RpcError("ResourceExhausted", "request too large");
+    const invalid = (msg: string): RpcError => new RpcError("InvalidArgument", msg, { reject: mkReject(Code.INVALID_ENVELOPE) });
+    if (ms.length === 0) throw invalid("no mutation");
+    for (const m of ms) if (m.clientId !== (ms[0] as Mutation).clientId) throw invalid("the mutations carry more than one client_id");
   }
 
   private doMutate(principal: Principal, req: MutateRequest, inj: Injection | undefined): MutateResponse {
@@ -1185,7 +1314,21 @@ export class FakeServer {
     return s;
   }
 
-  /** Processes one mutation; `passed` says that the pair (keyspace, lane) passed the binding check (07 [MUT-7]). */
+  /** The client_id is bound to its subject at its first use (07 [MUT-30]); the newest id of a subject is the one a resend's lane wait may replace the wait for (07 [MUT-39]). */
+  private bindClient(clientId: string, subject: string): void {
+    if (this.clients.get(clientId) === subject) return;
+    this.clients.set(clientId, subject);
+    this.newestClient.set(subject, clientId);
+  }
+
+  /**
+   * Processes one mutation in the order of 07 Table 7-1 as `mutate/one.go` makes it: the identity fields (step 4); the duplicate
+   * lookup, voided markers included (step 6); the keyspace's existence and freeze (step 8); the lane checks (step 9), which a
+   * duplicate meets too (`store/lanes.go`, JudgeLane); a duplicate's stored outcome; only then a keyspace that is not ACTIVE
+   * (KEYSPACE_ARCHIVED), and the content checks (steps 10 to 16: the op type, its lane, the base epoch, the changes, the
+   * preconditions) and the commit or the registration (step 17). `passed` says that the pair (keyspace, lane) passed the binding
+   * check (07 [MUT-7]).
+   */
   private processOne(principal: Principal, m: Mutation, injection: Injection | undefined): { result: MutationResult; passed: boolean } {
     const inj = injection?.behavior;
     const id = m.mutationId;
@@ -1202,78 +1345,86 @@ export class FakeServer {
     }
     const k = this.keyspaces.get(m.keyspaceId);
     const rej = (r: Reject, passed = false): { result: MutationResult; passed: boolean } => ({ result: rejectedResult(id, r), passed });
+    // step 4: the identity fields; none of their rejects is recorded
+    if (m.mutationId === "") return rej(mkReject(Code.INVALID_ENVELOPE, { message: "no mutation id" }));
+    if (m.lane !== Lane.SEQUENCED && m.lane !== Lane.GATED) return rej(mkReject(Code.INVALID_ENVELOPE, { message: "no lane" }));
+    if (m.clientId !== "" && m.clientSeq === 0n) return rej(mkReject(Code.INVALID_ENVELOPE, { message: "client_seq 0" }));
     if (k === undefined) return rej(mkReject(Code.KEYSPACE_NOT_FOUND));
-    if (k.deleted) return rej(mkReject(Code.KEYSPACE_DELETED));
-    if (k.lifecycle !== KeyspaceLifecycle.ACTIVE) return rej(mkReject(Code.KEYSPACE_ARCHIVED, { details: { lifecycle: k.lifecycle === KeyspaceLifecycle.SPLIT ? "SPLIT" : "ARCHIVED" }, successors: this.successorsFor(k, m) }));
-    if (k.seeding) return { result: retryResult(id, RetryReason.KEYSPACE_SEEDING, 1000), passed: false };
-    if (k.frozen) return rej(mkReject(Code.HISTORY_DIVERGED));
     const manifest = this.manifests.get(k.manifestVersion);
     const op = manifest?.opType(m.opType);
-    // 07 Table 7-1: the envelope
-    if (m.mutationId === "") return rej(mkReject(Code.INVALID_ENVELOPE, { message: "no mutation id" }));
-    if (m.clientId !== "" && m.clientSeq === 0n) return rej(mkReject(Code.INVALID_ENVELOPE, { message: "client_seq 0" }));
-    if (op === undefined) return rej(mkReject(Code.UNKNOWN_OP_TYPE));
-    if ((op.lane === "GATED") !== (m.lane === Lane.GATED)) return rej(mkReject(Code.INVALID_ENVELOPE, { message: "lane mismatch" }));
-    // idempotency (07 §7.6)
+    // step 6: the duplicate lookup (07 §7.6)
     const content = toHex(encodeContent(m));
     const bound = k.bindings.get(id);
-    const slots = m.clientId === "" ? undefined : this.slotsOf(k, m.clientId);
-    const laneMap = slots === undefined ? undefined : m.lane === Lane.SEQUENCED ? slots.seq : slots.gated;
-    // the client_id is bound to one subject (10 [AUTH-20])
-    if (m.clientId !== "") {
-      const owner = this.clients.get(m.clientId);
-      if (owner !== undefined && owner !== subject) return rej(mkReject(Code.ACTOR_MISMATCH));
-    }
+    const voided = k.voided.get(id);
+    let duplicate = false;
+    let voidedResend = false;
     if (bound !== undefined) {
       if (bound.subject !== subject) return rej(mkReject(Code.ID_CONFLICT));
       if (bound.content !== "" && bound.content !== content) return rej(mkReject(Code.IDEMPOTENCY_KEY_REUSED));
-      if (m.clientId !== "") this.clients.set(m.clientId, subject);
-      // 07 [MUT-32], [MUT-33]: the lane checks come before the stored outcome
-      if (laneMap !== undefined) {
-        const at = laneMap.get(Number(m.clientSeq));
-        if (at !== undefined && at !== id) return rej(mkReject(Code.CLIENT_FORKED), true);
-        if (at === undefined) laneMap.set(Number(m.clientSeq), id); // 07 [MUT-50]: a duplicate binds its slot
-      }
-      const stored = create(MutationResultSchema, { ...bound.result, duplicate: true });
-      return { result: stored, passed: true };
-    }
-    const voided = k.voided.get(id);
-    if (voided !== undefined) {
+      duplicate = true;
+    } else if (voided !== undefined) {
       if (voided.subject !== subject) return rej(mkReject(Code.ID_CONFLICT));
-      if (!(op.spend && voided.opType === m.opType)) {
-        // 07 [MUT-105]: recorded as Reject{STALE, EPOCH}, never applied
-        const reject = mkReject(Code.STALE, { stale: { cause: StaleCause.EPOCH } });
-        k.voided.delete(id);
-        this.bindRecorded(k, principal, m, rejectedResult(id, reject));
-        return { result: rejectedResult(id, reject), passed: true };
-      }
-      k.voided.delete(id);
+      // 07 [MUT-105]: a spend action lost to a restore is processed as a new action; every other resend gets the recorded STALE{EPOCH}, after the lane checks
+      voidedResend = !(op?.spend === true && voided.opType === m.opType);
     }
-    // 07 [MUT-30]: a client_id is bound at its first use
-    if (m.clientId !== "") this.clients.set(m.clientId, subject);
-    // 07 [MUT-31], [MUT-32], [MUT-33]: the lanes
-    if (laneMap !== undefined && slots !== undefined) {
+    // step 8: the keyspace exists; a frozen keyspace answers a duplicate too
+    if (k.deleted) return rej(mkReject(Code.KEYSPACE_DELETED));
+    if (k.frozen) return rej(mkReject(Code.HISTORY_DIVERGED));
+    // step 9: the lane checks, which a duplicate meets too (07 [MUT-31], [MUT-32], [MUT-33], store/lanes.go JudgeLane)
+    const slots = m.clientId === "" ? undefined : this.slotsOf(k, m.clientId);
+    const laneMap = slots === undefined ? undefined : m.lane === Lane.SEQUENCED ? slots.seq : slots.gated;
+    let verdict: "proceed" | "stored" | "bind" = "proceed";
+    let passed = false;
+    if (m.clientId !== "" && slots !== undefined && laneMap !== undefined) {
+      // 07 [MUT-30]: the binding of the client_id is judged first
+      const owner = this.clients.get(m.clientId);
+      if (owner !== undefined && owner !== subject) return rej(mkReject(Code.ACTOR_MISMATCH));
+      passed = true;
+      const dupLike = duplicate || voidedResend;
+      const at = laneMap.get(Number(m.clientSeq));
       if (m.lane === Lane.SEQUENCED) {
-        if (slots.seq.size === 0 && slots.gated.size === 0 && m.clientSeq > 1n) return rej(mkReject(Code.CLIENT_UNKNOWN), false);
+        // 07 [MUT-31]: no lane state on either lane and a slot above 1
+        if (slots.seq.size === 0 && slots.gated.size === 0 && m.clientSeq > 1n) return rej(mkReject(Code.CLIENT_UNKNOWN), true);
         const l = this.processed(k, slots.seq);
-        const at = laneMap.get(Number(m.clientSeq));
-        if (at !== undefined && at !== id) return rej(mkReject(Code.CLIENT_FORKED), true);
-        if (Number(m.clientSeq) > l + 1) return { result: retryResult(id, RetryReason.OUT_OF_ORDER, 100), passed: true };
-        if (Number(m.clientSeq) <= l && at === undefined) return rej(mkReject(Code.CLIENT_FORKED), true);
-      } else {
-        const at = laneMap.get(Number(m.clientSeq));
-        if (at !== undefined && at !== id) return rej(mkReject(Code.CLIENT_FORKED), true);
-      }
+        const seq = Number(m.clientSeq);
+        if (seq === l + 1) verdict = dupLike ? "bind" : "proceed";
+        else if (seq > l + 1) return { result: retryResult(id, RetryReason.OUT_OF_ORDER, 100), passed: true };
+        else if (at === id) verdict = "stored";
+        else return rej(mkReject(Code.CLIENT_FORKED), true);
+      } else if (at === undefined) verdict = dupLike ? "bind" : "proceed";
+      else if (at === id) verdict = "stored";
+      else return rej(mkReject(Code.CLIENT_FORKED), true);
+      this.bindClient(m.clientId, subject); // 07 [MUT-30]: a client_id is bound at its first use
     }
+    if (duplicate) {
+      // 07 [MUT-50]: a duplicate at the next slot of its lane binds the slot; the stored outcome is returned
+      if (verdict === "bind") laneMap?.set(Number(m.clientSeq), id);
+      const p = k.pending.get(id);
+      if (p !== undefined) return { result: this.pendingDuplicate(k, p, m), passed };
+      return { result: create(MutationResultSchema, { ...(bound as Binding).result, duplicate: true }), passed };
+    }
+    if (voidedResend) {
+      // 07 [MUT-105]: recorded as Reject{STALE, EPOCH}, never applied
+      const reject = mkReject(Code.STALE, { stale: { cause: StaleCause.EPOCH } });
+      this.bindRecorded(k, principal, m, rejectedResult(id, reject));
+      return { result: rejectedResult(id, reject), passed };
+    }
+    // step 8, after the lane checks: an archived keyspace or a split source answers KEYSPACE_ARCHIVED, which is not recorded
+    if (k.lifecycle !== KeyspaceLifecycle.ACTIVE) return rej(mkReject(Code.KEYSPACE_ARCHIVED, { details: { lifecycle: k.lifecycle === KeyspaceLifecycle.SPLIT ? "SPLIT" : "ARCHIVED" }, successors: this.successorsFor(k, m) }), passed);
+    if (k.seeding) return { result: retryResult(id, RetryReason.KEYSPACE_SEEDING, 1000), passed: false };
+    // steps 10 and 11: the envelope, then the op type and its lane (07 Tables 7-2, 7-3); a lane mismatch is a recorded reject
+    if (m.changes.length === 0) return this.final(k, principal, m, content, mkReject(Code.INVALID_ENVELOPE, { message: "no change" }), passed);
+    if (op === undefined || manifest === undefined) return rej(mkReject(Code.UNKNOWN_OP_TYPE), passed);
+    if ((op.lane === "GATED") !== (m.lane === Lane.GATED)) return this.final(k, principal, m, content, mkReject(Code.INVALID_ENVELOPE, { message: "lane mismatch" }), passed);
     // the base epoch (05 [STATE-81]): not for a spend action
     if (m.baseLogEpoch !== 0 && m.baseLogEpoch !== k.epoch && !op.spend) {
-      return this.final(k, principal, m, content, mkReject(Code.STALE, { stale: { cause: StaleCause.EPOCH, currentSeq: k.head } }));
+      return this.final(k, principal, m, content, mkReject(Code.STALE, { stale: { cause: StaleCause.EPOCH, currentSeq: k.head } }), passed);
     }
     const err = this.checkChanges(k, m, manifest);
-    if (err !== undefined) return this.final(k, principal, m, content, err);
+    if (err !== undefined) return this.final(k, principal, m, content, err, passed);
     const stale = this.checkPreconditions(k, m);
-    if (stale !== undefined) return this.final(k, principal, m, content, stale);
-    if (m.lane === Lane.GATED) return this.registerIntent(k, principal, m, content, laneMap);
+    if (stale !== undefined) return this.final(k, principal, m, content, stale, passed);
+    if (m.lane === Lane.GATED) return this.registerIntent(k, principal, m, content, laneMap, op.logIntent);
     // 07 §7.8: the SEQUENCED commit
     return this.commitOp(k, principal, m, content, laneMap);
   }
@@ -1290,6 +1441,7 @@ export class FakeServer {
   }
 
   private bindRecorded(k: FakeKeyspace, principal: Principal, m: Mutation, result: MutationResult): void {
+    k.voided.delete(m.mutationId);
     k.bindings.set(m.mutationId, { subject: subjectOf(principal), content: toHex(encodeContent(m)), opType: m.opType, result, final: true, mutation: m });
     if (m.clientId !== "") {
       const slots = this.slotsOf(k, m.clientId);
@@ -1298,17 +1450,19 @@ export class FakeServer {
   }
 
   /** A final reject: recorded when 07 §7.6 says so (the slot is consumed), unrecorded otherwise. */
-  private final(k: FakeKeyspace, principal: Principal, m: Mutation, _content: string, r: Reject): { result: MutationResult; passed: boolean } {
+  private final(k: FakeKeyspace, principal: Principal, m: Mutation, _content: string, r: Reject, passed = true): { result: MutationResult; passed: boolean } {
     const result = rejectedResult(m.mutationId, r);
     if (isRecorded(r)) this.bindRecorded(k, principal, m, result);
-    return { result, passed: true };
+    return { result, passed };
   }
 
   private checkChanges(k: FakeKeyspace, m: Mutation, manifest: ReturnType<StaticManifests["get"]>): Reject | undefined {
     if (manifest === undefined) return mkReject(Code.UNKNOWN_OP_TYPE);
     const lim = this.limits;
     if (m.changes.length === 0) return mkReject(Code.INVALID_ENVELOPE, { message: "no change" });
+    // 07 [MUT-76], Table 7-1 step 13: the action limits; the size of the action is its binary encoding (04 Table 4.10a)
     if (m.changes.length > lim.maxChangesPerAction) return mkReject(Code.PAYLOAD_TOO_LARGE);
+    if (toBinary(MutationSchema, m).byteLength > Number(lim.maxActionBytes)) return mkReject(Code.PAYLOAD_TOO_LARGE);
     const seen = new Set<string>();
     const top = new VersionTopology(this.manifests, k.manifestVersion);
     const deleted: string[] = [];
@@ -1378,20 +1532,62 @@ export class FakeServer {
     return undefined;
   }
 
-  private registerIntent(k: FakeKeyspace, principal: Principal, m: Mutation, content: string, laneMap: Map<number, string> | undefined): { result: MutationResult; passed: boolean } {
-    // 08 §8.2: registered, logged as an INTENT record with the intent row (06 [LOG-22])
-    const row = create(KeyChangeSchema, { key: `abpc.intent/${m.mutationId}`, kind: ChangeKind.SET, value: new TextEncoder().encode(JSON.stringify({ status: "PENDING" })), encoding: "json/v1" });
-    const rec = this.record(k, RecordKind.INTENT, { principal, mutationId: m.mutationId, opType: m.opType, changes: [...m.changes, row], authoredAt: m.authoredAt });
-    this.commit(k, rec);
-    const result = retryResult(m.mutationId, RetryReason.GATE_TIMEOUT, 1000, rec.seq);
-    k.bindings.set(m.mutationId, { subject: subjectOf(principal), content, opType: m.opType, result, final: false, mutation: m, intentSeq: rec.seq });
-    k.pending.set(m.mutationId, { mutation: m, principal, intentSeq: rec.seq });
-    laneMap?.set(Number(m.clientSeq), m.mutationId);
-    // 07 [MUT-37]: a lane wait that is not satisfied answers LANE_NOT_READY
-    if (m.afterClientSeq > 0n && m.clientId !== "") {
-      const slots = this.slotsOf(k, m.clientId);
-      if (BigInt(this.processed(k, slots.seq)) < m.afterClientSeq) return { result: retryResult(m.mutationId, RetryReason.LANE_NOT_READY, 100, rec.seq), passed: true };
+  // -- GATED intents (08 §8.2) --
+
+  /** Whether the lane wait of a pending intent is satisfied (07 [MUT-37]); once satisfied it stays so (`store/mem/gated.go`, waitSatisfied). */
+  private waitSatisfied(k: FakeKeyspace, p: PendingIntent): boolean {
+    if (p.wait.satisfied) return true;
+    if (p.wait.after === 0n || p.wait.clientId === "") return (p.wait.satisfied = true);
+    const slots = k.lanes.get(p.wait.clientId);
+    if (slots !== undefined && BigInt(this.processed(k, slots.seq)) >= p.wait.after) return (p.wait.satisfied = true);
+    return false;
+  }
+
+  /**
+   * What a registration, a resend and `GetMutationResult` answer for a pending intent (`store/gated.go`, ResultFor and ReasonOf):
+   * `Retry{LANE_NOT_READY}` while the lane wait is not satisfied, else `Retry{GATE_TIMEOUT}`; `intent_seq` only when the INTENT is
+   * logged (07 [MUT-8]), so 0 for an op type with `log_intent: false`.
+   */
+  private pendingResult(k: FakeKeyspace, id: string, p: PendingIntent): MutationResult {
+    return this.waitSatisfied(k, p) ? retryResult(id, RetryReason.GATE_TIMEOUT, 1000, p.intentSeq) : retryResult(id, RetryReason.LANE_NOT_READY, 100, p.intentSeq);
+  }
+
+  /** A resend of a pending intent: the lane wait of the newest client id of the subject replaces the old one while it is not satisfied (07 [MUT-39]). */
+  private pendingDuplicate(k: FakeKeyspace, p: PendingIntent, m: Mutation): MutationResult {
+    if (m.clientId !== "" && !this.waitSatisfied(k, p) && this.newestClient.get(subjectOf(p.principal)) === m.clientId) {
+      p.wait = { clientId: m.clientId, after: m.afterClientSeq, satisfied: false };
     }
+    return create(MutationResultSchema, { ...this.pendingResult(k, m.mutationId, p), duplicate: true });
+  }
+
+  /** The registered, undecided GATED actions of a client instance in every keyspace, or of a subject for a laneless action (07 [MUT-42]). */
+  private inflight(m: Mutation, principal: Principal): number {
+    let n = 0;
+    for (const k of this.keyspaces.values()) {
+      for (const p of k.pending.values()) {
+        if (m.clientId !== "" ? p.mutation.clientId === m.clientId : p.mutation.clientId === "" && subjectOf(p.principal) === subjectOf(principal)) n++;
+      }
+    }
+    return n;
+  }
+
+  private registerIntent(k: FakeKeyspace, principal: Principal, m: Mutation, content: string, laneMap: Map<number, string> | undefined, logIntent: boolean): { result: MutationResult; passed: boolean } {
+    // 07 [MUT-42], 08 [GATE-7]: over the in-flight cap the mutation is not registered, binds no slot and is not logged
+    if (this.inflight(m, principal) >= Number(this.limits.maxInflightGatedPerClient)) return { result: retryResult(m.mutationId, RetryReason.RATE_LIMITED, 1000), passed: true };
+    // 08 §8.2: registered; with `log_intent` it is logged as an INTENT record with the intent row (06 [LOG-22]), without it nothing is logged
+    let intentSeq = 0n;
+    if (logIntent) {
+      const row = create(KeyChangeSchema, { key: `abpc.intent/${m.mutationId}`, kind: ChangeKind.SET, value: new TextEncoder().encode(JSON.stringify({ status: "PENDING" })), encoding: "json/v1" });
+      const rec = this.record(k, RecordKind.INTENT, { principal, mutationId: m.mutationId, opType: m.opType, changes: [...m.changes, row], authoredAt: m.authoredAt });
+      this.commit(k, rec);
+      intentSeq = rec.seq;
+    }
+    const p: PendingIntent = { mutation: m, principal, intentSeq, acceptedSeq: k.head, logged: logIntent, wait: { clientId: m.clientId, after: m.afterClientSeq, satisfied: false } };
+    k.voided.delete(m.mutationId);
+    k.pending.set(m.mutationId, p);
+    const result = this.pendingResult(k, m.mutationId, p);
+    k.bindings.set(m.mutationId, { subject: subjectOf(principal), content, opType: m.opType, result, final: false, mutation: m, intentSeq, acceptedSeq: p.acceptedSeq });
+    laneMap?.set(Number(m.clientSeq), m.mutationId);
     return { result, passed: true };
   }
 
@@ -1404,6 +1600,7 @@ export class FakeServer {
     const rec = this.record(k, RecordKind.OP, { principal, mutationId: m.mutationId, opType: m.opType, changes: [...m.changes], overwroteNewer: overwrote, authoredAt: m.authoredAt });
     this.commit(k, rec);
     const result = resultOf(m.mutationId, { case: "appended", value: create(AppendedSchema, { seq: rec.seq, overwroteNewer: overwrote, logEpoch: k.epoch }) });
+    k.voided.delete(m.mutationId);
     k.bindings.set(m.mutationId, { subject: subjectOf(principal), content, opType: m.opType, result, final: true, mutation: m });
     laneMap?.set(Number(m.clientSeq), m.mutationId);
     return { result, passed: true };

@@ -2,7 +2,7 @@
 
 import { describe, expect, it } from "vitest";
 import { create } from "@bufbuild/protobuf";
-import { set } from "../src/engine/index.js";
+import { RpcError, set } from "../src/engine/index.js";
 import { CloseReason, ControlFrameSchema, SubscribeResponseSchema } from "../src/gen/abpc/v2/sync_pb.js";
 import { Code, SuccessorRuleSchema } from "../src/gen/abpc/v2/types_pb.js";
 import { reject as mk } from "../src/fake/index.js";
@@ -231,7 +231,7 @@ describe("14 [CLI-52] the queued actions of a split or archived keyspace", () =>
     await goOffline(r);
     const a = await r.engine.submit({ keyspaceId: KS, opType: "Create", changes: [set("issues/i1", {})] }); // issues/ -> dst1
     const b = await r.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/x", 1)] }); // the catch-all -> dst2
-    const c = await r.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/y", 1), set("raw/z", "w", "bytes/v1")] });
+    const c = await r.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/y", 1), set("raw/z", new TextEncoder().encode("w"), "bytes/v1")] });
     void c;
     const e = await r.engine.submit({ keyspaceId: KS, opType: "Create", changes: [set("issues/i2", {}), set("settings/w", 1)] }); // two successors
     const baseOf = (id: string): bigint => r.engine.outbox().find((x) => x.mutationId === id) !== undefined ? ((r.engine as unknown as { content(x: unknown): { baseSeq: bigint } }).content(r.engine.outbox().find((x) => x.mutationId === id))).baseSeq : -1n;
@@ -283,15 +283,35 @@ describe("14 [CLI-52] the queued actions of a split or archived keyspace", () =>
     expect(r.server.calls.filter((c) => c.method === "mutate" && (c.request as { mutations: { keyspaceId: string }[] }).mutations.some((m) => m.keyspaceId === "dst1"))).toHaveLength(0);
   });
 
-  it("an action registered in the source as an intent is not re-routed or dead-lettered until the source gives it a result", async () => {
-    const r = await splitRig();
-    const g = await r.engine.submit({ keyspaceId: KS, opType: "Approve", changes: [set("settings/g", 1)] });
-    await r.engine.settle();
-    r.server.split(KS, [rule("", "dst2")]);
-    await tick(r, 5000);
-    expect(ofType(r, "rerouted")).toHaveLength(0);
-    expect(r.engine.deadLetterEntries()).toHaveLength(0);
-    expect(r.engine.outbox().map((x) => x.mutationId)).toEqual([g.mutationId]);
+  it("11 [COORD-96]: a split or an archive is refused while an intent is pending, logged or not; once it is decided the source gives it its result, and it is never re-routed or dead-lettered", async () => {
+    for (const opType of ["Approve", "ApproveQuiet"]) {
+      const r = await splitRig();
+      const g = await r.engine.submit({ keyspaceId: KS, opType, changes: [set("settings/g", 1)] });
+      await r.engine.settle();
+      for (const refuse of [() => r.server.split(KS, [rule("", "dst2")]), () => r.server.archive(KS, [rule("", "dst2")]), () => r.server.deleteKeyspace(KS)]) {
+        expect(refuse).toThrow(/open items/);
+        try {
+          refuse();
+        } catch (e) {
+          expect(e).toBeInstanceOf(RpcError);
+          expect((e as RpcError).status).toBe("FailedPrecondition");
+          expect((e as RpcError).reject?.code).toBe(Code.ADMIN_REFUSED);
+          expect((e as RpcError).reject?.details).toMatchObject({ reason: "LIFECYCLE_HOLD", pending_intents: "1", owned_keys: "0", hold_keys: "0" });
+        }
+      }
+      expect(r.server.openItems(KS)).toEqual({ pendingIntents: 1, ownedKeys: 0, holdKeys: 0 });
+      await tick(r, 5000);
+      expect(ofType(r, "rerouted")).toHaveLength(0);
+      expect(r.engine.deadLetterEntries()).toHaveLength(0);
+      expect(r.engine.outbox().map((x) => x.mutationId)).toEqual([g.mutationId]); // still pending: the keyspace is untouched
+      r.server.decide(KS, g.mutationId, { status: "COMMITTED" });
+      await r.engine.settle();
+      expect(types(r, g.mutationId)).toEqual(["committed"]);
+      r.server.split(KS, [rule("", "dst2")]); // no open item any more
+      await tick(r, 5000);
+      expect(ofType(r, "rerouted")).toHaveLength(0);
+      expect(r.engine.deadLetterEntries()).toHaveLength(0);
+    }
   });
 });
 

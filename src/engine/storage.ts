@@ -19,10 +19,14 @@ export interface Author {
   deviceId: string;
 }
 
-/** The outcome of an action that the server has recorded and the client has not retired yet, or that a journal entry keeps (14 [CLI-7]). */
+/**
+ * The outcome of an action that the server has recorded and the client has not retired yet, or that a journal entry keeps (14 [CLI-7]).
+ * `atServerMs` is the server time of the outcome (14 [CLI-53], [CLI-55]): the time of its record when the client has seen it, otherwise
+ * the client's estimate of the server time when it learned the outcome, which is never earlier than the outcome.
+ */
 export type StoredOutcome =
-  | { kind: "appended"; seq: bigint; logEpoch: number; overwroteNewer: number[] }
-  | { kind: "decided"; status: "COMMITTED" | "REJECTED"; decisionSeq: bigint; logEpoch: number; reject?: Reject };
+  | { kind: "appended"; seq: bigint; logEpoch: number; overwroteNewer: number[]; atServerMs?: number }
+  | { kind: "decided"; status: "COMMITTED" | "REJECTED"; decisionSeq: bigint; logEpoch: number; reject?: Reject; atServerMs?: number };
 
 /** The last answer an action got, for the report of 14 [CLI-83] and the dead-letter entry of 14 [CLI-28]. */
 export interface LastResult {
@@ -63,6 +67,11 @@ export interface OutboxEntry {
   lastResult?: LastResult;
   /** A GATED action that the server registered as an intent (14 [CLI-52], [CLI-53]). */
   registered: boolean;
+  /**
+   * How the applied result differs from the prediction, as far as the client has learned it (14 [CLI-38], [CLI-40]); it is kept with
+   * the entry, so that a restart between the learning and the retirement does not turn `corrected` into `committed`.
+   */
+  verdict?: Verdict;
   // -- outcome --
   outcome?: StoredOutcome;
   // -- one-shot markers (14 [CLI-46], [CLI-64]) --
@@ -79,6 +88,16 @@ export interface OutboxEntry {
    * sent again, until the app acknowledges entries of that store and the move can be made.
    */
   stuck?: { sink: "deadLetter" | "export" | "journal"; reason: string; reject?: Reject; cause?: string; dependencyOf?: string };
+}
+
+/** The keys on which an action's applied result differs from its prediction (14 [CLI-38], [CLI-40]). */
+export interface Verdict {
+  /** A `CAS` that was shown as having no effect, which sticks even when it commits later (14 [CLI-11]). */
+  noEffect: string[];
+  /** A CRDT update that folded to no effect (05 [STATE-76], 14 [CLI-40]). */
+  crdtNoEffect: string[];
+  /** The keys of a gate's effects that the prediction lacked or got wrong (14 [CLI-15]); absent until the DECISION that made them was seen. */
+  effects?: string[];
 }
 
 /** An entry of the dead-letter store (14 [CLI-28]). */
@@ -109,8 +128,10 @@ export interface JournalEntry {
   outcome: StoredOutcome;
   /** What the app was told when it retired. */
   reported: "committed" | "corrected";
-  /** The server time at which the outcome retired: the window of 14 [CLI-53] runs from it. */
+  /** The server time at which the action retired. */
   retiredServerMs: number;
+  /** The server time of the outcome, from which the window of 14 [CLI-53] runs: the server keeps the binding for `max_offline` after it (07 [MUT-51]). */
+  outcomeServerMs: number;
   spend: boolean;
   /** The action is a resend of a lost spend action: a later restore never makes it be resent again (14 [CLI-64]). */
   spendResent: boolean;

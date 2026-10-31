@@ -127,6 +127,10 @@ export abstract class SenderLayer extends ReactionLayer {
       this.entries.set(id, entry);
       this.decoded.set(id, m);
       f.invalidate();
+      // 14 [CLI-11], [CLI-38]: a `CAS` that the view shows with no effect is `corrected` when it commits; what the view shows now is kept
+      // with the entry, so that a restart before the commit does not lose it
+      this.capturePredictions(f);
+      await this.flushDirty();
       this.schedulePump();
       this.armBoundTimer();
       return { mutationId: id };
@@ -185,8 +189,20 @@ export abstract class SenderLayer extends ReactionLayer {
   protected async pumpKeyspace(f: Follow): Promise<void> {
     if (!this.online() || !f.loaded || f.frozen !== undefined) return;
     if (f.stopped !== undefined && f.stopped !== "GRANT_CHANGED") return;
+    // 14 [CLI-24], [CLI-53], [CLI-64]: an action that was sent in an earlier epoch is resolved by `GetMutationResult`, never resent; the
+    // client learns that the epoch changed from the `KeyspaceDropped{EPOCH_CHANGED}` that follows `Subscribed`, so it sends nothing to a
+    // keyspace on a new session until the `KeyspaceAdded` has come with the epoch that it follows
+    if (f.awaitingAdd) return;
     const entries = this.entriesOf(f.id).filter((e) => !this.isDone(e));
     if (entries.length === 0) return;
+    // 14 [CLI-29]: an entry that cannot be decoded goes to the dead-letter store and stops no other entry: it is ended before the slots
+    // of the others are assigned, so that none of them takes a slot above the one that it would have held
+    const corrupt = entries.filter((e) => this.content(e) === undefined);
+    if (corrupt.length > 0) {
+      for (const e of corrupt) await this.endUndecodable(e);
+      this.schedulePump();
+      return;
+    }
     const lim = this.limits;
     const batch: OutboxEntry[] = [];
 
@@ -196,7 +212,7 @@ export abstract class SenderLayer extends ReactionLayer {
       const seq = entries.filter((e) => e.lane === "SEQUENCED");
       const slotted = seq.filter((e) => e.clientId === this.clientId && e.clientSeq > 0 && lane.assigned.get(e.clientSeq) === e.mutationId).sort((a, b) => a.clientSeq - b.clientSeq);
       const fresh = seq.filter((e) => !slotted.includes(e));
-      const room = (): boolean => batch.length < lim.maxMutationsPerRequest && batch.reduce((n, x) => n + x.content.length + 256, 0) < lim.maxRequestBytes;
+      const room = (next: OutboxEntry): boolean => this.fitsRequest(batch, next);
       let blocked = false;
       let alone = false;
       for (const e of slotted) {
@@ -204,7 +220,7 @@ export abstract class SenderLayer extends ReactionLayer {
           blocked = true;
           break; // the server processes the lane in client_seq order: nothing goes past an action that is not sent
         }
-        if ((batch.length > 0 && !room()) || (this.rt(e.mutationId).alone && batch.length > 0)) {
+        if ((batch.length > 0 && !room(e)) || (this.rt(e.mutationId).alone && batch.length > 0)) {
           blocked = true;
           break;
         }
@@ -218,12 +234,19 @@ export abstract class SenderLayer extends ReactionLayer {
       if (!blocked && !alone) {
         for (const e of fresh) {
           if (!this.canSendNow(e)) continue; // an action with no unresolved dependency does not wait for unrelated actions ([CLI-33])
-          if (batch.length > 0 && (!room() || this.rt(e.mutationId).alone)) break;
+          if (batch.length > 0 && (!room(e) || this.rt(e.mutationId).alone)) break;
           batch.push(e);
           if (this.rt(e.mutationId).alone) break;
         }
       }
       // slots are assigned in this order, so that they are contiguous ([CLI-27])
+      // SPEC-QUESTION: 14 [CLI-63] says that a re-stamp gives "fresh `client_seq` values from 1 ([CLI-27]), in authoring order", and
+      // [CLI-33] that "a client MUST send an action that has no unresolved dependency without waiting for unrelated actions".
+      // Reading A (taken): the slots go in authoring order among the actions that can be sent now; an action that waits for a dependency
+      // takes its slot when it is first sent ([CLI-27]), after unrelated later actions, so it never holds them up. Reading B: every
+      // pending SEQUENCED action is stamped in authoring order at once; an unrelated later action then has a slot above the one of an
+      // earlier action that waits for its dependency, is answered OUT_OF_ORDER, and waits for that action: [CLI-33] broken. The two
+      // differ only when an earlier action is blocked and a later one is not.
       for (const e of batch) {
         if (!(e.clientId === this.clientId && e.clientSeq > 0 && lane.assigned.get(e.clientSeq) === e.mutationId)) e.clientSeq = lane.allocate(e.mutationId);
         e.clientId = this.clientId;
@@ -246,6 +269,12 @@ export abstract class SenderLayer extends ReactionLayer {
         else if (s.outcome === undefined) waits = true; // an earlier SEQUENCED action with no slot yet gives none to name ([CLI-32])
       }
       if (waits) continue;
+      // SPEC-QUESTION: 14 [CLI-32] gives `after_client_seq` as "the highest `client_seq` the current client instance assigned to an earlier
+      // SEQUENCED action of the same keyspace". Reading A (taken): the earlier SEQUENCED actions that are still in the outbox, which is
+      // what the rest of [CLI-32] speaks of ("until that action has left the outbox without one"); an action that retired holds a slot
+      // at or below the watermark, so naming it adds no wait. Reading B: the highest slot of any earlier SEQUENCED action of this
+      // client instance, a retired one included, which needs a memory of the slots of the actions that have left. The server judges
+      // only whether the lane's watermark has reached the value, so the two give the same wait; they differ in the value on the wire.
       e.afterClientSeq = after;
       if (!(e.clientId === this.clientId && e.clientSeq > 0 && gatedLane.assigned.get(e.clientSeq) === e.mutationId)) e.clientSeq = gatedLane.allocate(e.mutationId);
       e.clientId = this.clientId;
@@ -253,9 +282,38 @@ export abstract class SenderLayer extends ReactionLayer {
       gatedRoom--;
     }
 
-    const all = [...batch, ...gated];
-    if (all.length === 0) return;
-    await this.dispatch(f, all, batch.length > 0);
+    // 14 [CLI-26], 07 [MUT-4]: a request never passes `max_mutations_per_request` or `max_request_bytes`, GATED actions included: the
+    // first request carries the SEQUENCED batch and the GATED actions that fit beside it, the others are GATED actions only (they may be
+    // in flight together); an action of a request that was split goes alone (14 [CLI-50])
+    const requests: OutboxEntry[][] = [];
+    let cur = [...batch];
+    for (const e of gated) {
+      if (cur.length > 0 && (!this.fitsRequest(cur, e) || this.rt(e.mutationId).alone || cur.some((x) => this.rt(x.mutationId).alone))) {
+        requests.push(cur);
+        cur = [];
+      }
+      cur.push(e);
+    }
+    if (cur.length > 0) requests.push(cur);
+    for (const [i, req] of requests.entries()) await this.dispatch(f, req, i === 0 && batch.length > 0);
+  }
+
+  /**
+   * Whether `next` fits in a request that already carries `batch`: under `max_mutations_per_request`, and under `max_request_bytes`,
+   * which 07 [MUT-4] measures in the binary encoding of the `MutateRequest`. An action alone in a request goes whatever its size (it
+   * cannot be split further, 14 [CLI-50]).
+   */
+  private fitsRequest(batch: readonly OutboxEntry[], next: OutboxEntry): boolean {
+    if (batch.length === 0) return true;
+    if (batch.length >= this.limits.maxMutationsPerRequest) return false;
+    let bytes = this.features.reduce((n, x) => n + 2 + x.length, 0) + this.requestBytes(next);
+    for (const x of batch) bytes += this.requestBytes(x);
+    return bytes <= this.limits.maxRequestBytes;
+  }
+
+  /** What an entry adds to a `MutateRequest`: its content, the stamping fields at their widest, and the tag and length of the field. */
+  private requestBytes(e: OutboxEntry): number {
+    return e.content.length + 72;
   }
 
   /** Records the stamping before the request leaves ([CLI-27]), then sends. */
@@ -280,8 +338,7 @@ export abstract class SenderLayer extends ReactionLayer {
     for (const e of all) {
       const c = this.content(e);
       if (c === undefined) {
-        // 14 [CLI-29]: an entry that cannot be decoded goes to the dead-letter store; it stops no other entry
-        await this.endAction(e, { sink: "deadLetter", reject: makeReject(Code.INVALID_ENVELOPE, ErrorClass.DEAD_LETTER, "the stored content cannot be decoded"), reason: "UNDECODABLE", dependents: "fail" });
+        await this.endUndecodable(e);
         continue;
       }
       mutations.push(stamped(c, e));
@@ -297,6 +354,14 @@ export abstract class SenderLayer extends ReactionLayer {
     if (hasSequenced) this.seqInflight.add(f.id);
     const req = create(MutateRequestSchema, { mutations, supportedFeatures: [...this.features] });
     this.detach(this.sendRequest(f, live, req, hasSequenced));
+  }
+
+  /**
+   * 14 [CLI-29]: an entry that cannot be decoded goes to the dead-letter store; it stops no other entry. The server saw nothing of it, so
+   * its slot, if it had one, is given back (14 [CLI-27]).
+   */
+  private async endUndecodable(e: OutboxEntry): Promise<void> {
+    await this.endAction(e, { sink: "deadLetter", reject: makeReject(Code.INVALID_ENVELOPE, ErrorClass.DEAD_LETTER, "the stored content cannot be decoded"), reason: "UNDECODABLE", dependents: "fail", slot: "release" });
   }
 
   /** The call, outside the queue: its answer comes back as a task. */
@@ -334,10 +399,15 @@ export abstract class SenderLayer extends ReactionLayer {
       return;
     }
     this.noteWatermarks(resp.watermarks);
-    for (let i = 0; i < batch.length; i++) {
-      const e = batch[i] as OutboxEntry;
-      if (!this.entries.has(e.mutationId) || this.ending.has(e.mutationId)) continue;
-      await this.applyResult(e, resp.results[i] as MutationResult, "mutate");
+    this.freshReading = true; // the watermarks are after the results: 14 [CLI-27]
+    try {
+      for (let i = 0; i < batch.length; i++) {
+        const e = batch[i] as OutboxEntry;
+        if (!this.entries.has(e.mutationId) || this.ending.has(e.mutationId)) continue;
+        await this.applyResult(e, resp.results[i] as MutationResult, "mutate");
+      }
+    } finally {
+      this.freshReading = false;
     }
     // 14 [CLI-52]: the rest of the queued actions of a keyspace that this answer showed to be split or archived
     if (f.lifecycle !== KeyspaceLifecycle.ACTIVE && f.lifecycle !== KeyspaceLifecycle.UNSPECIFIED) await this.keyspaceEnded(f, f.lifecycle, f.successors);
@@ -442,6 +512,11 @@ export abstract class SenderLayer extends ReactionLayer {
           for (const e of live) this.deferEntry(e, this.nextDelay(e, retryAfter));
           return;
         }
+        if (detail?.reject !== undefined) {
+          // A.7: a quota or count limit with its `Reject`: "stop and report", the code decides
+          for (const e of live) await this.onRejectResult(e, detail.reject);
+          return;
+        }
         // no detail: split the request; a single mutation that is still too large is dead-lettered (14 [CLI-50])
         await this.splitOrEnd(live, "ResourceExhausted", Code.PAYLOAD_TOO_LARGE);
         return;
@@ -461,7 +536,18 @@ export abstract class SenderLayer extends ReactionLayer {
           for (const e of live) await this.onRejectResult(e, r);
           return;
         }
-        for (const e of live) this.deferEntry(e, this.nextDelay(e, undefined));
+        // A.7: "PermissionDenied, other": a client acts on the status when the call has no detail, as for PERMISSION_DENIED: refresh the
+        // token once, then stop and report (14 [CLI-46])
+        const again = live.filter((e) => !e.permissionRetried);
+        for (const e of again) {
+          e.permissionRetried = true;
+          this.markDirty(e);
+          this.refreshThenResend(e);
+        }
+        this.stopAndReport(
+          live.filter((e) => !again.includes(e)),
+          status,
+        );
         return;
       }
       case "Unimplemented":
@@ -475,7 +561,8 @@ export abstract class SenderLayer extends ReactionLayer {
           for (const e of live) await this.onRejectResult(e, detail.reject);
           return;
         }
-        for (const e of live) this.deferEntry(e, this.nextDelay(e, undefined));
+        // A.7: `NotFound`, `AlreadyExists` and `FailedPrecondition` with no detail: "stop and report"
+        this.stopAndReport(live, status);
         return;
       }
       default:
@@ -487,6 +574,9 @@ export abstract class SenderLayer extends ReactionLayer {
           this.markDirty(e);
           this.deferEntry(e, this.nextDelay(e, retryAfter));
         }
+        // a keyspace that was split or archived while the call was under way: it is no longer sent to, so the action is not resent;
+        // the source's answer is asked for, as for the other queued actions (14 [CLI-52], [CLI-7])
+        if (f.lifecycle !== KeyspaceLifecycle.ACTIVE && f.lifecycle !== KeyspaceLifecycle.UNSPECIFIED) await this.keyspaceEnded(f, f.lifecycle, f.successors);
     }
   }
 
@@ -497,7 +587,7 @@ export abstract class SenderLayer extends ReactionLayer {
         if (!this.rt(e.mutationId).alone && live.length > 1) continue;
         if (this.rt(e.mutationId).alone || live.length === 1) {
           const reject = makeReject(code, ErrorClass.DEAD_LETTER, `${status}: the call failed for the action alone`);
-          await this.endAction(e, { sink: "deadLetter", reject, reason: status === "ResourceExhausted" ? codeName(Code.PAYLOAD_TOO_LARGE) : status, dependents: "fail" });
+          await this.endAction(e, { sink: "deadLetter", reject, reason: status === "ResourceExhausted" ? codeName(Code.PAYLOAD_TOO_LARGE) : status, dependents: "fail", slot: "release" });
         }
       }
       return;

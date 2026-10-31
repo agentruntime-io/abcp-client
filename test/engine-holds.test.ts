@@ -33,15 +33,21 @@ describe("14 [CLI-45] a hold keeps the action, stops sending in its scope, emits
     expect(r.engine.outbox()).toHaveLength(0);
   });
 
-  it("UNKNOWN_OP_TYPE: the client reloads the manifest; a type that is now declared is resent, one that is still unknown is dead-lettered at once", async () => {
+  it("UNKNOWN_OP_TYPE: the client reloads the version that LoadState names; a type that it declares is resent with the hold backoff, one that is not declared is dead-lettered at once", async () => {
     const manifests = new StaticManifests(MANIFEST);
     const r = await rig({ manifests });
+    r.random.fixed = 0.5;
     r.server.inject("mutate", { kind: "result", result: (m) => rejectResult(m, mk(Code.UNKNOWN_OP_TYPE)) });
     const a = await r.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/a", 1)] });
     await r.engine.settle();
-    expect(manifests.reloads).toEqual([1]);
+    expect(manifests.reloads).toEqual([1]); // the version in force is the one that the client used, and it declares the type
+    expect(held(r.events).map((e) => [e.state, e.scope, e.lane, e.code])).toEqual([["start", "lane", "SEQUENCED", "UNKNOWN_OP_TYPE"]]);
+    expect(types(r, a.mutationId)).toEqual([]); // nothing is resent before the hold backoff has passed
+    await tick(r, 29_000);
+    expect(sentIds(r)).toEqual([a.mutationId]);
+    await tick(r, 2000); // the first probe of the hold backoff: a bound from 1 min, drawn at 0.5
     expect(held(r.events).map((e) => [e.state, e.scope, e.lane, e.code])).toEqual([["start", "lane", "SEQUENCED", "UNKNOWN_OP_TYPE"], ["stop", "lane", "SEQUENCED", "UNKNOWN_OP_TYPE"]]);
-    expect(types(r, a.mutationId)).toEqual(["committed"]); // the reloaded manifest declares it (it always did here): resent
+    expect(types(r, a.mutationId)).toEqual(["committed"]); // a resend that gets another result clears the hold
     const r2 = await rig({ manifests: new StaticManifests(MANIFEST) });
     r2.manifests.reload = (v: number): Promise<boolean> => {
       void v;

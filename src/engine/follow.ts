@@ -23,21 +23,44 @@ export class LaneState {
     return n;
   }
 
+  /** Slots whose action left the outbox before a reading of the watermark said whether the server consumed them (14 [CLI-27]). */
+  private readonly deferred = new Map<number, string>();
+
   /** Raises the watermark (never lowers it) and forgets the slots it covers; returns whether it rose. */
   raise(to: number): boolean {
     if (to <= this.watermark) return false;
     this.watermark = to;
     for (const slot of [...this.assigned.keys()]) if (slot <= to) this.assigned.delete(slot);
+    for (const slot of [...this.deferred.keys()]) if (slot <= to) this.deferred.delete(slot);
     return true;
   }
 
   release(slot: number, mutationId: string): void {
     if (this.assigned.get(slot) === mutationId) this.assigned.delete(slot);
+    if (this.deferred.get(slot) === mutationId) this.deferred.delete(slot);
+  }
+
+  /** The slot stays with the lane until a reading of the watermark says whether it was consumed (see `settle`). */
+  defer(slot: number, mutationId: string): void {
+    if (this.assigned.get(slot) === mutationId) this.deferred.set(slot, mutationId);
+  }
+
+  /**
+   * A reading of the watermark came. 14 [CLI-27]: "If the watermark stays just below a slot after the slot's action got a result, that
+   * result recorded nothing": the slot of an action that has left the outbox, which the reading leaves just above the watermark, is given
+   * to the next action of the lane. A slot higher up waits until the watermark has reached the slot below it.
+   */
+  settle(): void {
+    for (const [slot, id] of [...this.deferred]) {
+      if (slot <= this.watermark) this.deferred.delete(slot);
+      else if (slot === this.watermark + 1) this.release(slot, id);
+    }
   }
 
   reset(): void {
     this.watermark = 0;
     this.assigned.clear();
+    this.deferred.clear();
   }
 }
 
@@ -66,8 +89,17 @@ export class Follow {
   onSession = false;
   /** A resume of the keyspace is under way after a chain break (09 [READ-46]): frames that do not continue are ignored. */
   resuming = false;
+  /**
+   * The keyspace was named to a live session and its `KeyspaceAdded` (or `KeyspaceDropped`) has not come: the client does not know yet
+   * whether the epoch that it follows is the keyspace's, and sends it nothing (14 [CLI-24], [CLI-53], [CLI-64]).
+   */
+  awaitingAdd = false;
   /** A load is under way. */
   loading = false;
+  /** Consecutive loads that failed with a transient error, the exponent of the client backoff before the next one (14 [CLI-43]). */
+  loadFailures = 0;
+  /** Consecutive adds that a `Retry` rejected, the exponent of the client backoff before the next one (14 [CLI-43], [CLI-44]). */
+  addFailures = 0;
   /** Whether the first cold load of this follow was made (for the `COLD_LOAD` cause). */
   everLoaded = false;
   /** The load answered `skipped_unsupported` (14 [CLI-41]). */

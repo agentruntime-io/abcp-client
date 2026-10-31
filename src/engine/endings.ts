@@ -8,7 +8,7 @@
 
 import { create } from "@bufbuild/protobuf";
 import { Code, ErrorClass, RejectSchema, ChangeKind, type KeyChange, type Reject, type Stale } from "../gen/abpc/v2/types_pb.js";
-import { codeName, isRecordedReject } from "./codes.js";
+import { codeName } from "./codes.js";
 import { EngineCore } from "./core.js";
 import type { Follow } from "./follow.js";
 import { StoreFull, type DeadLetterEntry, type ExportEntry, type JournalEntry, type OutboxEntry, type RejectionRecord, type StorageOp } from "./storage.js";
@@ -26,6 +26,13 @@ export interface EndSpec {
   reject: Reject | undefined;
   /** The reason that the app is told, and the store entry keeps. */
   reason: string;
+  /**
+   * What becomes of the slot of the ended action (14 [CLI-27]), which the lane's watermark decides and never the code of a result:
+   * `release`: the server recorded nothing for the action (the client ended it itself, or the call never reached the server), so the
+   * slot goes to the next action of the lane unless the watermark has passed it. By default the watermark that came with the result of
+   * the same `Mutate` response decides; with no such watermark in hand the slot waits for the next reading.
+   */
+  slot?: "release";
   /** Report `outcome-unknown` with this cause (A.11) instead of `rejected` (14 [CLI-83]). */
   outcomeUnknown?: string;
   /** The actions that depend on it: they fail ([CLI-34]), are left alone, or move to the replacement that the user chose ([CLI-47]). */
@@ -41,6 +48,10 @@ export interface EndSpec {
 export abstract class EndingLayer extends EngineCore {
   /** Entries whose final rejection awaits the app's conflict handler: they no longer shape the view ([CLI-47]) and are never sent. */
   protected readonly ending = new Set<string>();
+  /** The lane watermarks of the `Mutate` response that is being applied have been taken: they are after the results that it carries ([CLI-27]). */
+  protected freshReading = false;
+  /** The conflict flows under way (a handler may take as long as the user does), by mutation id: the epoch flow waits for one before it acts on the next answer (14 [CLI-53]). */
+  protected readonly conflictFlows = new Map<string, Promise<void>>();
   /** Waiters for the cursor of a keyspace to reach a seq (the hold `CONFLICT_WAIT`). */
   protected readonly cursorWaiters = new Map<string, Set<{ need: bigint; wake: () => void }>>();
 
@@ -188,11 +199,12 @@ export abstract class EndingLayer extends EngineCore {
       if (it === items[0] && spec.journal === true) this.journal.delete(en.mutationId);
       this.entries.delete(en.mutationId);
       this.ending.delete(en.mutationId);
-      // 14 [CLI-27]: the slot of an action whose result the server recorded is consumed and stays with the lane until its watermark
-      // passes it; the slot of an action that the server recorded nothing for goes to the next action of the lane. An action that
-      // is reported as outcome unknown may have consumed it: the slot stays, and a lane that it blocks re-identifies (14 [CLI-44]).
-      const consumed = it.unknown !== undefined || (it.reject !== undefined && isRecordedReject(it.reject));
-      if (!consumed) this.releaseSlot(en);
+      // 14 [CLI-27]: whether the slot is consumed is the watermark's to say, never the result's code: a slot at or below the watermark is
+      // consumed; one just above the watermark, after the action got its result, recorded nothing and goes to the next action of the lane.
+      // The watermark of the `Mutate` response that carried the result is in hand (`freshReading`), and so is the fact that a reject that
+      // the client made itself recorded nothing; any other end waits for the next reading, and so does an action reported as outcome
+      // unknown, which may have consumed its slot (14 [CLI-83]).
+      this.settleSlot(en, spec.slot === "release" || (this.freshReading && it.unknown === undefined) ? "decide" : "wait");
       this.dropRuntime(en.mutationId);
     }
     for (const op of ops) {
@@ -289,6 +301,19 @@ export abstract class EndingLayer extends EngineCore {
     f?.lanes[e.lane].release(e.clientSeq, e.mutationId);
   }
 
+  /**
+   * The slot of an action that left the outbox (14 [CLI-27]): at or below the lane's watermark it is consumed and nothing is left to do;
+   * above it, `decide`: the watermark in hand is after the result, so the slot recorded nothing and is given up; `wait`: a later reading
+   * of the watermark decides (`LaneState.settle`).
+   */
+  protected settleSlot(e: OutboxEntry, how: "decide" | "wait"): void {
+    if (e.clientSeq === 0) return;
+    const lane = this.follows.get(e.keyspaceId)?.lanes[e.lane];
+    if (lane === undefined || e.clientSeq <= lane.watermark) return;
+    if (how === "decide") lane.release(e.clientSeq, e.mutationId);
+    else lane.defer(e.clientSeq, e.mutationId);
+  }
+
   // ---------------------------------------------------------------------------------------------------------------------
   // Retiring (14 [CLI-7], [CLI-53])
 
@@ -308,34 +333,19 @@ export abstract class EndingLayer extends EngineCore {
     if (o === undefined || !this.entries.has(e.mutationId)) return;
     if (o.kind === "decided" && o.status !== "COMMITTED") return;
     const f = this.follows.get(e.keyspaceId);
-    const rt = this.rt(e.mutationId);
     const seq = this.outcomeSeq(e);
-    const m = this.content(e);
-    // what was applied against what the prediction showed ([CLI-38], [CLI-40])
+    // what was applied against what the prediction showed ([CLI-38], [CLI-40]): the verdict that the entry keeps, which survives a restart
     const keys = new Set<string>();
-    for (const k of rt.noEffect) keys.add(k); // a CAS that was predicted to have no effect ([CLI-11])
+    for (const k of e.verdict?.noEffect ?? []) keys.add(k); // a CAS that was predicted to have no effect ([CLI-11])
     let cause: "NO_EFFECT" | undefined;
-    for (const k of rt.crdtNoEffect) {
+    for (const k of e.verdict?.crdtNoEffect ?? []) {
       keys.add(k); // a CRDT update that folded to no effect (05 [STATE-76], [CLI-40])
       cause = "NO_EFFECT";
     }
-    if (e.lane === "GATED" && rt.confirmed !== undefined && m !== undefined) {
-      // the gate's effects: the changes after the requested ones, but the intent row (06 [LOG-32]); placeholders unless predicted ([CLI-15])
-      const effects = rt.confirmed.changes.slice(m.changes.length).filter((c) => c.key !== `abpc.intent/${e.mutationId}`);
-      const predictor = this.predictors[e.opType];
-      let predicted: KeyChange[] = [];
-      if (predictor !== undefined) {
-        try {
-          predicted = predictor(this.snapshot(e)).map((c) => this.toKeyChange(c));
-        } catch {
-          predicted = [];
-        }
-      }
-      for (const c of effects) {
-        const p = predicted.find((x) => x.key === c.key);
-        if (p === undefined || p.kind !== c.kind || !sameBytes(p.value, c.value) || p.delta !== c.delta) keys.add(c.key);
-      }
-    }
+    // the gate's effects (14 [CLI-15]): from the DECISION that the client saw; for a decision that it never saw (it came while the engine
+    // was stopped, and a load installed its result), the keys that the decision changed besides the requested ones
+    const effects = e.verdict?.effects ?? (f !== undefined && o.kind === "decided" && o.status === "COMMITTED" ? this.effectKeysFromState(f, e, o.decisionSeq) : []);
+    for (const k of effects) keys.add(k);
     const reported: "committed" | "corrected" = keys.size > 0 ? "corrected" : "committed";
     const journal: JournalEntry = {
       mutationId: e.mutationId,
@@ -346,6 +356,7 @@ export abstract class EndingLayer extends EngineCore {
       outcome: o,
       reported,
       retiredServerMs: this.serverNow(),
+      outcomeServerMs: o.atServerMs ?? this.serverNow(),
       spend: this.opInfoFor(e)?.spend ?? false,
       spendResent: e.spendResent,
       lane: e.lane,
@@ -377,6 +388,38 @@ export abstract class EndingLayer extends EngineCore {
     this.schedulePump();
   }
 
+  /**
+   * The keys of the effects of a GATED decision that the client never saw as a record (14 [CLI-15]): those that the confirmed state holds
+   * at the version of the decision, other than the requested ones and the intent row, which are not the prediction's unless a predictor
+   * of the op type predicted that key with that value. A key that a later record changed is not found, so the verdict is never too high.
+   */
+  private effectKeysFromState(f: Follow, e: OutboxEntry, decisionSeq: bigint): string[] {
+    const m = this.content(e);
+    if (m === undefined) return [];
+    const requested = new Set(m.changes.map((c) => c.key));
+    const predictor = this.predictors[e.opType];
+    let predicted: KeyChange[] = [];
+    if (predictor !== undefined) {
+      try {
+        predicted = predictor(this.snapshot(e)).map((c) => this.toKeyChange(c));
+      } catch {
+        predicted = [];
+      }
+    }
+    const out: string[] = [];
+    const st = f.state;
+    for (const key of [...st.keyNames(), ...st.tombstoneKeys()]) {
+      if (requested.has(key) || key === `abpc.intent/${e.mutationId}`) continue;
+      const row = st.key(key);
+      const version = row !== undefined ? row.version : (st.tombstone(key)?.version ?? 0n);
+      if (version !== decisionSeq) continue;
+      const p = predicted.find((x) => x.key === key);
+      const same = p !== undefined && (row === undefined ? p.kind === ChangeKind.DELETE : p.kind === ChangeKind.SET && sameBytes(p.value, row.value));
+      if (!same) out.push(key);
+    }
+    return out;
+  }
+
   private reportRetired(e: OutboxEntry, reported: "committed" | "corrected", keys: Set<string>, cause: "NO_EFFECT" | undefined, seq: bigint): void {
     if (reported === "committed") this.emit({ type: "committed", mutationId: e.mutationId, keyspaceId: e.keyspaceId, seq });
     else this.emit({ type: "corrected", mutationId: e.mutationId, keyspaceId: e.keyspaceId, seq, keys: [...keys], ...(cause !== undefined ? { cause } : {}) });
@@ -397,7 +440,12 @@ export abstract class EndingLayer extends EngineCore {
     const ev: import("./types.js").ConflictEvent = { type: "conflict", mutationId: e.mutationId, keyspaceId: e.keyspaceId, reject };
     if (reject.stale !== undefined) ev.stale = reject.stale;
     this.emit(ev);
-    this.detach(this.conflictFlow(e, reject, opts.journal === true));
+    const id = e.mutationId;
+    const flow: Promise<void> = this.conflictFlow(e, reject, opts.journal === true).finally(() => {
+      if (this.conflictFlows.get(id) === flow) this.conflictFlows.delete(id);
+    });
+    this.conflictFlows.set(id, flow);
+    this.detach(flow);
   }
 
   private async conflictFlow(e: OutboxEntry, reject: Reject, journal: boolean): Promise<void> {
@@ -427,7 +475,12 @@ export abstract class EndingLayer extends EngineCore {
     await this.run(() => this.endAction(e, { sink: "none", reject, reason: codeName(reject.code), dependents: replacedBy !== undefined ? { replacedBy } : "fail", ...(journal ? { journal: true } : {}) }));
   }
 
-  /** The hold `CONFLICT_WAIT` (14 Table 14.1): wait until the cursor is at `Stale.current_seq`, at most to the default bound. */
+  /**
+   * The hold `CONFLICT_WAIT` (14 Table 14.1): wait until the cursor is at `Stale.current_seq`, at most to the default bound. The table
+   * and [CLI-47] give two ways to wait ("The client loads the key (09 §9.2), or waits for its cursor"); this client takes the second, which
+   * installs nothing that the stream does not, and so keeps the order of the records. The default bound is the end of the wait in either
+   * way, at which the handler is called with the confirmed state that the client holds.
+   */
   private async waitForCursor(e: OutboxEntry, stale: Stale | undefined): Promise<void> {
     const need = stale?.currentSeq ?? 0n;
     const f = this.follows.get(e.keyspaceId);
@@ -520,6 +573,7 @@ export abstract class EndingLayer extends EngineCore {
           outcome: o,
           reported: s.reason === "corrected" ? "corrected" : "committed",
           retiredServerMs: this.serverNow(),
+          outcomeServerMs: o.atServerMs ?? this.serverNow(),
           spend: this.opInfoFor(e)?.spend ?? false,
           spendResent: e.spendResent,
           lane: e.lane,
@@ -547,12 +601,16 @@ export abstract class EndingLayer extends EngineCore {
     }
   }
 
-  /** Drops the journal entries whose window has passed: `max_offline` after the outcome, in server time (14 [CLI-53]). */
+  /**
+   * Drops the journal entries whose window has passed: `max_offline` after the outcome, in server time (14 [CLI-53]). The window runs
+   * from the outcome and not from the retirement: it is as long as the server keeps the outcome's binding (07 [MUT-51]), and a retirement
+   * that waited for the cursor (a hold, a stop of the following, an outage) does not make the server keep the binding longer.
+   */
   protected async purgeJournal(): Promise<void> {
     const now = this.serverNow();
     const ops: StorageOp[] = [];
     for (const j of this.journal.values()) {
-      if (now - j.retiredServerMs > this.limits.maxOfflineMs) ops.push({ op: "deleteJournal", mutationId: j.mutationId });
+      if (now - (j.outcomeServerMs ?? j.retiredServerMs) > this.limits.maxOfflineMs) ops.push({ op: "deleteJournal", mutationId: j.mutationId });
     }
     if (ops.length === 0) return;
     await this.tx(ops);
@@ -560,7 +618,7 @@ export abstract class EndingLayer extends EngineCore {
   }
 }
 
-function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+export function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
   return true;

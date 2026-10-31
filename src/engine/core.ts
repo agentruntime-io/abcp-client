@@ -11,6 +11,7 @@ import { create } from "@bufbuild/protobuf";
 import { type AppLimits, type KeyChange, KeyChangeSchema } from "../gen/abpc/v2/types_pb.js";
 import type { Mutation } from "../gen/abpc/v2/sync_pb.js";
 import { VersionTopology, DEFAULT_FEATURES } from "../rules/fold/index.js";
+import { pushBounded } from "./bounded.js";
 import { systemClock, systemRandom, type Clock, type Random } from "./clock.js";
 import { CanonError, decodeContent } from "./entry.js";
 import { StorageError } from "./errors.js";
@@ -44,6 +45,8 @@ import type {
   TokenProvider,
 } from "./types.js";
 import { ChangeKind } from "../gen/abpc/v2/types_pb.js";
+
+const INTERNAL_ERRORS_KEPT = 100;
 
 export interface EngineConfig {
   appId: string;
@@ -107,12 +110,6 @@ export interface Runtime {
   timer: (() => void) | undefined;
   /** The entry was answered with a pending-intent `Retry`: the server drives it, and the client polls `GetMutationResult` (14 [CLI-44]). */
   polling: boolean;
-  /** The CRDT keys whose confirmed update of this action folded to no effect (14 [CLI-40]). */
-  crdtNoEffect: Set<string>;
-  /** The keys of this action's changes that the prediction gave no effect, read before the record that carries it was applied (14 [CLI-11]). */
-  noEffect: Set<string>;
-  /** The record that carries the action (an OP of its mutation id, or the DECISION of its intent), once it was applied. */
-  confirmed: { seq: bigint; changes: readonly KeyChange[] } | undefined;
   /** The entry is sent alone in its request (14 [CLI-50], a request split). */
   alone: boolean;
   /** How often a request that carried it got `Unauthenticated` (14 [CLI-50]). */
@@ -171,7 +168,10 @@ export abstract class EngineCore {
   protected busy = 0;
   /** Counts the tasks and calls that started or ended, so that `settle` sees a state that no longer changes. */
   protected activity = 0;
+  /** The failures of a task that nothing awaited, the last `INTERNAL_ERRORS_KEPT` of them (a long-lived engine must not keep them all). */
   readonly internalErrors: unknown[] = [];
+  /** How many failures there were in all. */
+  internalErrorCount = 0;
   protected stopped = false;
   private readonly timers = new Set<() => void>();
 
@@ -216,10 +216,16 @@ export abstract class EngineCore {
       },
       (e: unknown) => {
         this.queued--;
-        this.internalErrors.push(e);
+        this.noteInternalError(e);
       },
     );
     return result;
+  }
+
+  /** Records a failure that no caller sees; only the last ones are kept. */
+  protected noteInternalError(e: unknown): void {
+    this.internalErrorCount++;
+    pushBounded(this.internalErrors, e, INTERNAL_ERRORS_KEPT);
   }
 
   /** Runs fn as a task, and records (never throws) a failure. For work that no caller waits for. */
@@ -239,7 +245,7 @@ export abstract class EngineCore {
       (e: unknown) => {
         this.busy--;
         this.activity++;
-        this.internalErrors.push(e);
+        this.noteInternalError(e);
       },
     );
   }
@@ -315,8 +321,14 @@ export abstract class EngineCore {
     return this.clock.now() + this.serverOffsetMs;
   }
 
-  /** Notes a `server_time` from a heartbeat or a record. */
+  /**
+   * Notes a `server_time` from a heartbeat or a record. 14 [CLI-55] has the estimate come from "the latest `server_time` seen": the
+   * time of a record that is delivered late (a held frame, a replay after a resume) is older than the estimate and says nothing new,
+   * since the server's time never goes back, so it moves the estimate forward or not at all. Taking it as now would pull every bound
+   * that the estimate measures (holds, the journal window, warnings) back by the delay of the record.
+   */
   observeServerTime(ms: number): void {
+    if (this.obsServerMs !== undefined && ms <= this.serverNow()) return;
     this.obsServerMs = ms;
     this.obsMono = this.clock.mono();
     const offset = ms - this.clock.now();
@@ -442,7 +454,7 @@ export abstract class EngineCore {
   protected rt(id: string): Runtime {
     let r = this.runtimes.get(id);
     if (r === undefined) {
-      r = { inflight: false, nextAttemptAt: 0, timer: undefined, polling: false, crdtNoEffect: new Set(), noEffect: new Set(), confirmed: undefined, alone: false, authTries: 0 };
+      r = { inflight: false, nextAttemptAt: 0, timer: undefined, polling: false, alone: false, authTries: 0 };
       this.runtimes.set(id, r);
     }
     return r;

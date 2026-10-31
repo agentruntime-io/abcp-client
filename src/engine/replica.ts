@@ -10,15 +10,17 @@
 //  - [CLI-40]: `overwritten` once per mutation id.
 
 import { type RecordsFrame, type HeartbeatFrame, type LoadStateResponse, type LaneWatermark } from "../gen/abpc/v2/sync_pb.js";
-import { Code, ErrorClass, Lane, RecordKind, ChangeKind, DecisionStatus, type KeyEntry, type Record as RecordMessage, type Reject, KeyspaceLifecycle } from "../gen/abpc/v2/types_pb.js";
-import { makeReject } from "./endings.js";
+import { Code, ErrorClass, Lane, RecordKind, ChangeKind, DecisionStatus, type KeyChange, type KeyEntry, type Record as RecordMessage, type Reject, type SuccessorRule, KeyspaceLifecycle } from "../gen/abpc/v2/types_pb.js";
+import { makeReject, sameBytes } from "./endings.js";
 import { applyRecord, FoldError, installEntry, ReplicaState, StateValue } from "../rules/fold/index.js";
+import { matchSuccessor } from "./successors.js";
+import { BoundedSet } from "./bounded.js";
 import { ProtocolViolation } from "./errors.js";
 import { EndingLayer } from "./endings.js";
 import { appliedIndexes, planCrdt, type CrdtPlanItem } from "./crdt-view.js";
 import type { Follow } from "./follow.js";
 import { canDecode } from "./overlay.js";
-import type { OutboxEntry, StoredOutcome } from "./storage.js";
+import type { OutboxEntry, StoredOutcome, Verdict } from "./storage.js";
 import * as Y from "yjs";
 
 /** What a load did to the confirmed state. */
@@ -32,11 +34,12 @@ export interface LoadOutcome {
 
 export abstract class ReplicaLayer extends EndingLayer {
   /** The mutation ids for which `overwritten` was emitted, so that a record delivered again emits none (14 [CLI-40]). */
-  protected readonly overwrittenSeen = new Set<string>();
+  protected readonly overwrittenSeen = new BoundedSet<string>(1024);
   /** The pending actions whose REJECTED DECISION a frame carried: their final rejection is handled after the frame is applied. */
   protected rejectedByRecord: { entry: OutboxEntry; reject: Reject }[] = [];
 
   protected abstract flushDirty(): Promise<void>;
+  protected abstract markDirty(e: OutboxEntry): void;
   protected abstract onRejectResult(e: OutboxEntry, reject: Reject): Promise<void>;
   protected abstract resumeKeyspace(f: Follow): void;
   protected abstract onFoldStop(f: Follow, err: FoldError): void;
@@ -58,7 +61,9 @@ export abstract class ReplicaLayer extends EndingLayer {
       if (wm.clientId !== this.clientId || wm.logEpoch !== f.logEpoch) continue;
       const lane = wm.lane === Lane.SEQUENCED ? f.lanes.SEQUENCED : wm.lane === Lane.GATED ? f.lanes.GATED : undefined;
       if (lane === undefined) continue;
-      if (lane.raise(Number(wm.processedClientSeq))) {
+      const rose = lane.raise(Number(wm.processedClientSeq));
+      lane.settle(); // 14 [CLI-27]: a slot that an ended action left, and the reading leaves unconsumed, goes to the next action
+      if (rose) {
         // 14 [CLI-78]: an action at a slot at or below the watermark has a definitive result; if the client lacks it, it gets it
         // with `GetMutationResult` or by resending the identical content, and never treats the action as unsent
         const laneName = wm.lane === Lane.SEQUENCED ? "SEQUENCED" : "GATED";
@@ -156,12 +161,57 @@ export abstract class ReplicaLayer extends EndingLayer {
     return p !== undefined && p.appId === this.appId && p.sub === this.author.sub && p.issuer === this.author.issuer;
   }
 
-  /** Reads what the prediction shows now, so that the records that arrive can be judged against it ([CLI-11], [CLI-38]). */
-  private capturePredictions(f: Follow): void {
+  /**
+   * Reads what the prediction shows now, so that the records that arrive can be judged against it ([CLI-11], [CLI-38]). What it learns
+   * is kept in the outbox entry, which is written with the next transaction of its task.
+   */
+  protected capturePredictions(f: Follow): void {
     if (this.entriesOf(f.id).length === 0) return;
     const v = this.viewOf(f);
     // sticky: an action that was shown as having no effect and then commits is `corrected` ([CLI-11], [CLI-38])
-    for (const e of this.entriesOf(f.id)) for (const k of v.noEffectKeys(e.mutationId)) this.rt(e.mutationId).noEffect.add(k);
+    for (const e of this.entriesOf(f.id)) this.noteVerdict(e, { noEffect: v.noEffectKeys(e.mutationId) });
+  }
+
+  /** Adds to what the client has learned of how the applied result differs from the prediction, and marks the entry to be written. */
+  protected noteVerdict(e: OutboxEntry, add: { noEffect?: readonly string[]; crdtNoEffect?: readonly string[]; effects?: readonly string[] }): void {
+    const v: Verdict = e.verdict ?? { noEffect: [], crdtNoEffect: [] };
+    let changed = e.verdict === undefined && (add.noEffect?.length ?? 0) + (add.crdtNoEffect?.length ?? 0) > 0;
+    for (const k of add.noEffect ?? []) if (!v.noEffect.includes(k)) (v.noEffect.push(k), (changed = true));
+    for (const k of add.crdtNoEffect ?? []) if (!v.crdtNoEffect.includes(k)) (v.crdtNoEffect.push(k), (changed = true));
+    if (add.effects !== undefined) {
+      const have = v.effects ?? [];
+      for (const k of add.effects) if (!have.includes(k)) have.push(k);
+      if (v.effects === undefined || have.length !== v.effects.length) changed = true;
+      v.effects = have;
+    }
+    if (!changed) return;
+    e.verdict = v;
+    this.markDirty(e);
+  }
+
+  /**
+   * The keys of a gate's effects that the prediction lacked or got wrong, from the DECISION record that made them (14 [CLI-15], [CLI-38]):
+   * the changes after the requested ones, but the intent row; placeholders unless the app registered a predictor for the op type.
+   */
+  private effectKeysOf(e: OutboxEntry, changes: readonly KeyChange[]): string[] {
+    const m = this.content(e);
+    if (m === undefined) return [];
+    const effects = changes.slice(m.changes.length).filter((c) => c.key !== `abpc.intent/${e.mutationId}`);
+    const predictor = this.predictors[e.opType];
+    let predicted: KeyChange[] = [];
+    if (predictor !== undefined) {
+      try {
+        predicted = predictor(this.snapshot(e)).map((c) => this.toKeyChange(c));
+      } catch {
+        predicted = [];
+      }
+    }
+    const out: string[] = [];
+    for (const c of effects) {
+      const p = predicted.find((x) => x.key === c.key);
+      if (p === undefined || p.kind !== c.kind || !sameBytes(p.value, c.value) || p.delta !== c.delta) out.push(c.key);
+    }
+    return out;
   }
 
   /**
@@ -274,15 +324,18 @@ export abstract class ReplicaLayer extends EndingLayer {
     // 14 [CLI-7]: a confirmed DECISION that carries the action's mutation id is its `Decided`, and a confirmed OP that carries its
     // mutation id from the same subject resolves a SEQUENCED action whose outcome was unknown
     const e = this.entries.get(rec.mutationId);
+    const recMs = rec.serverTime !== undefined ? Number(rec.serverTime.seconds) * 1000 + Math.floor(rec.serverTime.nanos / 1e6) : undefined;
+    if (e !== undefined && e.outcome !== undefined && recMs !== undefined && (rec.kind === RecordKind.OP || rec.kind === RecordKind.DECISION) && e.outcome.logEpoch === rec.logEpoch) {
+      // 14 [CLI-53]: the window of the journal runs from the outcome; the record's time is the outcome's, the result's arrival is not earlier
+      e.outcome.atServerMs = Math.min(e.outcome.atServerMs ?? recMs, recMs);
+    }
     if (e !== undefined && (rec.kind === RecordKind.OP || rec.kind === RecordKind.DECISION)) {
-      const rt = this.rt(e.mutationId);
-      rt.confirmed = { seq: rec.seq, changes: rec.changes };
-      for (const item of plan) {
-        if (item.verdict !== "APPLIED") rt.crdtNoEffect.add(item.key);
-      }
+      // 14 [CLI-38], [CLI-40]: how the applied record differs from the prediction, kept with the entry
+      this.noteVerdict(e, { crdtNoEffect: plan.filter((item) => item.verdict !== "APPLIED").map((item) => item.key) });
+      if (rec.kind === RecordKind.DECISION && e.lane === "GATED" && rec.decision?.status === DecisionStatus.COMMITTED) this.noteVerdict(e, { effects: this.effectKeysOf(e, rec.changes) });
       if (e.outcome === undefined || e.outcome.logEpoch !== rec.logEpoch) {
         if (rec.kind === RecordKind.OP && this.isOurs(rec)) {
-          this.setOutcome(e, { kind: "appended", seq: rec.seq, logEpoch: rec.logEpoch, overwroteNewer: [...rec.overwroteNewer] });
+          this.setOutcome(e, { kind: "appended", seq: rec.seq, logEpoch: rec.logEpoch, overwroteNewer: [...rec.overwroteNewer], ...(recMs !== undefined ? { atServerMs: recMs } : {}) });
         } else if (rec.kind === RecordKind.DECISION && rec.decision !== undefined && e.lane === "GATED" && rec.decision.status !== DecisionStatus.COMMITTED) {
           // 14 [CLI-7]: a REJECTED decision is a final rejection, handled as 14 §14.6 says once the frame is applied
           this.rejectedByRecord.push({ entry: e, reject: rec.decision.reject ?? makeReject(Code.GATE_REJECTED, ErrorClass.DEAD_LETTER, "rejected") });
@@ -294,6 +347,7 @@ export abstract class ReplicaLayer extends EndingLayer {
             decisionSeq: rec.seq,
             logEpoch: rec.logEpoch,
             ...(d.reject !== undefined ? { reject: d.reject } : {}),
+            ...(recMs !== undefined ? { atServerMs: recMs } : {}),
           };
           this.setOutcome(e, out);
         }
@@ -303,7 +357,7 @@ export abstract class ReplicaLayer extends EndingLayer {
 
   /** Records the outcome of an action ([CLI-7]); the action retires when the cursor reaches its seq. */
   protected setOutcome(e: OutboxEntry, o: StoredOutcome): void {
-    e.outcome = o;
+    e.outcome = o.atServerMs === undefined ? { ...o, atServerMs: this.serverNow() } : o;
     e.attempts = 0;
     const rt = this.rt(e.mutationId);
     rt.polling = false;
@@ -317,11 +371,56 @@ export abstract class ReplicaLayer extends EndingLayer {
   protected async afterCursorMoved(f: Follow): Promise<void> {
     f.invalidate();
     await this.checkRetirements(f);
+    // 14 [CLI-7]: the actions of a split source retire once the successors that take their keys are loaded at their seq
+    for (const src of this.follows.values()) {
+      if (src !== f && src.stopped === "MOVED" && src.successors.some((r) => r.keyspaceId === f.id)) await this.checkRetirements(src);
+    }
     this.wakeCursorWaiters(f);
     this.schedulePump();
   }
 
-  /** Retires every action of the keyspace whose outcome the cursor has reached ([CLI-7]). */
+  /**
+   * Whether a stop of the following, rather than the cursor, decides the retirement of `e` (14 [CLI-7]): "When the client stops
+   * following the keyspace (`ACCESS_REVOKED`, `GRANT_CHANGED`, `MOVED`, `ARCHIVED`, `DELETED` or `NOT_FOUND`), its actions with a
+   * successful outcome in the epoch of its cursor retire at once"; for `MOVED`, "each retires once every successor that the client
+   * loads and whose rule takes any of its keys is loaded at a `checkpoint_seq` at or above its seq, and at once when there is no such
+   * successor". The cursor of a stopped keyspace never moves, so an outcome that arrives after the stop (a poll, a resend) is judged
+   * here. `undefined`: the keyspace is followed, and the cursor decides.
+   */
+  protected retiresOnStop(f: Follow, e: OutboxEntry): boolean | undefined {
+    switch (f.stopped) {
+      case "ACCESS_REVOKED":
+      case "GRANT_CHANGED":
+      case "ARCHIVED":
+      case "DELETED":
+      case "NOT_FOUND":
+        return true;
+      case "MOVED": {
+        const seq = this.outcomeSeq(e);
+        const m = this.content(e);
+        const keys: string[] = [];
+        if (m !== undefined) {
+          for (const c of m.changes) keys.push(c.key);
+          for (const p of m.preconditions) if (p.target.case === "key") keys.push(p.target.value); // a precondition on a prefix names no key (12 [ADM-45])
+        }
+        const rules = new Set<SuccessorRule>();
+        for (const k of keys) {
+          const r = matchSuccessor(f.successors, k);
+          if (r !== undefined) rules.add(r);
+        }
+        for (const r of rules) {
+          const sf = this.follows.get(r.keyspaceId);
+          if (sf === undefined) continue; // the client does not load this successor
+          if (!sf.loaded || sf.state.seq < seq) return false;
+        }
+        return true;
+      }
+      default:
+        return undefined;
+    }
+  }
+
+  /** Retires every action of the keyspace whose outcome the cursor has reached, or that a stop of the following retires ([CLI-7]). */
   protected async checkRetirements(f: Follow): Promise<void> {
     for (const e of this.entriesOf(f.id)) {
       const o = e.outcome;
@@ -333,7 +432,8 @@ export abstract class ReplicaLayer extends EndingLayer {
         this.needEpochResolution(f);
         continue;
       }
-      if (f.state.seq >= this.outcomeSeq(e)) await this.retire(e);
+      const onStop = this.retiresOnStop(f, e);
+      if (onStop === true || (onStop === undefined && f.state.seq >= this.outcomeSeq(e))) await this.retire(e);
     }
   }
 

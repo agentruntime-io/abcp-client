@@ -18,7 +18,6 @@ import {
   type Retry,
   type SuccessorRule,
 } from "../gen/abpc/v2/types_pb.js";
-import { isReservedKey } from "../rules/fold/index.js";
 import { fullJitter, HOLD_BACKOFF, resendDelay } from "./backoff.js";
 import { codeName, isKnownClass, isKnownCode, reactionOf, retryReasonName } from "./codes.js";
 import { encodeContent } from "./entry.js";
@@ -26,6 +25,7 @@ import { makeReject } from "./endings.js";
 import type { Follow } from "./follow.js";
 import type { Hold, HoldKind } from "./holds.js";
 import { ReplicaLayer } from "./replica.js";
+import { matchSuccessor } from "./successors.js";
 import type { OutboxEntry } from "./storage.js";
 
 /** The row of Table 14.1 that a reject falls under, or undefined for a reject that is no hold. */
@@ -54,23 +54,6 @@ export function holdKindOf(r: Reject): HoldKind | undefined {
   }
 }
 
-/** The successor rule that a key belongs to (14 [CLI-52], 12 [ADM-45]); undefined for a key that matches none. */
-export function matchSuccessor(rules: readonly SuccessorRule[], key: string): SuccessorRule | undefined {
-  let k = key;
-  if (isReservedKey(key)) {
-    // a reserved key matches no rule, except an entity's moved key, which matches the rule of the entity's marker key (11 [COORD-73])
-    const p = "abpc.saga.v1/moved/";
-    if (!key.startsWith(p)) return undefined;
-    k = key.slice(p.length);
-  }
-  let best: SuccessorRule | undefined;
-  for (const r of rules) {
-    if (r.prefix !== "" && k.startsWith(r.prefix) && (best === undefined || r.prefix.length > best.prefix.length)) best = r;
-  }
-  if (best !== undefined) return best;
-  return rules.find((r) => r.prefix === "");
-}
-
 export abstract class ReactionLayer extends ReplicaLayer {
   protected readonly dirty = new Set<string>();
   private readonly probeTimers = new Map<string, () => void>();
@@ -88,6 +71,8 @@ export abstract class ReactionLayer extends ReplicaLayer {
   protected abstract retryEpochResolution(f: Follow): void;
   protected abstract followSuccessors(rules: readonly SuccessorRule[]): void;
   protected abstract pumpAll(): Promise<void>;
+  /** The manifest version in force for the keyspace, as `LoadStateResponse.manifest_version` names it (14 Table 14.1, `UNKNOWN_OP_TYPE`). */
+  protected abstract manifestVersionInForce(f: Follow): Promise<number>;
   protected abstract kick(f?: Follow): void;
 
   // ---------------------------------------------------------------------------------------------------------------------
@@ -225,6 +210,16 @@ export abstract class ReactionLayer extends ReplicaLayer {
             rt.polling = false;
             await this.applyResult(e, resp.result, "poll");
             await this.flushDirty();
+          } else if (f !== undefined && !resp.voided && this.mayMoveAfterAnswer(f, e)) {
+            // 14 [CLI-52]: a GATED action whose last result is a Retry, and the source answers known = false and voided = false: it was
+            // never registered, so it is handled as the other queued actions of the split or archived keyspace are
+            rt.polling = false;
+            if ((await this.moveQueued(f, e, undefined)) === "needWhole") {
+              f.needsLoad = { cause: "RESUME_TOO_OLD", resume: f.loaded };
+              this.kick(f);
+            }
+            this.followSuccessors(f.successors);
+            this.schedulePump();
           } else if (f !== undefined && f.stopped !== undefined && f.stopped !== "GRANT_CHANGED" && f.stopped !== "UNKNOWN_DROP_REASON" && !resp.voided) {
             // 14 [CLI-7], [CLI-83]: the client stopped following the keyspace, and the answer leaves the outcome unknown: the action
             // ends as outcome unknown, so that no such action stays pending
@@ -258,6 +253,12 @@ export abstract class ReactionLayer extends ReplicaLayer {
     const reaction = reactionOf(reject.errorClass);
 
     // the hold rows of Table 14.1 (a HOLD code, a class that the client does not know)
+    // SPEC-QUESTION: 15 [COMPAT-39] says that a reject whose class is unknown or UNSPECIFIED "MUST be handled as HOLD", and 14 [CLI-7] and
+    // [CLI-34] that a REJECTED decision is a final rejection. They meet in a `Decided{REJECTED}` whose reject has a class that this
+    // client does not know. Reading A (taken): the hold rule is the more specific one, the lane is held and the action resent with the hold
+    // backoff, the report says that it is held, and at its bound it is reported as outcome unknown. Reading B: the decision is final,
+    // so the action ends at once as rejected, to the dead-letter store, whatever the class; a resend of a decided intent can only get
+    // the same stored decision again, so reading A reports a rejection that the server has made as an outcome that is unknown.
     const hk = holdKindOf(reject);
     if (hk !== undefined) {
       await this.enterHold(e, reject, hk);
@@ -386,14 +387,45 @@ export abstract class ReactionLayer extends ReplicaLayer {
     return h;
   }
 
+  /**
+   * A.7 "stop and report", for a `Mutate` call that failed with a status that has a row of its own and no ABPC detail: `PermissionDenied`
+   * after the one refresh, `NotFound`, `AlreadyExists`, `FailedPrecondition`. The action is kept, never dropped unseen (02 [ARC-50]),
+   * and the lane stops: it is held as 14 Table 14.1 holds a lane for a code that the client does not know, with the status as the hold's
+   * code, which `held` and the sync status report. The head of the lane is resent with the hold backoff, which ends the hold when a
+   * resend gets a result, and the default bound ends the actions (14 [CLI-45]).
+   *
+   * SPEC-QUESTION: A.7 says "stop and report" and gives no Table 14.1 row for these statuses on a `Mutate` call. Reading A (taken): the
+   * lane hold above, which reports, keeps the action, never loops (the hold backoff) and ends at the default bound as every hold does.
+   * Reading B: the client stops sending for good, or dead-letters the action at once with the status as its reason. Reading B loses an
+   * action to a status that a proxy or a deployment mistake can send, and has no way to resume; reading A needs no rule that the text lacks.
+   */
+  protected stopAndReport(entries: readonly OutboxEntry[], status: string): void {
+    const lanes = new Set<string>();
+    for (const e of entries) {
+      e.lastResult = { kind: "rpc", what: status, atMs: this.serverNow() };
+      this.markDirty(e);
+      const key = `${e.keyspaceId}|${e.lane}`;
+      if (lanes.has(key)) continue;
+      lanes.add(key);
+      const h = this.startHold({ kind: "UNKNOWN_HOLD", scope: "lane", keyspaceId: e.keyspaceId, lane: e.lane, code: status, probeId: e.mutationId });
+      this.armProbe(h);
+    }
+  }
+
   /** The reaction to a `HOLD` result: keep the action, stop the scope, tell the app, and clear as the table says. */
   protected async enterHold(e: OutboxEntry, reject: Reject, kind: HoldKind): Promise<void> {
     const f = this.follows.get(e.keyspaceId);
     const rt = this.rt(e.mutationId);
     const code = kind === "UNKNOWN_HOLD" ? (isKnownClass(reject.errorClass) ? codeName(reject.code) : "CLASS_UNKNOWN") : codeName(reject.code);
+    // the reject that starts a hold goes with it: an action that the hold ends before it was sent is dead-lettered with it (14 [CLI-45])
+    const stamp = (h: Hold): Hold => {
+      h.reject ??= reject;
+      return h;
+    };
     switch (kind) {
       case "UNKNOWN_OP_TYPE": {
-        const h = this.startHold({ kind, scope: "lane", keyspaceId: e.keyspaceId, lane: e.lane, code, probeId: e.mutationId });
+        const h = stamp(this.startHold({ kind, scope: "lane", keyspaceId: e.keyspaceId, lane: e.lane, code, probeId: e.mutationId }));
+        this.armProbe(h); // a resend of the lane's head with the hold backoff, which is all that bounds a server that keeps answering it
         if (f !== undefined) this.detach(this.reloadManifestFor(f, e, h));
         return;
       }
@@ -408,43 +440,56 @@ export abstract class ReactionLayer extends ReplicaLayer {
       case "KEYSPACE_NOT_FOUND": {
         // the wait of 07 [MUT-101]: counted from the first KEYSPACE_NOT_FOUND, or from the end of the client's own CreateKeyspace
         const bound = this.serverNow() + this.limits.keyspaceNotFoundWaitMs;
-        this.holdKeyspace(kind, code, e.keyspaceId, bound).probeId = e.mutationId;
+        stamp(this.holdKeyspace(kind, code, e.keyspaceId, bound)).probeId = e.mutationId;
         return;
       }
       case "UPGRADE_REQUIRED":
-        this.holdKeyspace(kind, code, e.keyspaceId);
+        stamp(this.holdKeyspace(kind, code, e.keyspaceId));
         return;
       case "HISTORY_DIVERGED":
-        this.holdKeyspace(kind, code, e.keyspaceId);
+        stamp(this.holdKeyspace(kind, code, e.keyspaceId));
         return;
       case "UNSUPPORTED_FEATURE":
       case "UNKNOWN_HOLD": {
-        const h = this.startHold({ kind, scope: "lane", keyspaceId: e.keyspaceId, lane: e.lane, code, probeId: e.mutationId });
+        const h = stamp(this.startHold({ kind, scope: "lane", keyspaceId: e.keyspaceId, lane: e.lane, code, probeId: e.mutationId }));
         this.armProbe(h);
         return;
       }
       case "APP_SUSPENDED":
-        this.holdApp(kind, code);
+        stamp(this.holdApp(kind, code));
         return;
       default:
         rt.nextAttemptAt = 0;
     }
   }
 
-  /** The hold `UNKNOWN_OP_TYPE`: reload the manifest version in force; the type declared clears it, or the action is dead-lettered at once. */
+  /**
+   * The hold `UNKNOWN_OP_TYPE` (14 Table 14.1): "The client reloads the keyspace's manifest version in force, the version that
+   * `LoadStateResponse.manifest_version` names, with `GetManifest`". A `LoadState` says which version that is, and that version is
+   * loaded again; the version that the client holds may be an older one, which declares the type that the version in force does not.
+   * The type is not declared by it: "dead-lettered at once", since the server answers the code only after its duplicate lookup, so
+   * nothing was recorded for the action. It is declared and the version is not the one the client used: the client resends at once.
+   * It is declared by the version that the client already used: the server's answer contradicts the client's manifest, so the hold
+   * stays and its probe resends the head with the hold backoff, which is what bounds a server that keeps answering it.
+   */
   private async reloadManifestFor(f: Follow, e: OutboxEntry, h: Hold): Promise<void> {
-    const version = f.state.manifestVersion;
+    const used = f.state.manifestVersion;
+    let version = 0;
+    let loaded = false;
     try {
-      await this.manifests.reload(version);
+      version = await this.manifestVersionInForce(f);
+      loaded = await this.manifests.reload(version);
     } catch {
-      // the reload failed: the hold stays and a probe tries again
+      // the version, or its manifest, could not be had: the hold stays, and its probe resends the action, which brings the answer again
     }
     await this.run(async () => {
       if (!this.entries.has(e.mutationId)) {
         this.stopHold("UNKNOWN_OP_TYPE", h.keyspaceId, h.lane);
         return;
       }
-      const declared = this.manifests.get(f.state.manifestVersion)?.opType(e.opType) !== undefined;
+      if (!loaded) return;
+      const declared = this.manifests.get(version)?.opType(e.opType) !== undefined;
+      if (declared && version === used) return; // the probe of the hold resends it
       this.stopHold("UNKNOWN_OP_TYPE", h.keyspaceId, h.lane);
       if (declared) {
         this.rt(e.mutationId).nextAttemptAt = 0;
@@ -486,6 +531,7 @@ export abstract class ReactionLayer extends ReplicaLayer {
           this.readdKeyspace(f);
         } else this.schedulePump(); // the head is resent
         break;
+      case "UNKNOWN_OP_TYPE":
       case "UNSUPPORTED_FEATURE":
       case "UNKNOWN_HOLD":
         this.schedulePump(); // the lane's head is resent, unchanged
@@ -549,7 +595,7 @@ export abstract class ReactionLayer extends ReplicaLayer {
   /** A result that is not the hold's own ends it (14 Table 14.1, "clears when"): a resend that gets another result. */
   protected clearProbeHolds(e: OutboxEntry, keep: HoldKind | undefined): void {
     for (const h of this.holds.all()) {
-      if (h.kind !== "UNSUPPORTED_FEATURE" && h.kind !== "UNKNOWN_HOLD" && h.kind !== "KEYSPACE_NOT_FOUND") continue;
+      if (h.kind !== "UNSUPPORTED_FEATURE" && h.kind !== "UNKNOWN_HOLD" && h.kind !== "KEYSPACE_NOT_FOUND" && h.kind !== "UNKNOWN_OP_TYPE") continue;
       if (h.keyspaceId !== e.keyspaceId || h.kind === keep) continue;
       if (h.scope === "lane" && h.lane !== e.lane) continue;
       this.stopHold(h.kind, h.keyspaceId, h.lane, h.mutationId);
@@ -607,8 +653,7 @@ export abstract class ReactionLayer extends ReplicaLayer {
         if (e.everSent || e.registered) {
           await this.endAction(e, { sink: "export", reject: undefined, reason: "HOLD_BOUND", outcomeUnknown: "HOLD_BOUND", dependents: "fail" });
         } else {
-          const reject = makeReject(codeOfName(h.code), ErrorClass.HOLD, `the hold ${h.code} reached its bound`);
-          await this.endAction(e, { sink: "deadLetter", reject, reason: h.code, dependents: "fail" });
+          await this.endAction(e, { sink: "deadLetter", reject: holdReject(h), reason: h.code, dependents: "fail" });
         }
       }
     }
@@ -658,47 +703,15 @@ export abstract class ReactionLayer extends ReplicaLayer {
     for (const e of entries) {
       if (!this.entries.has(e.mutationId) || e.outcome !== undefined || this.ending.has(e.mutationId) || e.stuck !== undefined) continue;
       if (this.rt(e.mutationId).inflight && e !== trigger) continue; // its answer is on the way, and decides it
-      const m = this.content(e);
-      const eligible = e === trigger || (!e.registered && (!e.everSent || e.lastResult?.kind === "retry" || e.lastResult?.kind === "reject"));
-      if (!eligible) {
+      if (!this.mayMove(e, trigger)) {
         // an action with an unknown outcome, or registered as an intent, is not re-routed or dead-lettered until the source gives
-        // it a result (14 [CLI-52], [CLI-24])
+        // it a result (14 [CLI-52], [CLI-24]); a GATED action whose last result is a Retry waits for the answer of
+        // `GetMutationResult` as well, since the Retry may be the answer for an intent that is registered and pending, logged or not
         if (poll && !this.rt(e.mutationId).polling) this.pollNow(e);
         continue;
       }
-      const keys = new Set<string>();
-      if (m !== undefined) {
-        for (const c of m.changes) keys.add(c.key);
-        for (const p of m.preconditions) if (p.target.case === "key") keys.add(p.target.value); // a precondition on a prefix names no key (12 [ADM-45])
-      }
       // the action's own reject holds the one or two rules that its keys match; another action needs the whole map, which a load gives (14 [CLI-52])
-      const own1 = e === trigger ? own : undefined;
-      const successors = own1 ?? f.successors;
-      if (own1 === undefined && f.successors.length === 0) {
-        needWhole = true;
-        continue;
-      }
-      const matched = [...keys].map((k) => matchSuccessor(successors, k));
-      const rulesOf = (): SuccessorRule[] => {
-        const out: SuccessorRule[] = [];
-        for (const r of matched) if (r !== undefined && !out.includes(r)) out.push(r);
-        return out;
-      };
-      if (lifecycle === KeyspaceLifecycle.SPLIT && m !== undefined && keys.size > 0 && matched.every((r) => r !== undefined && r === matched[0])) {
-        const target = (matched[0] as SuccessorRule).keyspaceId;
-        await this.reroute(e, m, target);
-        continue;
-      }
-      // archived, or a split action whose keys do not all belong to one rule: dead-lettered with KEYSPACE_ARCHIVED and the rules that
-      // its keys match; nothing is re-routed and no seen_version is reset
-      const reject = create(RejectSchema, {
-        code: Code.KEYSPACE_ARCHIVED,
-        errorClass: ErrorClass.DEAD_LETTER,
-        message: lifecycle === KeyspaceLifecycle.SPLIT ? "split: the keys of the action do not belong to one successor" : "archived",
-        details: { lifecycle: lifecycle === KeyspaceLifecycle.SPLIT ? "SPLIT" : "ARCHIVED" },
-        successors: rulesOf(),
-      });
-      await this.endAction(e, { sink: "deadLetter", reject, reason: codeName(Code.KEYSPACE_ARCHIVED), dependents: "fail" });
+      if ((await this.moveQueued(f, e, e === trigger ? own : undefined)) === "needWhole") needWhole = true;
     }
     if (needWhole) {
       f.needsLoad = { cause: "RESUME_TOO_OLD", resume: f.loaded };
@@ -706,6 +719,66 @@ export abstract class ReactionLayer extends ReplicaLayer {
     }
     this.followSuccessors(f.successors);
     this.schedulePump();
+  }
+
+  /**
+   * Whether a queued action of a split or archived keyspace may be re-routed or dead-lettered now (14 [CLI-52]): the action whose
+   * reject told the client; one that was never sent; a SEQUENCED action whose last result is a `Retry`; one whose last result is an
+   * unrecorded reject. Not a GATED action whose last result is a `Retry`: "for which `GetMutationResult` from the source answers
+   * `known = false` and `voided = false`", which `pollNow` asks and `mayMoveAfterAnswer` judges. An intent that is registered and
+   * pending, logged or not, answers every call with a `Retry` and `intent_seq` only when it is logged (07 [MUT-8]), so a Retry says
+   * nothing about registration (02 [ARC-50]: moving it would apply it twice, or end it that was decided).
+   */
+  private mayMove(e: OutboxEntry, trigger: OutboxEntry | undefined): boolean {
+    if (e === trigger) return true;
+    if (e.registered) return false;
+    if (!e.everSent) return true;
+    if (e.lastResult?.kind === "reject") return true;
+    return e.lastResult?.kind === "retry" && e.lane === "SEQUENCED";
+  }
+
+  /** Whether the source's answer `known = false`, `voided = false` frees a GATED action whose last result was a Retry to be moved (14 [CLI-52]). */
+  protected mayMoveAfterAnswer(f: Follow, e: OutboxEntry): boolean {
+    return (f.stopped === "MOVED" || f.stopped === "ARCHIVED") && e.lane === "GATED" && !e.registered && e.lastResult?.kind === "retry";
+  }
+
+  /**
+   * Re-routes (a split) or dead-letters (an archive, or a split action whose keys do not belong to one rule) a queued action that
+   * [CLI-52] lets go. `needWhole`: the action's own reject is not given and the whole map of successors is not known yet; a load gives it.
+   */
+  protected async moveQueued(f: Follow, e: OutboxEntry, own: readonly SuccessorRule[] | undefined): Promise<"done" | "needWhole"> {
+    const lifecycle = f.lifecycle;
+    if (lifecycle !== KeyspaceLifecycle.SPLIT && lifecycle !== KeyspaceLifecycle.ARCHIVED) return "done";
+    const m = this.content(e);
+    const keys = new Set<string>();
+    if (m !== undefined) {
+      for (const c of m.changes) keys.add(c.key);
+      for (const p of m.preconditions) if (p.target.case === "key") keys.add(p.target.value); // a precondition on a prefix names no key (12 [ADM-45])
+    }
+    const successors = own ?? f.successors;
+    if (own === undefined && f.successors.length === 0) return "needWhole";
+    const matched = [...keys].map((k) => matchSuccessor(successors, k));
+    const rulesOf = (): SuccessorRule[] => {
+      const out: SuccessorRule[] = [];
+      for (const r of matched) if (r !== undefined && !out.includes(r)) out.push(r);
+      return out;
+    };
+    if (lifecycle === KeyspaceLifecycle.SPLIT && m !== undefined && keys.size > 0 && matched.every((r) => r !== undefined && r === matched[0])) {
+      const target = (matched[0] as SuccessorRule).keyspaceId;
+      await this.reroute(e, m, target);
+      return "done";
+    }
+    // archived, or a split action whose keys do not all belong to one rule: dead-lettered with KEYSPACE_ARCHIVED and the rules that
+    // its keys match; nothing is re-routed and no seen_version is reset
+    const reject = create(RejectSchema, {
+      code: Code.KEYSPACE_ARCHIVED,
+      errorClass: ErrorClass.DEAD_LETTER,
+      message: lifecycle === KeyspaceLifecycle.SPLIT ? "split: the keys of the action do not belong to one successor" : "archived",
+      details: { lifecycle: lifecycle === KeyspaceLifecycle.SPLIT ? "SPLIT" : "ARCHIVED" },
+      successors: rulesOf(),
+    });
+    await this.endAction(e, { sink: "deadLetter", reject, reason: codeName(Code.KEYSPACE_ARCHIVED), dependents: "fail", slot: "release" });
+    return "done";
   }
 
   /** Re-routes a queued action to the split successor of its keys: only `keyspace_id` changes, stored once ([CLI-22], [CLI-52]). */
@@ -773,4 +846,30 @@ function lifecycleOf(r: Reject, f: Follow): KeyspaceLifecycle {
 function codeOfName(name: string): Code {
   const v = (Code as unknown as Record<string, number>)[name];
   return v !== undefined && isKnownCode(v) ? (v as Code) : Code.UNSPECIFIED;
+}
+
+/** The `Code` of a hold that has none of its own name: the code that its row of Table 14.1 stands for. */
+const HOLD_KIND_CODE: Partial<Record<HoldKind, Code>> = {
+  KEYSPACE_NOT_FOUND: Code.KEYSPACE_NOT_FOUND,
+  UNKNOWN_OP_TYPE: Code.UNKNOWN_OP_TYPE,
+  CLIENT_FORKED: Code.CLIENT_FORKED,
+  CLIENT_UNKNOWN: Code.CLIENT_UNKNOWN,
+  UPGRADE_REQUIRED: Code.UPGRADE_REQUIRED,
+  UNSUPPORTED_FEATURE: Code.UNSUPPORTED_FEATURE,
+  HISTORY_DIVERGED: Code.HISTORY_DIVERGED,
+  APP_SUSPENDED: Code.APP_SUSPENDED,
+  SESSION_CAP: Code.QUOTA_EXCEEDED,
+};
+
+/**
+ * The reject that an action carries to the dead-letter store when the hold that stopped it reaches its bound before it was ever sent
+ * (14 [CLI-45]: "dead-lettered with the hold's code"). The hold's code is `details["hold"]` whatever it is, since a hold's code may
+ * be a drop reason or a condition (`NOT_FOUND`, `EPOCH_RESOLUTION`, `CLASS_UNKNOWN`) that no `Code` names; `code` is the reject that
+ * started the hold, when one did (a code or a class that the client does not know included), or else the code of the hold's row.
+ */
+function holdReject(h: Hold): Reject {
+  const message = `the hold ${h.code} reached its bound`;
+  if (h.reject !== undefined) return create(RejectSchema, { ...h.reject, message, details: { ...h.reject.details, hold: h.code } });
+  const named = codeOfName(h.code);
+  return makeReject(named !== Code.UNSPECIFIED ? named : (HOLD_KIND_CODE[h.kind] ?? Code.UNSPECIFIED), ErrorClass.HOLD, message, { hold: h.code });
 }
