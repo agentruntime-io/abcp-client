@@ -3,9 +3,9 @@
 
 import { describe, expect, it } from "vitest";
 import { create, toBinary } from "@bufbuild/protobuf";
-import { jsonBytes, set, StaticManifests, type ConflictContext, type EngineEvent } from "../src/engine/index.js";
+import { del, jsonBytes, set, StaticManifests, type ConflictContext, type EngineEvent } from "../src/engine/index.js";
 import { MutateRequestSchema } from "../src/gen/abpc/v2/sync_pb.js";
-import { ChangeKind, Code, RetryReason, StaleCause, SuccessorRuleSchema, type SuccessorRule } from "../src/gen/abpc/v2/types_pb.js";
+import { ChangeKind, Code, ErrorClass, RetryReason, StaleCause, SuccessorRuleSchema, type SuccessorRule } from "../src/gen/abpc/v2/types_pb.js";
 import { LaneState } from "../src/engine/follow.js";
 import { ManualClock, reject as mk, rejectWith } from "../src/fake/index.js";
 import { goOffline, goOnline, kc, KS, MANIFEST, mutateRequests, ofType, rejectResult, retryResult, rig, sentIds, tick, types, type Rig } from "./helpers/engine.js";
@@ -579,15 +579,34 @@ describe("SPEC-QUESTION readings, as taken", () => {
     expect(kinds(r, a.mutationId).filter((t) => t !== "overwritten")).toEqual(["committed"]);
   });
 
-  it("15 [COMPAT-39] with 14 [CLI-7]: a REJECTED decision whose reject has a class that the client does not know holds the lane; it is not a final rejection", async () => {
+  it("Q42.2 (ruled) 15 [COMPAT-39] with 14 [CLI-7], [CLI-34]: a REJECTED decision whose reject has a class that the client does not know is final, handled as DEAD_LETTER: no hold, the dependents fail, the class is reported", async () => {
+    for (const cls of [77, ErrorClass.UNSPECIFIED]) {
+      const r = await rig();
+      const g = await r.engine.submit({ keyspaceId: KS, opType: "Approve", changes: [set("settings/g", 1)] });
+      await r.engine.settle();
+      const dep = await r.engine.submit({ keyspaceId: KS, opType: "Set", changes: [del("settings/g")] }); // depends on g, never sent
+      await r.engine.settle();
+      r.server.decide(KS, g.mutationId, { status: "REJECTED", reject: rejectWith(901, cls) });
+      await r.engine.settle();
+      expect(r.events.filter((e) => e.type === "held"), `class ${cls}: a hold that no resend can clear`).toEqual([]);
+      expect(kinds(r, g.mutationId)).toEqual(["rejected", "dead-lettered"]);
+      expect(kinds(r, dep.mutationId)).toEqual(["rejected", "dead-lettered"]); // 14 [CLI-34]
+      const rejected = r.events.find((e) => e.type === "rejected" && (e as { mutationId: string }).mutationId === g.mutationId) as { reject?: { errorClass: number; code: number } };
+      expect(rejected.reject).toMatchObject({ errorClass: cls, code: 901 }); // the app is told the class that the client did not know
+      expect(r.engine.status().holds).toEqual([]);
+      expect(r.engine.outbox()).toEqual([]);
+      expect(r.engine.deadLetterEntries().map((d) => d.mutationId).sort()).toEqual([g.mutationId, dep.mutationId].sort());
+    }
+  });
+
+  it("Q42.2 (ruled): the hold is for a `Reject` result only: a `Reject` of an unknown class that is no decision still holds the lane", async () => {
     const r = await rig();
-    const g = await r.engine.submit({ keyspaceId: KS, opType: "Approve", changes: [set("settings/g", 1)] });
+    r.random.fixed = 0.999999;
+    r.server.inject("mutate", { kind: "result", result: (m) => rejectResult(m, rejectWith(901, 77)) });
+    const a = await r.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/a", 1)] });
     await r.engine.settle();
-    r.server.decide(KS, g.mutationId, { status: "REJECTED", reject: rejectWith(901, 77) });
-    await r.engine.settle();
-    expect(r.events.filter((e) => e.type === "held").map((e) => [(e as { state: string }).state, (e as { code: string }).code])).toEqual([["start", "CLASS_UNKNOWN"]]);
-    expect(kinds(r, g.mutationId)).toEqual([]); // no rejected, no dead-lettered
-    expect(r.engine.status().holds).toEqual([expect.objectContaining({ scope: "lane", lane: "GATED", code: "CLASS_UNKNOWN" })]);
-    expect(r.engine.outbox().map((e) => e.mutationId)).toEqual([g.mutationId]);
+    expect(r.events.filter((e) => e.type === "held").map((e) => (e as { code: string }).code)).toEqual(["CLASS_UNKNOWN"]);
+    expect(kinds(r, a.mutationId)).toEqual([]);
+    expect(r.engine.status().holds).toEqual([expect.objectContaining({ scope: "lane", code: "CLASS_UNKNOWN" })]);
   });
 });

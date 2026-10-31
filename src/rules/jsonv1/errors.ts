@@ -42,6 +42,34 @@ export class JsonV1Error extends Error {
   }
 }
 
+/**
+ * The most of the input that an error message repeats: a message never grows with the input (02 [ARC-46]). A 20,000-octet number token
+ * or member name reaches the error of a client's value and of a manifest, and a response or a log line must not carry it whole (V1
+ * SHOULD-8).
+ */
+const MAX_ECHO = 32;
+
+/** The most of a name that an error path repeats: the longest field name that 04 [MAN-26] allows, so that the path of a valid name is whole. */
+const MAX_ECHO_NAME = 64;
+
+/** Returns s for the message of an error, cut to `limit` characters (never between the halves of a surrogate pair), with its length in octets when it is cut. */
+export function echoAt(s: string, limit: number): string {
+  if (s.length <= limit) return s;
+  let n = limit;
+  const c = s.charCodeAt(n - 1);
+  if (c >= 0xd800 && c <= 0xdbff) n--; // the cut would split a pair
+  return `${s.slice(0, n)}... (${new TextEncoder().encode(s).length} octets)`;
+}
+
+/** `echoAt(s, 32)`. */
+export const echo = (s: string): string => echoAt(s, MAX_ECHO);
+
+/** `echo(s)` as a quoted JSON string. */
+export const quote = (s: string): string => JSON.stringify(echo(s));
+
+/** A name in the path of an error. */
+export const echoName = (s: string): string => echoAt(s, MAX_ECHO_NAME);
+
 export function valueError(reason: Reason, rule: string, message: string): JsonV1Error {
   return new JsonV1Error("SCHEMA_INVALID", reason, rule, message);
 }

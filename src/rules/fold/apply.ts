@@ -19,8 +19,8 @@ import {
 import { CrdtError, Doc, parseUpdate, type Update } from "../crdt/index.js";
 import { applyIncr, counterText, JsonV1Error, parseCounter } from "../jsonv1/index.js";
 import { compareUtf8 } from "../bytes.js";
-import { refuse } from "./errors.js";
-import { inSubtree, type Rules, type Template, VersionTopology } from "./rules.js";
+import { type Anomaly, refuse } from "./errors.js";
+import { type Rules, type Template, VersionTopology } from "./rules.js";
 import { selectSystem, type Selection } from "./system.js";
 import {
   CRDT_ENCODING,
@@ -48,6 +48,13 @@ export interface FoldOptions {
    * The records alone do not tell, so the coordination milestone supplies it; absent means that no deletion leaves one.
    */
   staged?: (st: ReplicaState, rec: RecordMessage, key: string) => boolean;
+  /**
+   * Called with each change that a record the fold has applied carries and that its kind does not define (02 [ARC-46], 06 [LOG-41],
+   * the Q13 ruling): the fold ignored it, and the caller counts and reports it. A record that the fold refuses reports none, and nor
+   * does a record at or below the cursor (an overlapping delivery), which was reported when it moved the state. It runs inside
+   * `applyRecord`, so it must not call back into the state.
+   */
+  report?: (a: Anomaly) => void;
 }
 
 /** What `applyRecord` did. */
@@ -101,13 +108,30 @@ export function applyRecord(st: ReplicaState, rules: Rules, rec: RecordMessage, 
   }
   const p = plan(st, rules, rec, sel, opts, isNew);
   commit(st, rec, p);
-  if (isNew) st.applied(seq, rec.logEpoch, rec.manifestVersion);
+  if (isNew) {
+    st.applied(seq, rec.logEpoch, rec.manifestVersion);
+    report(rec, sel, opts);
+  }
   return { moved: isNew, skipped: p.skipped };
 }
 
+/** Tells `FoldOptions.report` of the changes that the record carried and the fold ignored (02 [ARC-46]). */
+function report(rec: RecordMessage, sel: Selection, opts: FoldOptions): void {
+  if (opts.report === undefined || sel.ignored === undefined) return;
+  for (const i of sel.ignored) {
+    opts.report({ seq: rec.seq, index: i, key: (rec.changes[i] as KeyChange).key, rule: sel.ignoredRule ?? "LOG-41", detail: sel.ignoredWhy ?? "" });
+  }
+}
+
 /**
- * The stop of 06 [LOG-11]: a record of unknown kind, or with a required feature that the folder does not support. The SYSTEM
- * kind that the fold does not know is judged with the record's changes (`selectChanges`).
+ * The stop of 15 [COMPAT-35] and 06 [LOG-11]: a record of unknown kind, a record with a required feature that the folder does not
+ * support, a DECISION with a status that it does not know (15 Table 15.2), and a change of a kind or with an encoding that it does
+ * not know. It reads every change of the record, applied or not: the reader meets them all. The SYSTEM kind that the fold does not
+ * know is judged with the record's changes (`selectChanges`).
+ *
+ * A change of a known kind and encoding that the fold cannot apply (a counter that is no counter, a key that no template matches, a
+ * CRDT update that is not a Yjs update) is not on this list: 15 [COMPAT-35] does not stop the keyspace for it, and 02 [ARC-46] has the
+ * reader count and report it (`malformed`, `no-template`).
  */
 function understood(rec: RecordMessage, opts: FoldOptions): void {
   switch (rec.kind) {
@@ -126,6 +150,39 @@ function understood(rec: RecordMessage, opts: FoldOptions): void {
       // LOG-11: stop at the previous seq.
       throw refuse("unsupported-feature", rec.seq, "LOG-11", `required feature "${feature}" is not supported`);
     }
+  }
+  if (rec.kind === RecordKind.DECISION) {
+    const status = rec.decision?.status;
+    if (status !== DecisionStatus.COMMITTED && status !== DecisionStatus.REJECTED) {
+      // COMPAT-35 (Table 15.2, DecisionStatus): a reader stops at the record, as for an unknown record kind.
+      throw refuse("unknown-decision-status", rec.seq, "COMPAT-35", `a DECISION record with status ${status ?? 0}`);
+    }
+  }
+  rec.changes.forEach((c, i) => changeKnown(rec.seq, i, c));
+}
+
+/** The encodings of 05 Table 5.2.1. */
+const KNOWN_ENCODINGS: ReadonlySet<string> = new Set<string>(["json/v1", "bytes/v1", CRDT_ENCODING, REDACTED_ENCODING]);
+
+/**
+ * The stop of 15 [COMPAT-35] for "a change kind or an encoding it does not know". The encoding is read for the kinds that carry one
+ * (05 [STATE-20]); a change that carries none, and an empty encoding, name no encoding to know.
+ */
+function changeKnown(seq: bigint, i: number, c: KeyChange): void {
+  switch (c.kind) {
+    case ChangeKind.DELETE:
+    case ChangeKind.INCR:
+      return;
+    case ChangeKind.SET:
+    case ChangeKind.CAS:
+    case ChangeKind.CRDT_UPDATE:
+    case ChangeKind.OVERRIDE:
+      if (c.encoding !== "" && !KNOWN_ENCODINGS.has(c.encoding)) {
+        throw refuse("unknown-encoding", seq, "COMPAT-35", `change ${i} of key "${c.key}" has encoding "${c.encoding}"`);
+      }
+      return;
+    default:
+      throw refuse("unknown-change-kind", seq, "COMPAT-35", `change ${i} of key "${c.key}" has kind ${c.kind}`);
   }
 }
 
@@ -159,7 +216,8 @@ function selectChanges(rec: RecordMessage): Selection {
         // LOG-32: the intent row only; with log_intent false there is none, and nothing is applied.
         return { applied: rowOnly() };
       }
-      throw refuse("malformed", rec.seq, "LOG-33", `a DECISION record with status ${status ?? 0}`);
+      // `understood` stops at any other status
+      throw refuse("unknown-decision-status", rec.seq, "COMPAT-35", `a DECISION record with status ${status ?? 0}`);
     }
     default:
       // SYSTEM, which `understood` has let through
@@ -172,7 +230,10 @@ interface Step {
   delete: boolean;
   /** A DELETE of a marker key. */
   subtree?: Subtree;
-  /** A DELETE of a key of the subtree of a marker key that the same record deletes. */
+  /**
+   * A change to a key of the subtree of a marker key that the same record deletes: a DELETE, or any other change (05 [STATE-43]). The
+   * subtree deletion decides the key's state, and the step makes it absent with no tombstone.
+   */
   covered: boolean;
   /** Any other change: the key it stores, and the CRDT update to integrate into its document, when it has one. */
   put?: KeyRow;
@@ -193,15 +254,6 @@ interface Plan {
   finish?: (st: ReplicaState) => void;
 }
 
-const CHANGE_KINDS = new Set<number>([
-  ChangeKind.SET,
-  ChangeKind.DELETE,
-  ChangeKind.INCR,
-  ChangeKind.CAS,
-  ChangeKind.CRDT_UPDATE,
-  ChangeKind.OVERRIDE,
-]);
-
 /** Reads the applied changes of the record against the state before it, and returns what to do. */
 function plan(st: ReplicaState, rules: Rules, rec: RecordMessage, sel: Selection, opts: FoldOptions, isNew: boolean): Plan {
   const seq = rec.seq;
@@ -213,7 +265,8 @@ function plan(st: ReplicaState, rules: Rules, rec: RecordMessage, sel: Selection
     if (isNew) p.finish = sel.sys.finish;
   }
 
-  // Pass 1: the shape of each applied change, the version-gated test, and the marker keys that the record deletes.
+  // Pass 1: the shape of each applied change, the version-gated test, and the marker keys that the record deletes. The kind and the
+  // encoding of every change of the record were judged by `understood` (15 [COMPAT-35]).
   interface Read {
     c: KeyChange;
     tpl: Template;
@@ -221,11 +274,11 @@ function plan(st: ReplicaState, rules: Rules, rec: RecordMessage, sel: Selection
   }
   const reads: Read[] = [];
   const seen = new Set<string>();
-  const deleted: string[] = [];
+  const deleted = new Set<string>(); // the marker keys that the record deletes
+  const deletedList: string[] = []; // the same, in record order
   for (const i of sel.applied) {
     const c = rec.changes[i] as KeyChange;
     const key = c.key;
-    if (!CHANGE_KINDS.has(c.kind)) throw refuse("malformed", seq, "STATE-20", `change ${i} of key "${key}" has kind ${c.kind}`);
     if (key === "") throw refuse("malformed", seq, "ID-13", `change ${i} has no key`);
     // STATE-5, MUT-15: one action never changes a key twice, and the records of the server's own work do not either.
     if (seen.has(key)) throw refuse("malformed", seq, "STATE-5", `the record changes key "${key}" twice`);
@@ -239,9 +292,28 @@ function plan(st: ReplicaState, rules: Rules, rec: RecordMessage, sel: Selection
       continue;
     }
     reads.push({ c, tpl, index: i });
-    if (c.kind === ChangeKind.DELETE && tpl.entity) deleted.push(key);
+    if (c.kind === ChangeKind.DELETE && tpl.entity) {
+      deleted.add(key);
+      deletedList.push(key);
+    }
   }
-  const inDeleted = (key: string): boolean => deleted.some((root) => root !== key && inSubtree(top, root, key));
+  // A key is in the subtree of a marker key when that marker is among its ancestor markers (05 [STATE-42]), so the questions about
+  // the record's own deletions are answered by the key's ancestors, a handful, and not by the record's changes: a record of 2,000
+  // changes costs 2,000 chains, not 2,000 x 2,000 tests.
+  const covered = (key: string): boolean => {
+    // a marker key that the record deletes is an ancestor marker of the key
+    if (deleted.size === 0) return false;
+    return top.ancestors(key).some((a) => deleted.has(a));
+  };
+  const nestedDeleted = new Map<string, string[]>(); // a deleted marker key -> the deleted marker keys of its subtree
+  for (const other of deletedList) {
+    for (const a of top.ancestors(other)) {
+      if (!deleted.has(a)) continue;
+      const list = nestedDeleted.get(a);
+      if (list === undefined) nestedDeleted.set(a, [other]);
+      else list.push(other);
+    }
+  }
 
   // The tombstone mark of 05 [STATE-37]: a REDACTED record's DELETEs leave marked tombstones, and the entity tombstone of a nested
   // marker key is marked when the key is one of the record's erased keys and was present just before it.
@@ -259,28 +331,31 @@ function plan(st: ReplicaState, rules: Rules, rec: RecordMessage, sel: Selection
         // STATE-45: the nested marker keys that are present, or hold a tombstone, just before the record, and the ones that the
         // same record deletes, get an entity tombstone too.
         const nested = new Set<string>(st.nestedMarkers(top, key));
-        for (const other of deleted) {
-          if (other !== key && inSubtree(top, key, other)) nested.add(other);
-        }
+        for (const other of nestedDeleted.get(key) ?? []) nested.add(other);
         for (const n of [...nested].sort(compareUtf8)) sub.nested.push({ key: n, mark: markNested(n) });
         step.subtree = sub;
-      } else if (deleted.length > 0 && inDeleted(key)) {
+      } else if (covered(key)) {
         step.covered = true;
       }
       p.steps.push(step);
       continue;
     }
-    // MUT-16, STATE-46: no server writes a change other than a DELETE to a key of the subtree of a marker key that the same record
-    // deletes; the subtree deletion would decide the key's state, so the record has no one meaning.
+    // STATE-43, STATE-35, MUT-16: a change other than a DELETE to a key of the subtree of a marker key that the same record deletes. No
+    // server writes one (07 [MUT-16] refuses the action), but a record of one is no malformed record: the subtree deletion decides the
+    // key's state "whatever the order of the changes", so the key is absent at the record's seq with no tombstone of its own, as for a
+    // covered DELETE, and its value is not read. 15 [COMPAT-35] does not stop a reader for it, and the change counts as applied for
+    // the prefixes ([STATE-51]), as a covered DELETE does.
     //
-    // SPEC-QUESTION: 05 [STATE-43] (SPEC-QUESTIONS Q12) "When the same record also changes other keys of the subtree, the subtree
-    // deletion decides their state at S, whatever the order of the changes in the record", with 07 [MUT-16], which refuses such
-    // an action when a change other than a DELETE names the subtree. Readings: (a) any change to a key of the subtree is
-    // overruled: the key is absent at S with no tombstone of its own; (b) the sentence is about DELETEs only, as the reference
-    // models read it. No vector holds such a record. The code refuses the record as malformed, as the Go server does, the one
-    // outcome that neither reading contradicts.
-    if (deleted.length > 0 && inDeleted(key)) {
-      throw refuse("malformed", seq, "MUT-16", `change ${r.index} (key "${key}") is not a DELETE and its key is in the subtree of a marker key that the record deletes`);
+    // SPEC-QUESTION (ruled, Q12): 05 [STATE-43] "When the same record also changes other keys of the subtree, the subtree deletion
+    // decides their state at S, whatever the order of the changes in the record", with 07 [MUT-16]. The two readings were (a) any
+    // change to a key of the subtree is overruled, and (b) the sentence is about DELETEs only, as the reference models read it (they
+    // apply a SET by index order, so it survives when it follows the marker's DELETE). Ruled by the coordinator (2026-10-31): reading
+    // (a). The reference models differ; no vector holds such a record.
+    if (covered(key)) {
+      step.delete = true;
+      step.covered = true;
+      p.steps.push(step);
+      continue;
     }
     planPut(st, rec, sel, r.tpl, c, step);
     p.steps.push(step);
@@ -317,7 +392,7 @@ function planPut(st: ReplicaState, rec: RecordMessage, sel: Selection, tpl: Temp
     // STATE-82: a blanked change, of any kind but DELETE, puts the key in the redacted state: an empty value, the version and
     // changed_at that the change gives it, and an empty changed_by.
     //
-    // SPEC-QUESTION: 05 [STATE-82] (SPEC-QUESTIONS Q11) "Every party that folds records MUST apply a blanked change of any kind but
+    // SPEC-QUESTION (ruled, Q11: the text decides, and the code follows it): 05 [STATE-82] (SPEC-QUESTIONS Q11) "Every party that folds records MUST apply a blanked change of any kind but
     // DELETE by putting the key in the redacted state". Both reference models test the change's kind before its encoding: a
     // blanked INCR is applied as an INCR of 0 and a blanked CRDT_UPDATE as an update of no bytes. No vector tells the readings
     // apart: every key that a blanked INCR or update names is deleted by the REDACTED record that follows. The code follows the text.
@@ -376,13 +451,18 @@ function planPut(st: ReplicaState, rec: RecordMessage, sel: Selection, tpl: Temp
     k.value = c.value.slice();
   }
   // STATE-67: a conversion keeps the changed_at and changed_by of the key that it converted from.
-  if (sel.sys?.keep !== undefined && k.state !== StateRedacted) {
+  //
+  // STATE-82 with STATE-67: a blanked conversion SET puts the key in the redacted state with "the version and changed_at the change
+  // would otherwise have given it", which for a conversion is the source key's changed_at, so the metadata hash (05 [STATE-84] covers
+  // changed_at) through the blanked records equals the one of the rewritten checkpoint (06 [LOG-82]). Its changed_by stays empty: a key
+  // in the redacted state has none (STATE-82, STATE-69).
+  if (sel.sys?.keep !== undefined) {
     const src = sel.sys.keep(c);
     if (src !== undefined) {
       const o = st.key(src);
       if (o !== undefined) {
         k.changedAt = o.changedAt;
-        k.changedBy = o.changedBy;
+        if (k.state !== StateRedacted) k.changedBy = o.changedBy;
       }
     }
   }
@@ -406,8 +486,11 @@ function commit(st: ReplicaState, rec: RecordMessage, p: Plan): void {
       // STATE-43, STATE-45: a subtree deletion decides the state of every key of its subtree at seq, whatever the order of the changes.
       st.deleteSubtree(p.top, seq, s.subtree);
     } else if (s.delete && s.covered) {
-      // STATE-37, STATE-43: the key is absent at seq with no tombstone of its own; the subtree deletion of the same record decides it.
-      st.dropKey(s.key);
+      // STATE-37, STATE-43: the key is absent at seq with no tombstone of its own, and the subtree deletion of the same record decides
+      // it, "whatever the order of the changes in the record". `deleteSubtree` has removed, or will remove, every row and tombstone of
+      // the subtree but the entity tombstones that it writes, so the step changes nothing but the prefixes (below). A `dropKey` here
+      // would take the entity tombstone that the deletion gave a nested marker key, and only when the change came after the DELETE
+      // (verifier V6, MUST-B).
     } else if (s.delete) {
       // STATE-17, STATE-37: a DELETE of the key itself, of an absent key too, leaves a key tombstone at seq.
       st.deleteKey(s.key, seq, p.mark);
@@ -416,10 +499,13 @@ function commit(st: ReplicaState, rec: RecordMessage, p: Plan): void {
       if (s.update !== undefined) {
         // STATE-31, STATE-76: the key's document after this update; a base, a record's SET, and an update after a key that is
         // absent, null or in the redacted state start a document anew (STATE-41, STATE-82).
+        //
+        // 02 [ARC-28], `ReplicaState.key`: the Doc that the state holds is shared with every reader of the row, so the update is applied to a
+        // clone, which costs the key's clients and not its size, and the Doc that was read stays as it was.
         let doc: Doc | null = null;
         if (!s.base) {
           const old = st.key(s.key);
-          if (old !== undefined && old.state === StateValue) doc = old.doc;
+          if (old !== undefined && old.state === StateValue && old.doc !== null) doc = old.doc.clone();
         }
         if (doc === null) doc = new Doc();
         doc.applyUpdate(s.update);

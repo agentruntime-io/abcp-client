@@ -51,16 +51,39 @@ function encodeMessage(w: ByteWriter, m: ReflectMessage, view: EncodeView | unde
   // bytes it was received with". A known field that arrived with a wire type that its kind does not have (a string field as
   // a varint) is kept by `unmarshal` as an unknown field, as Go's decoder does, and is written here at its number, after the
   // known field of that number, if one is set. The text does not say whether such a field is unknown or the message refused.
+  //
+  // 07 [MUT-45] puts each unknown field at the place of its number, several of one number in the order received. A sender that writes
+  // the canonical encoding writes them in increasing order of their numbers already, which one pass checks with no allocation; the
+  // fields are then written as the cursor meets them. Otherwise the indexes of the fields are ordered by (number, index) in one typed
+  // array, so that the cost of a message of unknown fields is that and not an object for each of them, and two copies of the list: an
+  // 8 MiB mutation of 3-octet fields held 2.8 million fields, and the first version of the Go twin, which built a struct for each and
+  // sorted them, allocated 543 MiB to hash it (V1 SHOULD-1).
   let unknown = m.getUnknown();
+  let order: Uint32Array | null = null; // null: the fields are in the order of their numbers, and are written as they stand
   if (unknown !== undefined && unknown.length > 0 && view?.skipUnknown?.(md) !== true) {
-    unknown = unknown.map((u, i) => ({ u, i })).sort((a, b) => a.u.no - b.u.no || a.i - b.i).map((x) => x.u);
+    const list = unknown;
+    let sorted = true;
+    for (let i = 1; i < list.length; i++) {
+      if ((list[i] as { no: number }).no < (list[i - 1] as { no: number }).no) {
+        sorted = false;
+        break;
+      }
+    }
+    if (!sorted) {
+      order = new Uint32Array(list.length);
+      for (let i = 0; i < list.length; i++) order[i] = i;
+      // the index is part of the key, so the order within a number is the order received
+      order.sort((a, b) => (list[a] as { no: number }).no - (list[b] as { no: number }).no || a - b);
+    }
   } else {
     unknown = undefined;
   }
   let ui = 0;
   const writeUnknownBelow = (no: number): void => {
-    while (unknown !== undefined && ui < unknown.length && (unknown[ui] as { no: number }).no < no) {
-      writeUnknown(w, unknown[ui] as { no: number; wireType: number; data: Uint8Array });
+    while (unknown !== undefined && ui < unknown.length) {
+      const f = unknown[order === null ? ui : (order[ui] as number)] as { no: number; wireType: number; data: Uint8Array };
+      if (f.no >= no) break;
+      writeUnknown(w, f);
       ui++;
     }
   };

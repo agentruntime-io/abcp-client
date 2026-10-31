@@ -17,7 +17,7 @@
 // saga following come with the coordination milestone; only the pending DELETE of a marker key hides a subtree here.
 
 import { ChangeKind, type KeyChange } from "../gen/abpc/v2/types_pb.js";
-import { JsonV1Error, applyIncr, counterText, parse as parseJson, parseCounter, type JsonValue, type Range } from "../rules/jsonv1/index.js";
+import { counterText, parse as parseJson, parseCounter, type JsonValue } from "../rules/jsonv1/index.js";
 import { compareUtf8 } from "../rules/bytes.js";
 import { StateNull, StateRedacted, StateValue, type KeyRow, type ReplicaState, type Rule, type Topology } from "../rules/fold/index.js";
 
@@ -32,10 +32,9 @@ export interface PendingAction {
   effects?: readonly KeyChange[];
 }
 
-/** What the prediction needs besides the actions: the topology (markers, parents) and the counter ranges. */
+/** What the prediction needs besides the actions: the topology (markers, parents). A counter's range takes no part: the view is the plain sum (14 [CLI-12]). */
 export interface PredictContext {
   top: Topology;
-  counterRange(key: string): Range | undefined;
 }
 
 type CellState = "value" | "null" | "deleted" | "counter" | "crdt" | "pending";
@@ -159,7 +158,9 @@ function predict(st: ReplicaState, o: Overlay, ctx: PredictContext, mutationId: 
         const below = viewBelow(st, o, ctx.top, key);
         let cur: bigint | null = null;
         if (below.present && !below.isNull) cur = below.counter ?? parseCounter(below.value);
-        const n = applyIncr(cur, c.delta, ctx.counterRange(key));
+        // 14 [CLI-12], the home (Q42.4, ruled): "The view of a counter is its confirmed value plus the deltas of every pending `INCR`", with no
+        // exception: the plain sum, an INCR that would leave the template's range included, until the server's RANGE_EXCEEDED ends the action.
+        const n = (cur ?? 0n) + c.delta;
         cl.state = "counter";
         cl.counter = n;
         cl.value = counterText(n);
@@ -198,18 +199,17 @@ function predict(st: ReplicaState, o: Overlay, ctx: PredictContext, mutationId: 
       default:
         break;
     }
-  } catch (e) {
-    // 14 [CLI-20]: data that the server accepted never makes prediction throw. An INCR that leaves its range, a value that is not
-    // a counter: the change has no predicted effect, and the key is shown as pending.
-    // SPEC-QUESTION: 14 [CLI-12] says that "the view of a counter is its confirmed value plus the deltas of every pending `INCR`", and
-    // 05 [STATE-28] that the server rejects an INCR whose result leaves the template's range with RANGE_EXCEEDED and applies none of its
-    // changes. Reading A (taken): an INCR that would leave the range is no part of the predicted counter (its key is shown as pending), as a
-    // CAS whose expectation fails has no predicted effect ([CLI-11]); the view never shows a value that the server will refuse.
-    // Reading B: the view is the plain sum of every pending delta, an out-of-range value included, until the server's RANGE_EXCEEDED
-    // ends that action and the view returns to the confirmed value plus the deltas that remain.
-    if (!(e instanceof JsonV1Error)) {
-      // any other failure is the same: no predicted effect
-    }
+  } catch {
+    // 14 [CLI-20]: data that the server accepted never makes prediction throw. A value that is not a counter: the change has no predicted
+    // effect, and the key is shown as pending.
+    //
+    // SPEC-QUESTION (ruled, Q42.4): 14 [CLI-12] says that "the view of a counter is its confirmed value plus the deltas of every pending
+    // `INCR`", and 05 [STATE-28] that the server rejects an INCR whose result leaves the template's range with RANGE_EXCEEDED and applies none
+    // of its changes. Reading A: an INCR that would leave the range is no part of the predicted counter (its key is shown as pending), as a CAS
+    // whose expectation fails has no predicted effect ([CLI-11]); the view never shows a value that the server will refuse. Reading B: the
+    // view is the plain sum of every pending delta, an out-of-range value included, until the server's RANGE_EXCEEDED ends that action and the
+    // view returns to the confirmed value plus the deltas that remain. Ruled by the coordinator (the text decides): reading B. [CLI-12] is
+    // the home and has no exception; the sentence of 14 §14.2's introduction that suggests reading A is not normative (01 §1.2 item 5).
   }
 }
 

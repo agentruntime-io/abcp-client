@@ -1,9 +1,10 @@
 // 14 §14.2 Prediction: the view of a keyspace is its confirmed state with the prediction of every pending action on top.
 
 import { describe, expect, it } from "vitest";
-import { cas, del, incr, jsonBytes, LocalRefusal, set, type Predictor } from "../src/engine/index.js";
-import { ChangeKind } from "../src/gen/abpc/v2/types_pb.js";
-import { goOffline, goOnline, kc, KS, ofType, rig, text, types } from "./helpers/engine.js";
+import { cas, del, incr, jsonBytes, LocalRefusal, set, StaticManifests, type Predictor } from "../src/engine/index.js";
+import { Code, ChangeKind } from "../src/gen/abpc/v2/types_pb.js";
+import { reject as mk } from "../src/fake/index.js";
+import { goOffline, goOnline, kc, KS, ofType, rejectResult, rig, text, types } from "./helpers/engine.js";
 
 describe("14 [CLI-6] the view is confirmed state plus the pending actions, in outbox order", () => {
   it("shows pending changes at once, in outbox order, and recomputes when confirmed state advances", async () => {
@@ -237,6 +238,43 @@ describe("14 [CLI-19] a local check against the manifest", () => {
   });
 });
 
+describe("14 [CLI-12] the view of a counter is its confirmed value plus the deltas of every pending INCR (Q42.4, ruled)", () => {
+  const ranged = (): StaticManifests =>
+    new StaticManifests({
+      version: 1,
+      templates: { "counters/{id}": { rule: "counter", range: { min: 0n, max: 10n } }, "settings/{name}": { rule: "lww" } },
+      opTypes: { Incr: {}, Set: {} },
+    });
+
+  it("an INCR that would leave the template's range is part of the sum, until the server's RANGE_EXCEEDED ends the action", async () => {
+    const r = await rig({ manifests: ranged() });
+    r.server.write(KS, [kc("counters/c", "incr", 8)]);
+    await r.engine.settle();
+    await goOffline(r);
+    await r.engine.submit({ keyspaceId: KS, opType: "Incr", changes: [incr("counters/c", 1)] }); // 9: in range
+    const b = await r.engine.submit({ keyspaceId: KS, opType: "Incr", changes: [incr("counters/c", 5)] }); // 14: leaves the range
+    await r.engine.submit({ keyspaceId: KS, opType: "Incr", changes: [incr("counters/c", -2)] }); // 12
+    expect(r.engine.view(KS).json("counters/c")).toBe(8 + 1 + 5 - 2); // the plain sum, not 8 + 1 - 2
+    expect(r.engine.view(KS).pending("counters/c")).toHaveLength(3);
+    // the server applies them in order: 9, then RANGE_EXCEEDED for the second (9 + 5 > 10, 05 [STATE-28]: none of its changes), and the
+    // third depends on it (the same key) and fails with it ([CLI-34]). The fake server does not judge ranges, so the refusal is scripted.
+    r.server.inject("mutate", { kind: "result", recorded: true, result: (m) => (m.mutationId === b.mutationId ? rejectResult(m, mk(Code.RANGE_EXCEEDED)) : undefined) });
+    await goOnline(r);
+    await r.engine.settle();
+    expect(types(r, b.mutationId)).toEqual(["conflict", "rejected"]); // RANGE_EXCEEDED is class CONFLICT
+    expect(r.engine.confirmed(KS).json("counters/c")).toBe(9);
+    expect(r.engine.view(KS).json("counters/c")).toBe(9); // the confirmed value plus the deltas that remain: none
+    expect(r.engine.view(KS).pending("counters/c")).toHaveLength(0);
+  });
+
+  it("a counter that has no confirmed value starts from 0, and the sum may leave the range of its template", async () => {
+    const r = await rig({ manifests: ranged() });
+    await goOffline(r);
+    await r.engine.submit({ keyspaceId: KS, opType: "Incr", changes: [incr("counters/new", 50)] }); // far above the range: still the sum
+    expect(r.engine.view(KS).json("counters/new")).toBe(50);
+  });
+});
+
 describe("14 [CLI-20] prediction is total", () => {
   it("data that the server accepted never makes prediction throw", async () => {
     const r = await rig();
@@ -247,7 +285,8 @@ describe("14 [CLI-20] prediction is total", () => {
     await goOffline(r);
     await r.engine.submit({ keyspaceId: KS, opType: "Incr", changes: [incr("counters/max", 1)] });
     expect(() => r.engine.view(KS).get("counters/max")).not.toThrow();
-    expect(r.engine.view(KS).json("counters/max")).toBe(Number.MAX_SAFE_INTEGER); // no predicted effect
+    // 14 [CLI-12] (Q42.4, ruled): the view is the confirmed value plus the delta, an INCR that leaves the range included
+    expect(r.engine.view(KS).json("counters/max")).toBe(Number.MAX_SAFE_INTEGER + 1);
     expect(r.engine.view(KS).pending("counters/max")).toHaveLength(1);
     // a SET over a key that holds a value of another encoding, and a predictor that throws
     const w = await rig({ cfg: { predictors: { Approve: () => { throw new Error("boom"); } } } });

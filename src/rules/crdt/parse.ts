@@ -192,6 +192,47 @@ export function normalizeRanges(rs: readonly Range[]): Range[] {
 const NO_ID: Id = { client: 0, clock: 0 };
 
 /**
+ * A GC or a Skip: it names no id and holds no content, so it keeps only what it has, and the rest of a Struct is read from the
+ * prototype. An update of 4 MiB can hold two million of them (02 [ARC-46]: the memory of a read is bounded by the update's length, and
+ * a struct of seventeen fields for each of two million GCs was 240 MB retained, and the check of references another hundred).
+ */
+class BareStruct implements Struct {
+  declare readonly content: number;
+  declare readonly hasOrigin: boolean;
+  declare readonly origin: Id;
+  declare readonly hasRight: boolean;
+  declare readonly right: Id;
+  declare readonly parentKind: ParentKind;
+  declare readonly parentId: Id;
+  declare readonly root: string;
+  declare readonly hasSub: boolean;
+  declare readonly units: Uint16Array | null;
+  idx = 0;
+  grp = 0;
+  off = 0;
+  end = 0;
+
+  constructor(
+    readonly kind: StructKind,
+    readonly client: number,
+    readonly clock: number,
+    public len: number,
+  ) {}
+}
+Object.assign(BareStruct.prototype, {
+  content: 0,
+  hasOrigin: false,
+  origin: NO_ID,
+  hasRight: false,
+  right: NO_ID,
+  parentKind: ParentKind.Implied,
+  parentId: NO_ID,
+  root: "",
+  hasSub: false,
+  units: null,
+});
+
+/**
  * Reads b as a Yjs update in format v1 and checks it against the first six conditions of 05 [STATE-71]: Parse, Strings,
  * Values, Integers, No empty pieces and References. Throws a CrdtError with the vector's reason name.
  */
@@ -265,6 +306,18 @@ function readId(r: Reader, what: string): Id {
 function readStruct(r: Reader, client: number, clock: number): Struct {
   const start = r.p;
   const info = r.u8();
+  const ref0 = info & 0x1f;
+  if (ref0 === 0 || ref0 === 10) {
+    // 05 [STATE-71] (Parse): the info byte of a GC or a Skip has none of its three high bits set.
+    if ((info & 0xe0) !== 0) throw fail("gc-skip-high-bits", `info byte 0x${info.toString(16).padStart(2, "0")}`);
+    const len = r.varUint();
+    if (len === 0) throw fail("zero-length", `struct of client ${client} at clock ${clock} has length 0`);
+    if (len > MAX_CLOCK - clock) throw fail("int-range", "struct clock + length above 2^32-1");
+    const b = new BareStruct(ref0 === 10 ? "skip" : "gc", client, clock, len);
+    b.off = start;
+    b.end = r.p;
+    return b;
+  }
   const s: Struct = {
     kind: "item",
     content: 0,
@@ -285,45 +338,38 @@ function readStruct(r: Reader, client: number, clock: number): Struct {
     off: 0,
     end: 0,
   };
-  const ref = info & 0x1f;
-  if (ref === 0 || ref === 10) {
-    // 05 [STATE-71] (Parse): the info byte of a GC or a Skip has none of its three high bits set.
-    if ((info & 0xe0) !== 0) throw fail("gc-skip-high-bits", `info byte 0x${info.toString(16).padStart(2, "0")}`);
-    s.kind = ref === 10 ? "skip" : "gc";
-    s.len = r.varUint();
-  } else {
-    if (ref > 10) throw fail("content-ref", `content ref ${ref}`);
-    if (ref === 2) throw fail("content-json", "ContentJSON is refused");
-    if (ref === 9) throw fail("content-doc", "ContentDoc is refused");
-    s.kind = "item";
-    s.content = ref;
-    if ((info & 0x80) !== 0) {
-      s.hasOrigin = true;
-      s.origin = readId(r, "origin");
-    }
-    if ((info & 0x40) !== 0) {
-      s.hasRight = true;
-      s.right = readId(r, "right origin");
-    }
-    if ((info & 0xc0) === 0) {
-      // Only an item with neither origin nor right origin encodes its parent, and its parentSub with it.
-      const pi = r.varUint();
-      if (pi === 1) {
-        s.parentKind = ParentKind.Root;
-        s.root = utf8DecodeValid(r.strBytes());
-      } else if (pi === 0) {
-        s.parentKind = ParentKind.Item;
-        s.parentId = readId(r, "parent");
-      } else {
-        throw fail("parent-info", `parent-info number ${pi}`);
-      }
-      if ((info & 0x20) !== 0) {
-        s.hasSub = true;
-        r.strBytes();
-      }
-    }
-    readContent(r, s);
+  const ref = ref0;
+  if (ref > 10) throw fail("content-ref", `content ref ${ref}`);
+  if (ref === 2) throw fail("content-json", "ContentJSON is refused");
+  if (ref === 9) throw fail("content-doc", "ContentDoc is refused");
+  s.kind = "item";
+  s.content = ref;
+  if ((info & 0x80) !== 0) {
+    s.hasOrigin = true;
+    s.origin = readId(r, "origin");
   }
+  if ((info & 0x40) !== 0) {
+    s.hasRight = true;
+    s.right = readId(r, "right origin");
+  }
+  if ((info & 0xc0) === 0) {
+    // Only an item with neither origin nor right origin encodes its parent, and its parentSub with it.
+    const pi = r.varUint();
+    if (pi === 1) {
+      s.parentKind = ParentKind.Root;
+      s.root = utf8DecodeValid(r.strBytes());
+    } else if (pi === 0) {
+      s.parentKind = ParentKind.Item;
+      s.parentId = readId(r, "parent");
+    } else {
+      throw fail("parent-info", `parent-info number ${pi}`);
+    }
+    if ((info & 0x20) !== 0) {
+      s.hasSub = true;
+      r.strBytes();
+    }
+  }
+  readContent(r, s);
   if (s.len === 0) throw fail("zero-length", `struct of client ${client} at clock ${clock} has length 0`);
   if (s.len > MAX_CLOCK - clock) throw fail("int-range", "struct clock + length above 2^32-1");
   s.off = start;
@@ -477,45 +523,62 @@ export function named(s: Struct): Id[] {
 function checkReferences(u: Update): void {
   // No item names an id of its own client at or above its own clock, which is an id of itself or of a later struct.
   for (const s of u.all) {
-    for (const id of named(s)) {
-      if (id.client === s.client && id.clock >= s.clock) {
-        throw fail("self-reference", `item ${s.client}:${s.clock} names ${id.client}:${id.clock}`);
-      }
-    }
+    if (s.kind !== "item") continue;
+    if (s.hasOrigin && s.origin.client === s.client && s.origin.clock >= s.clock) throw selfReference(s, s.origin);
+    if (s.hasRight && s.right.client === s.client && s.right.clock >= s.clock) throw selfReference(s, s.right);
+    if (s.parentKind === ParentKind.Item && s.parentId.client === s.client && s.parentId.clock >= s.clock) throw selfReference(s, s.parentId);
   }
-  // The reference graph has no cycle. Its nodes are the structs. Its edges run from each item to the struct that defines an id
-  // the item names, and from each struct to the struct before it in its group. The search is iterative.
+  // The reference graph has no cycle. Its nodes are the structs. Its edges run from each item to the struct that defines an id the item
+  // names, and from each struct to the struct before it in its group. The search is iterative, and it allocates no edge list: the edges
+  // of a node are four slots (the struct before it, then its origin, right origin and parent), read where they stand, so that the memory
+  // of the check is a few octets for each struct and not an array for each (02 [ARC-46]).
   const FRESH = 0;
   const ON_PATH = 1;
   const DONE = 2;
-  const state = new Uint8Array(u.all.length);
-  const neighbours = u.all.map((s): number[] => {
-    const out: number[] = [];
-    if (s.idx > (u.groups[s.grp] as ClientGroup).first) out.push(s.idx - 1);
-    for (const id of named(s)) {
-      const t = u.find(id);
-      if (t !== undefined) out.push(t.idx);
+  const n = u.all.length;
+  const state = new Uint8Array(n);
+  const edge = (v: number, k: number): number => {
+    const s = u.all[v] as Struct;
+    switch (k) {
+      case 0:
+        return s.idx > (u.groups[s.grp] as ClientGroup).first ? s.idx - 1 : -1;
+      case 1:
+        return s.kind === "item" && s.hasOrigin ? (u.find(s.origin)?.idx ?? -1) : -1;
+      case 2:
+        return s.kind === "item" && s.hasRight ? (u.find(s.right)?.idx ?? -1) : -1;
+      default:
+        return s.kind === "item" && s.parentKind === ParentKind.Item ? (u.find(s.parentId)?.idx ?? -1) : -1;
     }
-    return out;
-  });
-  for (let start = 0; start < u.all.length; start++) {
+  };
+  const stackV: number[] = [];
+  const stackK: number[] = [];
+  for (let start = 0; start < n; start++) {
     if (state[start] !== FRESH) continue;
     state[start] = ON_PATH;
-    const stack: { v: number; k: number }[] = [{ v: start, k: 0 }];
-    while (stack.length > 0) {
-      const top = stack[stack.length - 1] as { v: number; k: number };
-      const edges = neighbours[top.v] as number[];
-      if (top.k >= edges.length) {
-        state[top.v] = DONE;
-        stack.pop();
+    stackV.push(start);
+    stackK.push(0);
+    while (stackV.length > 0) {
+      const top = stackV.length - 1;
+      const k = stackK[top] as number;
+      if (k >= 4) {
+        state[stackV[top] as number] = DONE;
+        stackV.pop();
+        stackK.pop();
         continue;
       }
-      const w = edges[top.k++] as number;
+      stackK[top] = k + 1;
+      const w = edge(stackV[top] as number, k);
+      if (w < 0) continue;
       if (state[w] === ON_PATH) throw fail("cycle", "the reference graph of the update has a cycle");
       if (state[w] === FRESH) {
         state[w] = ON_PATH;
-        stack.push({ v: w, k: 0 });
+        stackV.push(w);
+        stackK.push(0);
       }
     }
   }
+}
+
+function selfReference(s: Struct, id: Id): Error {
+  return fail("self-reference", `item ${s.client}:${s.clock} names ${id.client}:${id.clock}`);
 }

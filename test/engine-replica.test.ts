@@ -150,13 +150,13 @@ describe("14 [CLI-4] a record that 06 [LOG-11] says to stop at freezes the keysp
 describe("14 [CLI-5] a change whose value cannot be decoded still enters the confirmed state", () => {
   it("is shown as undecodable, `skipped` is emitted, it is counted in the status, and the engine goes on", async () => {
     const r = await rig();
-    r.server.write(KS, [create(KeyChangeSchema, { key: "settings/bad", kind: ChangeKind.SET, value: new TextEncoder().encode("{not json"), encoding: "json/v1" }), create(KeyChangeSchema, { key: "settings/odd", kind: ChangeKind.SET, value: new Uint8Array([1, 2]), encoding: "app/custom" })]);
+    r.server.write(KS, [create(KeyChangeSchema, { key: "settings/bad", kind: ChangeKind.SET, value: new TextEncoder().encode("{not json"), encoding: "json/v1" }), create(KeyChangeSchema, { key: "settings/odd", kind: ChangeKind.SET, value: new Uint8Array([1, 2]), encoding: "json/v1" })]);
     r.server.write(KS, [kc("settings/ok", "set", 1)]);
     await r.engine.settle();
     const v = r.engine.confirmed(KS);
     expect(v.get("settings/bad")).toMatchObject({ decodable: false, version: 1n });
     expect(v.get("settings/bad")?.value).toEqual(new TextEncoder().encode("{not json"));
-    expect(v.get("settings/odd")).toMatchObject({ decodable: false, encoding: "app/custom" });
+    expect(v.get("settings/odd")).toMatchObject({ decodable: false, encoding: "json/v1" });
     expect(v.json("settings/bad")).toBeUndefined();
     expect(v.get("settings/ok")?.decodable).toBe(true);
     const sk = ofType(r, "skipped");

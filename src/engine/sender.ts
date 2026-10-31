@@ -240,7 +240,7 @@ export abstract class SenderLayer extends ReactionLayer {
         }
       }
       // slots are assigned in this order, so that they are contiguous ([CLI-27])
-      // SPEC-QUESTION: 14 [CLI-63] says that a re-stamp gives "fresh `client_seq` values from 1 ([CLI-27]), in authoring order", and
+      // SPEC-QUESTION (ruled, Q42.1: the text decides reading A; round 16 words [CLI-63] to say so): 14 [CLI-63] says that a re-stamp gives "fresh `client_seq` values from 1 ([CLI-27]), in authoring order", and
       // [CLI-33] that "a client MUST send an action that has no unresolved dependency without waiting for unrelated actions".
       // Reading A (taken): the slots go in authoring order among the actions that can be sent now; an action that waits for a dependency
       // takes its slot when it is first sent ([CLI-27]), after unrelated later actions, so it never holds them up. Reading B: every
@@ -248,7 +248,7 @@ export abstract class SenderLayer extends ReactionLayer {
       // earlier action that waits for its dependency, is answered OUT_OF_ORDER, and waits for that action: [CLI-33] broken. The two
       // differ only when an earlier action is blocked and a later one is not.
       for (const e of batch) {
-        if (!(e.clientId === this.clientId && e.clientSeq > 0 && lane.assigned.get(e.clientSeq) === e.mutationId)) e.clientSeq = lane.allocate(e.mutationId);
+        if (!(e.clientId === this.clientId && e.clientSeq > 0 && lane.assigned.get(e.clientSeq) === e.mutationId)) e.clientSeq = lane.allocate(e.mutationId, e.ordinal);
         e.clientId = this.clientId;
       }
     }
@@ -258,10 +258,13 @@ export abstract class SenderLayer extends ReactionLayer {
     let gatedRoom = lim.maxInflightGated - entries.filter((e) => e.lane === "GATED" && e.everSent && !this.isDone(e) && (this.rt(e.mutationId).inflight || this.rt(e.mutationId).polling)).length;
     const earlierSeq = this.entriesOf(f.id).filter((e) => e.lane === "SEQUENCED" && !this.ending.has(e.mutationId) && e.stuck === undefined);
     const gated: OutboxEntry[] = [];
+    // the memory of the slots of retired SEQUENCED actions is kept as long as a GATED action in the outbox can ask for it ([CLI-32])
+    f.lanes.SEQUENCED.compact(Math.min(Infinity, ...entries.filter((e) => e.lane === "GATED").map((e) => e.ordinal)));
     for (const e of entries) {
       if (e.lane !== "GATED" || !this.canSendNow(e)) continue;
       if (gatedRoom <= 0) break;
-      let after = 0;
+      // 14 [CLI-32]: the highest slot that this client instance assigned to an earlier SEQUENCED action, one that has retired included
+      let after = f.lanes.SEQUENCED.highestBefore(e.ordinal);
       let waits = false;
       for (const s of earlierSeq) {
         if (s.ordinal >= e.ordinal) continue;
@@ -269,14 +272,18 @@ export abstract class SenderLayer extends ReactionLayer {
         else if (s.outcome === undefined) waits = true; // an earlier SEQUENCED action with no slot yet gives none to name ([CLI-32])
       }
       if (waits) continue;
-      // SPEC-QUESTION: 14 [CLI-32] gives `after_client_seq` as "the highest `client_seq` the current client instance assigned to an earlier
-      // SEQUENCED action of the same keyspace". Reading A (taken): the earlier SEQUENCED actions that are still in the outbox, which is
-      // what the rest of [CLI-32] speaks of ("until that action has left the outbox without one"); an action that retired holds a slot
-      // at or below the watermark, so naming it adds no wait. Reading B: the highest slot of any earlier SEQUENCED action of this
-      // client instance, a retired one included, which needs a memory of the slots of the actions that have left. The server judges
-      // only whether the lane's watermark has reached the value, so the two give the same wait; they differ in the value on the wire.
+      // SPEC-QUESTION (ruled, Q42.3): 14 [CLI-32] gives `after_client_seq` as "the highest `client_seq` the current client instance assigned to
+      // an earlier SEQUENCED action of the same keyspace". Reading A: the earlier SEQUENCED actions that are still in the outbox, which is
+      // what the rest of [CLI-32] speaks of ("until that action has left the outbox without one"); an action that retired holds a slot at
+      // or below the watermark, so naming it adds no wait. Reading B: the highest slot of any earlier SEQUENCED action of this client
+      // instance, a retired one included, which needs a memory of the slots of the actions that have left (`LaneState.highestBefore`).
+      // The server judges only whether the lane's watermark has reached the value, so the two give the same wait, but they differ in the
+      // value on the wire, and the value reaches what a gate reads: 08 [GATE-17]'s waited records are those of the SEQUENCED mutations with
+      // `client_seq` <= `after_client_seq`, and fill the `min_versions` of each attempt, so reading A leaves the author's own retired
+      // writes out of the policy host's `min_versions`. Ruled by the coordinator (the text decides): reading B. 11 [COORD-89] agrees ("the
+      // client's last SEQUENCED `client_seq` in the keyspace").
       e.afterClientSeq = after;
-      if (!(e.clientId === this.clientId && e.clientSeq > 0 && gatedLane.assigned.get(e.clientSeq) === e.mutationId)) e.clientSeq = gatedLane.allocate(e.mutationId);
+      if (!(e.clientId === this.clientId && e.clientSeq > 0 && gatedLane.assigned.get(e.clientSeq) === e.mutationId)) e.clientSeq = gatedLane.allocate(e.mutationId, e.ordinal);
       e.clientId = this.clientId;
       gated.push(e);
       gatedRoom--;
@@ -454,7 +461,7 @@ export abstract class SenderLayer extends ReactionLayer {
         } else {
           // a REJECTED decision is a final rejection ([CLI-34]), of the class of its reject (A.1)
           const reject = d.reject ?? makeReject(Code.GATE_REJECTED, ErrorClass.DEAD_LETTER, "rejected");
-          await this.onRejectResult(e, reject);
+          await this.onRejectResult(e, reject, true);
         }
         return;
       }

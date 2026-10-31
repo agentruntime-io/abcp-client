@@ -130,6 +130,12 @@ const recordEView: EncodeView = {
  * since the blanked fields are outside E.
  */
 export function contentDigest(r: RecordMessage, digests: readonly Uint8Array[]): { e: Uint8Array; c: Uint8Array } {
+  // LOG-71: one digest for each change and one for each `previous` entry. Another count is a caller's mistake, which would give a wrong
+  // record_hash with no sign of it, so it is refused (V1 SHOULD-3).
+  const want = r.changes.length + r.previous.length;
+  if (digests.length !== want) {
+    throw new RangeError(`${digests.length} value digests for ${r.changes.length} changes and ${r.previous.length} previous entries, want ${want}`);
+  }
   const e = encode(RecordSchema, r, recordEView);
   return { e, c: sha256(concat(e, ...digests)) };
 }

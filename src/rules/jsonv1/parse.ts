@@ -5,7 +5,7 @@
 // only to an explicit depth limit and never throws anything but a JsonV1Error (02 [ARC-46]).
 
 import { isValidUtf8, utf8DecodeValid } from "../bytes.js";
-import { JsonV1Error, valueError } from "./errors.js";
+import { echo, JsonV1Error, quote, valueError } from "./errors.js";
 import { denote, numberText } from "./number.js";
 import {
   fitNumber,
@@ -16,8 +16,10 @@ import {
 import {
   type JsonValue,
   MAX_DEPTH,
+  MAX_CANONICAL_DOCUMENT_BYTES,
   MAX_DOCUMENT_BYTES,
   MAX_DOCUMENT_DEPTH,
+  MAX_DOCUMENT_VALUES,
   MAX_MEMBERS,
 } from "./value.js";
 
@@ -59,7 +61,7 @@ export function parse(b: Uint8Array): JsonValue {
  * json/v1 value do not apply (nesting is bounded by MAX_DOCUMENT_DEPTH only so that untrusted input cannot recurse without
  * limit). The document is at most 4 MiB (04 [MAN-4]). Every error has code INVALID_ENVELOPE (04 [MAN-77]).
  *
- * SPEC-QUESTION: 04 [MAN-3] (SPEC-QUESTIONS Q4): 1e-400 denotes the finite value 0 under one reading and is refused under
+ * SPEC-QUESTION (ruled, Q4: closed by 05 [STATE-7], the reading stands): 04 [MAN-3] (SPEC-QUESTIONS Q4): 1e-400 denotes the finite value 0 under one reading and is refused under
  * the other (and a noncharacter is valid I-JSON under one reading). The code follows the Go server and the reference
  * models: both are refused.
  */
@@ -110,6 +112,7 @@ class Parser {
   private notCanonical = false; // the text differs from the RFC 8785 form of its value
   private hasNUL = false; // a string or member name holds U+0000
   private topNull = false; // the whole text is the literal null
+  private values = 0; // the values read so far (a manifest document only)
   private schemaErr: JsonV1Error | null = null; // the first value-schema failure
 
   constructor(
@@ -164,6 +167,16 @@ class Parser {
 
   /** Reads one value. depth is the depth of the container that holds it (0 at the top). */
   private value(depth: number, sch: Schema | undefined, top: boolean): JsonValue {
+    if (this.doc && ++this.values > MAX_DOCUMENT_VALUES) {
+      // MAN-4: a document of V values has a canonical form of at least 2V-1 octets, so one of more than MAX_DOCUMENT_VALUES cannot be within
+      // 1 MiB. Refused here, before the tree is built (V1 SHOULD-6).
+      throw new JsonV1Error(
+        "INVALID_ENVELOPE",
+        "json-limits",
+        "MAN-4",
+        `more than ${MAX_DOCUMENT_VALUES} values: the canonical form is over the limit of ${MAX_CANONICAL_DOCUMENT_BYTES} octets`,
+      );
+    }
     this.skipWS();
     if (this.pos >= this.b.length) throw this.err("json-syntax", "unexpected end of the text");
     const c = this.b[this.pos] as number;
@@ -230,7 +243,7 @@ class Parser {
       this.skipWS();
       if (this.peek() !== 0x22) throw this.err("json-syntax", "an object member name was expected");
       const name = this.str();
-      if (names.has(name)) throw this.err("json-duplicate", `duplicate member "${name}"`); // 05 [STATE-7]
+      if (names.has(name)) throw this.err("json-duplicate", `duplicate member ${quote(name)}`); // 05 [STATE-7]
       if (this.maxMembers > 0 && names.size >= this.maxMembers) {
         throw this.err("json-limits", `more than ${this.maxMembers} members`); // 05 [STATE-7]
       }
@@ -248,7 +261,7 @@ class Parser {
           child = f;
           if (sch.requiredSet.has(name)) required++;
         } else {
-          this.failSchema("MAN-26", `member "${name}" is not a field of the schema`);
+          this.failSchema("MAN-26", `member ${quote(name)} is not a field of the schema`);
           sch = undefined;
         }
       }
@@ -271,7 +284,8 @@ class Parser {
 
   /** Fails the schema when an object that fits sch lacks a required field (04 [MAN-26], §4.4.2). */
   private checkRequired(sch: Schema | undefined, seen: number): void {
-    if (sch !== undefined && seen < sch.required.length) this.failSchema("MAN-26", "a required field is missing");
+    // the count is that of the distinct names (V1 SHOULD-9): a Schema that a caller built with a name listed twice still counts it once
+    if (sch !== undefined && seen < sch.requiredSet.size) this.failSchema("MAN-26", "a required field is missing");
   }
 
   private array(depth: number, schema: Schema | undefined): JsonValue {
@@ -347,8 +361,8 @@ class Parser {
     for (let k = start; k < i; k++) tok += String.fromCharCode(b[k] as number);
     this.pos = i;
     const d = denote(tok);
-    if (d.status === "infinite") throw this.err("json-number", `${tok.slice(0, 40)} is not a finite binary64 value`); // 05 [STATE-7]
-    if (d.status === "underflow") throw this.err("json-number", `${tok.slice(0, 40)} rounds to zero but its digits are not zero`); // 05 [STATE-7]
+    if (d.status === "infinite") throw this.err("json-number", `${echo(tok)} is not a finite binary64 value`); // 05 [STATE-7]
+    if (d.status === "underflow") throw this.err("json-number", `${echo(tok)} rounds to zero but its digits are not zero`); // 05 [STATE-7]
     if (d.plain) {
       // up to 15 digits: its canonical text is itself, except -0
       if (d.value === 0 && tok.charCodeAt(0) === 0x2d) this.notCanonical = true;

@@ -47,7 +47,11 @@ export interface Result {
   error?: CrdtError;
 }
 
-/** The first definition of a run of ids: one struct of an integrated update, whole. */
+/**
+ * The first definition of a run of ids: one or more structs of an integrated update with the same kind, content ref and parent.
+ * Adjacent structs that agree are one definition, so that a run of GCs, or of the items of one text, costs one (02 [ARC-46]: a key's
+ * memory follows the shape of its document, not the number of its structs). A Def is never changed once a Doc holds it.
+ */
 export interface Def {
   /** the ids [start, end) */
   start: number;
@@ -65,14 +69,75 @@ export interface Def {
   gcParent: boolean;
 }
 
+/** Whether e, which starts where d ends, can join d: the ids agree on everything that a reader of the definitions asks. */
+function sameRun(d: Def, e: Def): boolean {
+  return (
+    d.end === e.start &&
+    d.units === null &&
+    e.units === null &&
+    d.kind === e.kind &&
+    d.content === e.content &&
+    d.hasParent === e.hasParent &&
+    d.gcParent === e.gcParent &&
+    sameId(d.parentId, e.parentId)
+  );
+}
+
+function sameId(a: Id | null, b: Id | null): boolean {
+  return a === null || b === null ? a === b : a.client === b.client && a.clock === b.clock;
+}
+
 export class Doc {
   /** Whether the key has received a committed update, a no-op for good included (05 [STATE-76]). */
   present = false;
   /** client → next clock */
-  readonly sv = new Map<number, number>();
-  readonly ds = new Map<number, Range[]>();
+  readonly sv: Map<number, number>;
+  /** client → the canonical delete ranges (05 [STATE-41]); an array is replaced, never edited, so a clone shares it */
+  readonly ds: Map<number, Range[]>;
   /** client → the first definitions below sv, in ascending clock order */
-  readonly defs = new Map<number, Def[]>();
+  readonly defs: Map<number, Def[]>;
+  /** The clients whose `defs` array this Doc made, and may change in place; the arrays of the others are shared with a clone and are copied before a write. */
+  private owned = new Set<number>();
+
+  constructor() {
+    this.sv = new Map();
+    this.ds = new Map();
+    this.defs = new Map();
+  }
+
+  /**
+   * Returns a Doc that holds what this one holds and that changes independently of it: an update applied to either does not show in
+   * the other (02 [ARC-28]: the state that a reader holds does not move under it). It costs the key's clients, not the size of its
+   * document: the delete ranges and the definitions of a client are shared, and the definitions of a client are copied only when an
+   * update adds to them. The fold clones the Doc of a key before it applies an update to it, so that the Doc that a reader of the
+   * state holds stays as it was.
+   */
+  clone(): Doc {
+    const c = new Doc();
+    c.present = this.present;
+    for (const [client, next] of this.sv) c.sv.set(client, next);
+    for (const [client, rs] of this.ds) c.ds.set(client, rs);
+    for (const [client, ds] of this.defs) c.defs.set(client, ds);
+    this.owned = new Set(); // the arrays that the clone shares are no longer this Doc's to change in place
+    return c;
+  }
+
+  /** Adds the first definition of a run of ids at the end of the client's list, or extends the one before it when the two agree. */
+  private addDef(client: number, d: Def): void {
+    let list = this.defs.get(client);
+    if (list === undefined) {
+      list = [];
+      this.defs.set(client, list);
+      this.owned.add(client);
+    } else if (!this.owned.has(client)) {
+      list = list.slice();
+      this.defs.set(client, list);
+      this.owned.add(client);
+    }
+    const last = list[list.length - 1];
+    if (last !== undefined && sameRun(last, d)) list[list.length - 1] = { ...last, end: d.end };
+    else list.push(d);
+  }
 
   /** The next clock of a client: the highest clock that a struct of the client in an integrated update covers, plus 1. */
   next(client: number): number {
@@ -174,33 +239,27 @@ export class Doc {
     const reason = noOpForGood(this, a);
     if (reason !== undefined) return { verdict: "NOOP_FOR_GOOD", reason };
 
-    // The first definitions, with the parents resolved against the state before the update.
+    // The first definitions, with the parents resolved against the state before the update. Adjacent structs of a client that agree
+    // are one definition, so a run of GCs is one entry however many structs it has.
     const news: { client: number; def: Def }[] = [];
     for (const s of u.all) {
       if (s.clock + s.len <= this.next(s.client)) continue; // wholly below the next clock: the ids keep their earlier definition
       const p = a.parentOf(s);
-      news.push({
-        client: s.client,
-        def: {
-          start: s.clock,
-          end: s.clock + s.len,
-          kind: s.kind,
-          content: s.content,
-          units: s.units,
-          parentId: p.id,
-          hasParent: p.hasId,
-          gcParent: p.gc,
-        },
-      });
+      const def: Def = {
+        start: s.clock,
+        end: s.clock + s.len,
+        kind: s.kind,
+        content: s.content,
+        units: s.units,
+        parentId: p.id,
+        hasParent: p.hasId,
+        gcParent: p.gc,
+      };
+      const last = news[news.length - 1];
+      if (last !== undefined && last.client === s.client && sameRun(last.def, def)) last.def.end = def.end; // last.def is this call's own
+      else news.push({ client: s.client, def });
     }
-    for (const n of news) {
-      let ds = this.defs.get(n.client);
-      if (ds === undefined) {
-        ds = [];
-        this.defs.set(n.client, ds);
-      }
-      ds.push(n.def);
-    }
+    for (const n of news) this.addDef(n.client, n.def);
 
     let changed = false;
     for (const g of u.groups) {

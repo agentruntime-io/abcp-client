@@ -1,4 +1,4 @@
-// The refusals of the fold of records (02 [ARC-26], [ARC-46], 06 [LOG-11]).
+// The refusals of the fold of records (02 [ARC-26], [ARC-46], 06 [LOG-11], 15 [COMPAT-35]).
 
 /** Says why the fold refused a record. */
 export type FoldCode =
@@ -10,18 +10,38 @@ export type FoldCode =
   | "unsupported-feature"
   /** A SYSTEM record of a kind that the fold does not know has `must_understand` set or carries changes (06 [LOG-11], [LOG-41]). A stop. */
   | "unknown-system-kind"
+  /** A change of a kind that the fold does not know (15 [COMPAT-35]). A stop. */
+  | "unknown-change-kind"
+  /** A change carries an encoding that the fold does not know (15 [COMPAT-35]). A stop. */
+  | "unknown-encoding"
+  /** A DECISION record with a status that the fold does not know (15 Table 15.2: a reader stops at the record, as for an unknown record kind). A stop. */
+  | "unknown-decision-status"
   /** A change names a key that no template of the record's manifest version matches (03 [ID-19]). */
   | "no-template"
   /**
-   * The record is not one that a server writes: a change of no known kind, a SYSTEM body that does not read, a CRDT update that
-   * does not parse, a counter that leaves its range, two applied changes to one key.
+   * The record is not one that a server writes: a SYSTEM body that does not read, a CRDT update that does not parse, a counter that
+   * leaves its range, two applied changes to one key. Not a stop (15 [COMPAT-35]).
    */
   | "malformed";
 
+/** The codes that 15 [COMPAT-35] and 06 [LOG-11] make a stop. */
+const STOPS: ReadonlySet<FoldCode> = new Set<FoldCode>([
+  "unknown-record-kind",
+  "unsupported-feature",
+  "unknown-system-kind",
+  "unknown-change-kind",
+  "unknown-encoding",
+  "unknown-decision-status",
+]);
+
 /**
  * The refusal of a record, a typed refusal (02 [ARC-46]). The state is unchanged: a record is applied whole or not at all
- * (02 [ARC-28]). A client that gets one stops applying records for the keyspace at the previous seq and holds it as 14 [CLI-4],
- * [CLI-5] and 16 [SEC-3] say (`stop` tells the three cases that 06 [LOG-11] names: the hold is UPGRADE_REQUIRED).
+ * (02 [ARC-28]).
+ *
+ * `stop` says whether the refusal is one of the cases that 15 [COMPAT-35] lists. A client that gets such an error stops applying
+ * records for the keyspace at the previous seq and holds it as 14 [CLI-4], [CLI-5] and 16 [SEC-3] say (the hold is
+ * UPGRADE_REQUIRED). Any other FoldError is a record that no server writes and that the fold cannot apply: 15 [COMPAT-35] does
+ * not stop the keyspace for it, and 02 [ARC-46] has the reader count and report it, which the caller does.
  */
 export class FoldError extends Error {
   readonly code: FoldCode;
@@ -40,12 +60,33 @@ export class FoldError extends Error {
     this.detail = detail;
   }
 
-  /** Whether the refusal is one of the three that 06 [LOG-11] names: an unknown record kind, an unsupported required feature, a SYSTEM record of an unknown kind that must be understood. */
+  /**
+   * Whether the refusal is one of the cases of 15 [COMPAT-35]: a record kind that the fold does not know, a required feature that
+   * it does not support, a SYSTEM record of an unknown kind that must be understood or carries changes (06 [LOG-11]), a change
+   * kind or an encoding that it does not know, and a DECISION status that it does not know (15 Table 15.2).
+   */
   get stop(): boolean {
-    return this.code === "unknown-record-kind" || this.code === "unsupported-feature" || this.code === "unknown-system-kind";
+    return STOPS.has(this.code);
   }
 }
 
 export function refuse(code: FoldCode, seq: bigint, rule: string, detail: string): FoldError {
   return new FoldError(code, seq, rule, detail);
+}
+
+/**
+ * A change that a record of a known kind carries and that the fold does not apply, because its kind does not define it: the
+ * changes of a known SYSTEM kind that has none, or that defines others (06 [LOG-39] table, [LOG-41]). 02 [ARC-46] has a reader
+ * count and report it, and 15 [COMPAT-35] does not stop the keyspace for it.
+ */
+export interface Anomaly {
+  /** The seq of the record. */
+  seq: bigint;
+  /** The change's index in the record. */
+  index: number;
+  /** The change's key. */
+  key: string;
+  /** The rule that makes the change ignored, for example "LOG-41". */
+  rule: string;
+  detail: string;
 }

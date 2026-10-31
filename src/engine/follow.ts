@@ -15,12 +15,46 @@ export class LaneState {
   /** The slots that are assigned and not consumed, with the action at each (14 [CLI-27]). */
   readonly assigned = new Map<number, string>();
 
-  /** The lowest slot above the watermark that no action holds: slots are contiguous from 1 (14 [CLI-27]). */
-  allocate(mutationId: string): number {
+  /**
+   * The authoring order (`OutboxEntry.ordinal`) of the action that holds each slot that this client instance assigned in the lane, the
+   * slots that the server consumed included, whether or not the action has left the outbox since (14 [CLI-32]: `after_client_seq` is
+   * "the highest `client_seq` the current client instance assigned to an earlier SEQUENCED action"). A slot that was given up is
+   * forgotten: it holds no action, and the next one of the lane takes it.
+   */
+  private readonly ordinals = new Map<number, number>();
+  /** The highest slot of the consumed slots that `compact` folded away: every action that can still ask was authored after them. */
+  private floor = 0;
+
+  /** The lowest slot above the watermark that no action holds: slots are contiguous from 1 (14 [CLI-27]). `ordinal` is the action's authoring order. */
+  allocate(mutationId: string, ordinal = 0): number {
     let n = this.watermark + 1;
     while (this.assigned.has(n)) n++;
     this.assigned.set(n, mutationId);
+    this.ordinals.set(n, ordinal);
     return n;
+  }
+
+  /**
+   * The highest slot that this client instance assigned in the lane to an action authored before `ordinal`, a retired one included; 0 when
+   * it assigned none (14 [CLI-32], 07 §7.5, the Q42.3 ruling: the text decides reading B).
+   */
+  highestBefore(ordinal: number): number {
+    let h = this.floor;
+    for (const [slot, o] of this.ordinals) if (o < ordinal && slot > h) h = slot;
+    return h;
+  }
+
+  /**
+   * Folds the slots that the server consumed, of actions authored before `before`, into one number, so that the memory of the slots that
+   * have left the outbox is bounded by the actions in flight and not by the session: `before` is the authoring order of the earliest
+   * action that can still ask `highestBefore` (every later one is authored after all of these), or Infinity when none is.
+   */
+  compact(before: number): void {
+    for (const [slot, o] of [...this.ordinals]) {
+      if (slot > this.watermark || o >= before) continue;
+      if (slot > this.floor) this.floor = slot;
+      this.ordinals.delete(slot);
+    }
   }
 
   /** Slots whose action left the outbox before a reading of the watermark said whether the server consumed them (14 [CLI-27]). */
@@ -36,6 +70,7 @@ export class LaneState {
   }
 
   release(slot: number, mutationId: string): void {
+    if (this.assigned.get(slot) === mutationId || this.deferred.get(slot) === mutationId) this.ordinals.delete(slot);
     if (this.assigned.get(slot) === mutationId) this.assigned.delete(slot);
     if (this.deferred.get(slot) === mutationId) this.deferred.delete(slot);
   }
@@ -61,6 +96,8 @@ export class LaneState {
     this.watermark = 0;
     this.assigned.clear();
     this.deferred.clear();
+    this.ordinals.clear();
+    this.floor = 0;
   }
 }
 

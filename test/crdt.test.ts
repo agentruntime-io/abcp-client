@@ -1,10 +1,17 @@
 // CRDT vectors (conformance/vectors/crdt.json): the strict reader (05 [STATE-71]), the fold (05 [STATE-76]), the canonical
 // form and per-key hash (05 [STATE-41]), the validity of a base (05 [STATE-74]) and the rename of a CRDT key (06 [LOG-40]).
-// Not run here, by design: `expect.content` and `library.*`, the checks of a library's document (the vector README).
+//
+// And the document check of 17 [CONF-9] ("Where a CRDT vector gives an expected document, the document that each of them folds MUST
+// also equal it, root by root"), for every vector that has one (Q33, client side): the Yjs document that a client shows (14
+// [CLI-13]: stock Yjs, which the engine uses) after the updates that the spec integrates is compared with `expect.content`, per root;
+// for a base, the base loaded alone is compared with the covered updates folded (`expect.content_matches_fold`) and with `expect.content`;
+// for a rename, the base and the later updates. Nothing is skipped: the vectors where a library differs from the spec are listed by id
+// below (`KNOWN_LIBRARY_DIFFERENCES`), and a difference anywhere else fails the run.
 
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import * as Y from "yjs";
 import { fromHex, toHex } from "../src/rules/bytes.js";
 import { Doc, integrated, parseUpdate, validateBase, type RootType, type Roots } from "../src/rules/crdt/index.js";
 import { keyStatePreimage, keyStateHash, StateValue, type KeyValueState } from "../src/rules/hashes/index.js";
@@ -15,6 +22,76 @@ const all = loadVectors("crdt.json");
 const ofKind = (k: string): Vector[] => all.filter((v) => v.kind === k);
 
 const toRoots = (m: Record<string, string>): Roots => new Map(Object.entries(m) as [string, RootType][]);
+
+// ---- the documents that a library shows (Q33, client side; the twin of runner-yjs/run.mjs) ----
+
+/**
+ * The vectors where a library document differs from the spec one, by id, and which library (the vector's `library.known`). Stock Yjs
+ * hides an item whose right origin is a GC (`crdt-int-par-004`: it integrates it as a GC, so its text is not shown), which 05
+ * [STATE-76] does not: its canonical form is the same either way, and only the document differs. yrs differs on `crdt-int-par-005` (with a
+ * GC as the origin it takes the parent of the right origin) and aborts on `crdt-any-008`; Yjs agrees with the spec on both. Round 16 will
+ * change the text to match Yjs (docs/SPEC-QUESTIONS.md, Q33); until then an entry here is the one place where a document may differ.
+ * `shows` is the document that the library gives, so that a difference that moves fails too.
+ */
+const KNOWN_LIBRARY_DIFFERENCES: Record<string, { library: "yjs" | "yrs"; shows?: Record<string, unknown> }> = {
+  "crdt-int-par-004": { library: "yjs", shows: { a: ["p"] } },
+  "crdt-int-par-005": { library: "yrs" },
+  "crdt-any-008": { library: "yrs" },
+};
+
+/** Stable JSON for a comparison of documents: object keys sorted. */
+const norm = (x: unknown): string =>
+  JSON.stringify(x, (_k, v: unknown) =>
+    v !== null && typeof v === "object" && !Array.isArray(v) ? Object.fromEntries(Object.entries(v as object).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) : v,
+  );
+
+const newYDoc = (roots: Record<string, string>): Y.Doc => {
+  const d = new Y.Doc();
+  for (const [n, t] of Object.entries(roots)) {
+    if (t === "text") d.getText(n);
+    else if (t === "map") d.getMap(n);
+    else if (t === "array") d.getArray(n);
+    else d.getXmlFragment(n);
+  }
+  return d;
+};
+
+/** The document of every root, as a library shows it; a text root is a delta when the expected content gives one. */
+function contentOf(d: Y.Doc, roots: Record<string, string>, expected: Record<string, unknown> | undefined): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [n, t] of Object.entries(roots)) {
+    if (t === "text") out[n] = Array.isArray(expected?.[n]) ? d.getText(n).toDelta() : d.getText(n).toString();
+    else if (t === "map") out[n] = d.getMap(n).toJSON();
+    else if (t === "array") out[n] = d.getArray(n).toJSON();
+    else out[n] = d.getXmlFragment(n).toString();
+  }
+  return JSON.parse(JSON.stringify(out, (_k, x: unknown) => (typeof x === "bigint" ? Number(x) : x))) as Record<string, unknown>;
+}
+
+const pick = (obj: Record<string, unknown>, keys: string[]): Record<string, unknown> => Object.fromEntries(keys.map((k) => [k, obj[k]]));
+
+/** The Yjs document that integrating the updates gives, in order. */
+function yDocOf(roots: Record<string, string>, updates: readonly Uint8Array[], base?: Uint8Array): Y.Doc {
+  const d = newYDoc(roots);
+  if (base !== undefined) Y.applyUpdate(d, base);
+  for (const u of updates) Y.applyUpdate(d, u);
+  return d;
+}
+
+/**
+ * 17 [CONF-9]: the document of a library after the updates equals `expect.content`, root by root. For a vector that lists the library as
+ * a known difference it must be the document that the table gives, and not the spec one.
+ */
+function expectDocument(id: string, roots: Record<string, string>, d: Y.Doc, expected: Record<string, unknown>): void {
+  const got = pick(contentOf(d, roots, expected), Object.keys(expected));
+  const known = KNOWN_LIBRARY_DIFFERENCES[id];
+  if (known?.library === "yjs") {
+    expect(norm(got), `${id}: Yjs is listed as differing from the spec, and shows the document of the table`).toBe(norm(known.shows));
+    expect(norm(got), `${id}: the difference is gone: remove the entry`).not.toBe(norm(expected));
+  } else {
+    expect(norm(got), `${id}: the Yjs document`).toBe(norm(expected));
+  }
+}
 
 interface Step {
   update: string;
@@ -68,9 +145,9 @@ const libraryBases: Record<string, { base_from: string; hex: string }> = existsS
 
 /**
  * The candidate base of a vector: its bytes, the merge that `mergeUpdates` builds, or, for `doc`, the bytes that Yjs JS built
- * (the encoder of a library, not a rule of the spec). Returns undefined when a library's bytes are needed and not at hand.
+ * (the encoder of a library, not a rule of the spec).
  */
-function builtBase(id: string, hexBase: string | undefined, from: string | undefined, f: Folded): Uint8Array | undefined {
+function builtBase(id: string, hexBase: string | undefined, from: string | undefined, f: Folded, roots: Record<string, string>): Uint8Array {
   if (hexBase !== undefined) return fromHex(hexBase);
   const lib = libraryBases[id];
   if (from === "merge" || from === "merge-all") {
@@ -78,7 +155,12 @@ function builtBase(id: string, hexBase: string | undefined, from: string | undef
     if (lib !== undefined) expect(toHex(got), "mergeUpdates against Yjs's").toBe(lib.hex);
     return got;
   }
-  if (from === "doc") return lib !== undefined ? fromHex(lib.hex) : undefined;
+  if (from === "doc") {
+    // the encoded state of a Yjs document that integrated the updates (the encoder of a library, not a rule of the spec)
+    const built = Y.encodeStateAsUpdate(yDocOf(roots, f.integrated));
+    if (lib !== undefined) expect(toHex(built), "the base that Yjs builds against the one that the server's tests keep").toBe(lib.hex);
+    return built;
+  }
   throw new Error(`no base: base_from ${from}`);
 }
 
@@ -97,13 +179,15 @@ describe("05 [STATE-71], [STATE-76], [STATE-41] CRDT fold (crdt-fold vectors)", 
       const ks = { key: v.key as string, state: StateValue as KeyValueState, encoding: "yjs/v1", content: doc.canonical(), version: f.seq };
       expect(toHex(keyStatePreimage(ks))).toBe(v.expect.state_hash_preimage);
       expect(toHex(keyStateHash(ks))).toBe(v.expect.state_hash);
+      // 17 [CONF-9]: the document that a client shows after the updates that the spec integrates
+      if (v.expect.content) expectDocument(v.id, v.crdt_roots, yDocOf(v.crdt_roots, f.integrated), v.expect.content);
     });
   }
 });
 
 describe("05 [STATE-74] base validity (crdt-base vectors)", () => {
   for (const v of ofKind("crdt-base")) {
-    it(`${v.id}: ${v.title}`, (ctx) => {
+    it(`${v.id}: ${v.title}`, () => {
       const roots = toRoots(v.crdt_roots);
       const key = new Doc();
       const f = runSteps(key, roots, v.covered, 0);
@@ -113,24 +197,38 @@ describe("05 [STATE-74] base validity (crdt-base vectors)", () => {
       const ks = { key: v.key as string, state: StateValue as KeyValueState, encoding: "yjs/v1", content: key.canonical(), version: v.crdt_covered_seq };
       expect(toHex(keyStateHash(ks))).toBe(v.expect.state_hash);
 
-      const base = builtBase(v.id, v.base, v.base_from, f);
-      if (base === undefined) return ctx.skip();
+      const base = builtBase(v.id, v.base, v.base_from, f, v.crdt_roots);
       const err = validateBase(base, roots, key);
       expect(err === null, `${err?.code}`).toBe(v.expect.valid);
       if (err !== null && v.expect.reason !== undefined) expect(err.code).toBe(v.expect.reason);
+      if (err !== null) return;
+      // 05 [STATE-74] (the MAY check): the base loaded alone against the covered updates folded, with the same library, and the document
+      // that the vector gives
+      let loaded: Record<string, unknown> | undefined;
+      try {
+        loaded = contentOf(yDocOf(v.crdt_roots, [], base), v.crdt_roots, v.expect.content);
+      } catch {
+        loaded = undefined; // the library cannot load it
+      }
+      const folded = contentOf(yDocOf(v.crdt_roots, f.integrated), v.crdt_roots, v.expect.content);
+      if (v.expect.content_matches_fold !== undefined) {
+        expect(loaded !== undefined && norm(loaded) === norm(folded), `${v.id}: the base loaded alone against the covered updates folded`).toBe(v.expect.content_matches_fold);
+      }
+      if (v.expect.content) {
+        expect(norm(pick(loaded ?? {}, Object.keys(v.expect.content))), `${v.id}: the base loaded alone`).toBe(norm(v.expect.content));
+      }
     });
   }
 });
 
 describe("06 [LOG-40] rename of a CRDT key (crdt-rename vectors)", () => {
   for (const v of ofKind("crdt-rename")) {
-    it(`${v.id}: ${v.title.slice(0, 100)}`, (ctx) => {
+    it(`${v.id}: ${v.title.slice(0, 100)}`, () => {
       const roots = toRoots(v.crdt_roots);
       const src = new Doc();
       const f = runSteps(src, roots, v.source_steps, 0);
       // 06 [LOG-40], 04 [MAN-65]: the SYSTEM SET of the target key holds a base of the source key's integrated updates
-      const base = builtBase(v.id, v.base, v.base_from, f);
-      if (base === undefined) return ctx.skip();
+      const base = builtBase(v.id, v.base, v.base_from, f, v.crdt_roots);
       const err = validateBase(base, roots, src);
       expect(err === null, `${err?.code}`).toBe(v.expect.base_valid);
       if (err !== null) {
@@ -149,8 +247,23 @@ describe("06 [LOG-40] rename of a CRDT key (crdt-rename vectors)", () => {
       expect(toHex(dst.canonical())).toBe(v.expect.canonical);
       const ks = { key: v.key as string, state: StateValue as KeyValueState, encoding: "yjs/v1", content: dst.canonical(), version: g.seq };
       expect(toHex(keyStateHash(ks))).toBe(v.expect.state_hash);
+      // 17 [CONF-9]: the document of the target key, the base and the later updates
+      if (v.expect.content) expectDocument(v.id, v.crdt_roots, yDocOf(v.crdt_roots, g.integrated, base), v.expect.content);
     });
   }
+});
+
+describe("17 [CONF-9], Q33: no vector hides a difference between the documents of a library and the spec", () => {
+  it("the vectors with a document are all checked, and the known library differences are exactly those that the vectors list", () => {
+    const withContent = all.filter((v) => v.expect?.content !== undefined && v.expect.content !== null);
+    expect(withContent.length, "vectors that give an expected document at draft 13").toBe(70);
+    const listed = all.filter((v) => v.library?.known !== undefined).map((v) => [v.id, Object.keys(v.library.known as object).sort()] as const);
+    expect(listed.map(([id]) => id).sort()).toEqual(Object.keys(KNOWN_LIBRARY_DIFFERENCES).sort());
+    for (const [id, libs] of listed) expect(libs, id).toEqual([(KNOWN_LIBRARY_DIFFERENCES[id] as { library: string }).library]);
+    // the two that this client library (Yjs) is concerned with: -004 differs, -005 agrees
+    expect(KNOWN_LIBRARY_DIFFERENCES["crdt-int-par-004"]?.library).toBe("yjs");
+    expect(KNOWN_LIBRARY_DIFFERENCES["crdt-int-par-005"]?.library).toBe("yrs");
+  });
 });
 
 describe("05 [STATE-71] strictness beyond the vectors", () => {

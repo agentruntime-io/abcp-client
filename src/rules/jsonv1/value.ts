@@ -28,6 +28,12 @@ export const MAX_DOCUMENT_DEPTH = 128;
 export const MAX_DOCUMENT_BYTES = 4 << 20;
 /** The largest canonical form of a manifest: 1 MiB (04 [MAN-4]). */
 export const MAX_CANONICAL_DOCUMENT_BYTES = 1 << 20;
+/**
+ * The most values (every scalar, array and object, a member's value and an item each counting) that a document within
+ * MAX_CANONICAL_DOCUMENT_BYTES can hold: the canonical form of V values has at least 2V-1 octets (a `0` for each scalar, a comma
+ * between two).
+ */
+export const MAX_DOCUMENT_VALUES = (MAX_CANONICAL_DOCUMENT_BYTES + 1) >> 1;
 
 /** True when f is an integer of 05 [STATE-7]: a binary64 value with zero fraction within ±(2^53−1). −0 is one (it is 0). */
 export function isInteger(f: number): boolean {

@@ -40,7 +40,8 @@ export abstract class ReplicaLayer extends EndingLayer {
 
   protected abstract flushDirty(): Promise<void>;
   protected abstract markDirty(e: OutboxEntry): void;
-  protected abstract onRejectResult(e: OutboxEntry, reject: Reject): Promise<void>;
+  /** `decided`: the reject is that of a `Decided{REJECTED}` (or of the DECISION record), which is final whatever its class (15 [COMPAT-39], 14 [CLI-34]). */
+  protected abstract onRejectResult(e: OutboxEntry, reject: Reject, decided?: boolean): Promise<void>;
   protected abstract resumeKeyspace(f: Follow): void;
   protected abstract onFoldStop(f: Follow, err: FoldError): void;
   protected abstract onProtocolViolation(v: ProtocolViolation, keyspaces?: readonly string[]): void;
@@ -242,7 +243,7 @@ export abstract class ReplicaLayer extends EndingLayer {
     const rejects = this.rejectedByRecord;
     this.rejectedByRecord = [];
     for (const x of rejects) {
-      if (this.entries.has(x.entry.mutationId) && !this.ending.has(x.entry.mutationId)) await this.onRejectResult(x.entry, x.reject);
+      if (this.entries.has(x.entry.mutationId) && !this.ending.has(x.entry.mutationId)) await this.onRejectResult(x.entry, x.reject, true);
     }
     await this.flushDirty();
   }

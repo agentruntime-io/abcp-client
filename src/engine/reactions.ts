@@ -243,7 +243,7 @@ export abstract class ReactionLayer extends ReplicaLayer {
   // ---------------------------------------------------------------------------------------------------------------------
   // `Reject` (14 [CLI-42], [CLI-46] to [CLI-49])
 
-  protected async onRejectResult(e: OutboxEntry, reject: Reject): Promise<void> {
+  protected async onRejectResult(e: OutboxEntry, reject: Reject, decided = false): Promise<void> {
     const f = this.follows.get(e.keyspaceId);
     const now = this.serverNow();
     if (e.firstFailureMs === undefined) e.firstFailureMs = now;
@@ -252,13 +252,21 @@ export abstract class ReactionLayer extends ReplicaLayer {
     const known = isKnownClass(reject.errorClass);
     const reaction = reactionOf(reject.errorClass);
 
+    // SPEC-QUESTION (ruled, Q42.2): 15 [COMPAT-39] says that a reject whose class is unknown or UNSPECIFIED "MUST be handled as HOLD", and
+    // 14 [CLI-7] and [CLI-34] that a REJECTED decision is a final rejection. They meet in a `Decided{REJECTED}` whose reject has a class that
+    // this client does not know. Reading A: the hold rule is the more specific one, the lane is held and the action resent with the hold
+    // backoff, and at its bound it is reported as outcome unknown. Reading B: the decision is final, so the action ends at once as rejected,
+    // to the dead-letter store, whatever the class; a resend of a decided intent can only get the same stored decision again, so reading A
+    // reports a rejection that the server has made as an outcome that is unknown, and holds a lane that no resend can clear. Ruled by the
+    // coordinator (until spec round 16 writes it into 15 [COMPAT-39]): reading B. A `Decided{REJECTED}` is final whatever its reject's
+    // class (14 [CLI-34]); when the class is unknown or UNSPECIFIED it is handled as DEAD_LETTER (14 [CLI-46]), and the dead-letter entry
+    // carries the reject with its class, which is how the app is told. The hold applies to a `Reject` result only.
+    if (decided && !known) {
+      await this.endAction(e, { sink: "deadLetter", reject, reason: codeName(reject.code), dependents: "fail" });
+      return;
+    }
+
     // the hold rows of Table 14.1 (a HOLD code, a class that the client does not know)
-    // SPEC-QUESTION: 15 [COMPAT-39] says that a reject whose class is unknown or UNSPECIFIED "MUST be handled as HOLD", and 14 [CLI-7] and
-    // [CLI-34] that a REJECTED decision is a final rejection. They meet in a `Decided{REJECTED}` whose reject has a class that this
-    // client does not know. Reading A (taken): the hold rule is the more specific one, the lane is held and the action resent with the hold
-    // backoff, the report says that it is held, and at its bound it is reported as outcome unknown. Reading B: the decision is final,
-    // so the action ends at once as rejected, to the dead-letter store, whatever the class; a resend of a decided intent can only get
-    // the same stored decision again, so reading A reports a rejection that the server has made as an outcome that is unknown.
     const hk = holdKindOf(reject);
     if (hk !== undefined) {
       await this.enterHold(e, reject, hk);
@@ -394,7 +402,7 @@ export abstract class ReactionLayer extends ReplicaLayer {
    * code, which `held` and the sync status report. The head of the lane is resent with the hold backoff, which ends the hold when a
    * resend gets a result, and the default bound ends the actions (14 [CLI-45]).
    *
-   * SPEC-QUESTION: A.7 says "stop and report" and gives no Table 14.1 row for these statuses on a `Mutate` call. Reading A (taken): the
+   * SPEC-QUESTION (Q42.5: the recommended reading stands until round 16 writes a Table 14.1 row): A.7 says "stop and report" and gives no Table 14.1 row for these statuses on a `Mutate` call. Reading A (taken): the
    * lane hold above, which reports, keeps the action, never loops (the hold backoff) and ends at the default bound as every hold does.
    * Reading B: the client stops sending for good, or dead-letters the action at once with the status as its reason. Reading B loses an
    * action to a status that a proxy or a deployment mistake can send, and has no way to resume; reading A needs no rule that the text lacks.

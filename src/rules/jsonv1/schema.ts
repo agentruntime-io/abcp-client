@@ -1,6 +1,6 @@
 // Value schemas (04 §4.4.2): reading a `value_schema` from a manifest and judging a value against it.
 
-import { definitionError, JsonV1Error, valueError } from "./errors.js";
+import { definitionError, echoName, JsonV1Error, quote, valueError } from "./errors.js";
 import {
   type JsonValue,
   MAX_SCHEMA_DEPTH,
@@ -177,6 +177,7 @@ export function schemaFromValue(v: JsonValue, use: SchemaUse): Schema {
 }
 
 function childPath(path: string, name: string): string {
+  name = echoName(name); // a path names a place, and never repeats a name of any length (V1 SHOULD-8)
   return path === "" ? name : `${path}.${name}`;
 }
 
@@ -206,13 +207,13 @@ function readNode(v: JsonValue, depth: number, path: string, use: SchemaUse): Sc
   const attrs = new Set<string>();
   for (const [name, val] of v) {
     const p = childPath(path, name);
-    if (attrs.has(name)) throw definitionError("MAN-25", p, `the attribute "${name}" is given twice`);
+    if (attrs.has(name)) throw definitionError("MAN-25", p, `the attribute ${quote(name)} is given twice`);
     attrs.add(name);
     switch (name) {
       case "type": {
         if (typeof val !== "string") throw definitionError("MAN-25", p, "type is a string");
         const t = TYPES.find((x) => x === val);
-        if (t === undefined) throw definitionError("MAN-25", p, `"${val}" is not a type of a value schema`);
+        if (t === undefined) throw definitionError("MAN-25", p, `${quote(val)} is not a type of a value schema`);
         s.type = t;
         hasType = true;
         break;
@@ -246,7 +247,7 @@ function readNode(v: JsonValue, depth: number, path: string, use: SchemaUse): Sc
         if (!Array.isArray(val)) throw definitionError("MAN-25", p, "required is a list of field names");
         val.forEach((r, i) => {
           if (typeof r !== "string") throw definitionError("MAN-25", `${p}[${i}]`, "required is a list of field names");
-          // SPEC-QUESTION: 04 [MAN-26] (SPEC-QUESTIONS Q5): "Every name in `required` MUST be in `fields`." The text does not
+          // SPEC-QUESTION (ruled, Q5: the code reading stands): 04 [MAN-26] (SPEC-QUESTIONS Q5): "Every name in `required` MUST be in `fields`." The text does not
           // say whether a name may be listed twice. It is read as a set here, as the Go server does: a repeated name is
           // accepted and kept once.
           if (!s.requiredSet.has(r)) {
@@ -264,7 +265,7 @@ function readNode(v: JsonValue, depth: number, path: string, use: SchemaUse): Sc
         s.nullable = val;
         break;
       default:
-        throw definitionError("MAN-25", p, `"${name}" is not an attribute of a value schema`);
+        throw definitionError("MAN-25", p, `${quote(name)} is not an attribute of a value schema`);
     }
   }
 
@@ -304,7 +305,7 @@ function readNode(v: JsonValue, depth: number, path: string, use: SchemaUse): Sc
   if (s.min !== undefined && s.max !== undefined && s.min > s.max) throw definitionError("MAN-25", path, "min is above max");
   (s.enum ?? []).forEach((e, i) => {
     if (!lengthWithin(s, codePointLength(e))) {
-      throw definitionError("MAN-25", `${childPath(path, "enum")}[${i}]`, `the enum value "${e}" is excluded by the length bounds`);
+      throw definitionError("MAN-25", `${childPath(path, "enum")}[${i}]`, `the enum value ${quote(e)} is excluded by the length bounds`);
     }
   });
   (s.enumInt ?? []).forEach((e, i) => {
@@ -315,7 +316,7 @@ function readNode(v: JsonValue, depth: number, path: string, use: SchemaUse): Sc
   if (hasRequired) {
     for (const r of s.required) {
       if (!hasFields || s.fields === undefined || !s.fields.has(r)) {
-        throw definitionError("MAN-26", childPath(path, "required"), `the required name "${r}" is not in fields`);
+        throw definitionError("MAN-26", childPath(path, "required"), `the required name ${quote(r)} is not in fields`);
       }
     }
   }
@@ -333,7 +334,7 @@ function readEnum(s: MutableSchema, v: JsonValue, path: string): void {
     const out: string[] = [];
     v.forEach((it, i) => {
       if (typeof it !== "string") throw definitionError("MAN-25", `${path}[${i}]`, "an enum holds only strings or only integers");
-      if (seen.has(it)) throw definitionError("MAN-25", `${path}[${i}]`, `the enum value "${it}" is repeated`);
+      if (seen.has(it)) throw definitionError("MAN-25", `${path}[${i}]`, `the enum value ${quote(it)} is repeated`);
       seen.add(it);
       out.push(it);
     });
@@ -362,7 +363,7 @@ function readFields(s: MutableSchema, v: JsonValue, depth: number, path: string,
   for (const [name, val] of v) {
     const p = childPath(path, name);
     if (!validFieldName(name)) {
-      throw definitionError("MAN-26", p, `"${name}" is not a field name (^[A-Za-z_][A-Za-z0-9_]{0,63}$, not __proto__)`);
+      throw definitionError("MAN-26", p, `${quote(name)} is not a field name (^[A-Za-z_][A-Za-z0-9_]{0,63}$, not __proto__)`);
     }
     fields.set(name, readNode(val, depth + 1, p, use));
   }

@@ -984,7 +984,7 @@ export abstract class SessionLayer extends SenderLayer {
         this.setOutcome(e, out);
         this.markDirty(e);
       } else if (o.case === "decided") {
-        await this.onRejectResult(e, o.value.reject ?? makeReject(Code.GATE_REJECTED, ErrorClass.DEAD_LETTER, "rejected"));
+        await this.onRejectResult(e, o.value.reject ?? makeReject(Code.GATE_REJECTED, ErrorClass.DEAD_LETTER, "rejected"), true);
       } else if (o.case === "rejected") {
         await this.onRejectResult(e, o.value);
       } else if (o.case === "retry") {

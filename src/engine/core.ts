@@ -511,7 +511,7 @@ export abstract class EngineCore {
       }
       pending.push(p);
     }
-    const o = buildOverlay(f.state, { top, counterRange: (key) => manifest?.counterRange(key) }, pending);
+    const o = buildOverlay(f.state, { top }, pending);
     f.cachedView = new KeyspaceView(f.id, f.state, o, top);
     return f.cachedView;
   }
@@ -519,7 +519,7 @@ export abstract class EngineCore {
   /** The confirmed state alone, as the conflict handler sees it (14 [CLI-47]). */
   confirmedViewOf(f: Follow): KeyspaceView {
     const top = new VersionTopology(this.manifests, f.state.manifestVersion);
-    return new KeyspaceView(f.id, f.state, buildOverlay(f.state, { top, counterRange: () => undefined }, []), top);
+    return new KeyspaceView(f.id, f.state, buildOverlay(f.state, { top }, []), top);
   }
 
   protected toKeyChange(c: ChangeInput): KeyChange {

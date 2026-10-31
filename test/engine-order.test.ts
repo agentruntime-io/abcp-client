@@ -165,6 +165,76 @@ describe("14 [CLI-32] a GATED action carries after_client_seq", () => {
     expect(last?.mutations.map((m) => m.mutationId)).toEqual([s, g]);
     expect(Number(last?.mutations.find((m) => m.mutationId === g)?.afterClientSeq)).toBe(1); // the slot that s was given
   });
+
+  // Q42.3 (ruled, reading B): "the highest `client_seq` the current client instance assigned to an earlier SEQUENCED action", a retired
+  // one included. 08 [GATE-17]'s waited records are those of the SEQUENCED mutations with client_seq <= after_client_seq, so naming only
+  // the actions still in the outbox leaves the author's own retired writes out of the policy host's min_versions.
+  const afterOf = (r: Rig, id: string): number => {
+    const m = mutateRequests(r).flatMap((q) => q.mutations).find((x) => x.mutationId === id);
+    if (m === undefined) throw new Error(`${id} was not sent`);
+    return Number(m.afterClientSeq);
+  };
+  const lane = (r: Rig): { highestBefore(o: number): number; ordinals: Map<number, number> } =>
+    (r.engine as unknown as { follows: Map<string, { lanes: { SEQUENCED: { highestBefore(o: number): number; ordinals: Map<number, number> } } }> }).follows.get(KS)!.lanes.SEQUENCED;
+
+  it("Q42.3: an earlier SEQUENCED action that has retired is named: its slot is the value, not 0", async () => {
+    const r = await rig();
+    await r.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/s1", 1)] });
+    await r.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/s2", 1)] });
+    await r.engine.settle();
+    expect(r.engine.outbox()).toEqual([]); // both retired: nothing of them is left in the outbox
+    const g = (await r.engine.submit({ keyspaceId: KS, opType: "Approve", changes: [set("settings/g", 1)] })).mutationId;
+    await r.engine.settle();
+    expect(afterOf(r, g)).toBe(2);
+  });
+
+  it("Q42.3: only an action authored before the GATED one is named, a retired one and one still in the outbox alike", async () => {
+    const r = await rig();
+    await r.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/s1", 1)] });
+    await r.engine.settle(); // retired, slot 1
+    await goOffline(r);
+    const g = (await r.engine.submit({ keyspaceId: KS, opType: "Approve", changes: [set("settings/g", 1)] })).mutationId;
+    const s2 = (await r.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/s2", 1)] })).mutationId; // authored after g: slot 2
+    const before = mutateRequests(r).length;
+    await goOnline(r);
+    const ms = mutateRequests(r).slice(before).flatMap((q) => q.mutations);
+    expect(Number(ms.find((m) => m.mutationId === s2)?.clientSeq)).toBe(2);
+    expect(Number(ms.find((m) => m.mutationId === g)?.afterClientSeq)).toBe(1); // s2 is later than g: not named
+  });
+
+  it("Q42.3: a slot that was given up (the action's result recorded nothing) is no slot that was assigned to an action: it is not named", async () => {
+    const r = await rig();
+    r.server.inject("mutate", { kind: "result", result: (m) => (m.changes[0]?.key === "settings/bad" ? rejectResult(m, mk(Code.INVALID_ENVELOPE)) : undefined) });
+    const bad = (await r.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/bad", 1)] })).mutationId;
+    await r.engine.settle();
+    expect(types(r, bad)).toEqual(["rejected", "dead-lettered"]); // the lane's watermark stayed below its slot: nothing was recorded
+    const g = (await r.engine.submit({ keyspaceId: KS, opType: "Approve", changes: [set("settings/g", 1)] })).mutationId;
+    await r.engine.settle();
+    expect(afterOf(r, g)).toBe(0);
+  });
+
+  it("Q42.3: the memory of retired slots is bounded by the actions that can still ask, not by the session", async () => {
+    const r = await rig();
+    for (let i = 0; i < 40; i++) {
+      await r.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set(`settings/k${i}`, 1)] });
+      await r.engine.settle();
+    }
+    expect(r.engine.outbox()).toEqual([]);
+    const g = (await r.engine.submit({ keyspaceId: KS, opType: "Approve", changes: [set("settings/g", 1)] })).mutationId; // compacts what is below it
+    await r.engine.settle();
+    expect(afterOf(r, g)).toBe(40);
+    expect(lane(r).ordinals.size).toBeLessThanOrEqual(1);
+    expect(lane(r).highestBefore(Number.MAX_SAFE_INTEGER)).toBe(40);
+  });
+
+  it("Q42.3: a new client_id starts the memory over: the slots of the old instance are not named", async () => {
+    const r = await rig();
+    await r.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/s1", 1)] });
+    await r.engine.settle();
+    expect(lane(r).highestBefore(Number.MAX_SAFE_INTEGER)).toBe(1);
+    (r.engine as unknown as { reidentify(why: string): void }).reidentify("test");
+    expect(lane(r).highestBefore(Number.MAX_SAFE_INTEGER)).toBe(0);
+  });
 });
 
 describe("14 [CLI-33] an action with no unresolved dependency is sent without waiting for unrelated actions", () => {

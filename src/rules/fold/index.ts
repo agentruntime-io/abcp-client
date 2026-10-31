@@ -1,6 +1,6 @@
 // The fold of served records onto a client's confirmed state (02 [ARC-26], 05 §5.5 to §5.7, 06 §6.4 to §6.7, 14 [CLI-1] to [CLI-5]).
 
-export { FoldError, type FoldCode } from "./errors.js";
+export { type Anomaly, FoldError, type FoldCode } from "./errors.js";
 export {
   RESERVED_TEMPLATE,
   VersionTopology,

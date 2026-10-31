@@ -129,11 +129,112 @@ export interface StateOptions {
   trackPrefixes?: boolean;
 }
 
+/**
+ * The names of one of the state's maps in an order that makes a subtree a range, so that the keys of a subtree, which all start with
+ * `root/`, are read and removed at the cost of the subtree and a search, not of the keyspace (05 [STATE-17]: a `DELETE` of an absent marker
+ * key is a valid subtree deletion, and a record can hold 2,000 of them; scanning every name for each of them took 3.6 s on 300,000 keys in
+ * the Go server before its keys went into an ordered index, V1 MUST-3). The order is that of the UTF-16 code units, which any prefix is a
+ * range of; the listings that are hashed keep their own order, the bytes of UTF-8 (`keyNames`).
+ *
+ * The map is the truth and the index follows it: a name that was added since the last range query waits in `pending` and is merged in
+ * by the next one, a name that left the map stays in `sorted` until a query skips it or the index is rebuilt, and a query reads only
+ * the names that the map still holds. A query costs the range, a search, and the merge of what was added since the last one, which is
+ * never more than the scan that it replaces.
+ */
+class NameIndex {
+  private sorted: string[] = [];
+  private pending: string[] = [];
+  private stale = 0;
+
+  constructor(private readonly live: ReadonlyMap<string, unknown>) {}
+
+  /** A name that was not in the map has been added to it. */
+  added(name: string): void {
+    this.pending.push(name);
+  }
+
+  /** A name that was in the map has been removed from it. */
+  removed(): void {
+    this.stale++;
+  }
+
+  private settle(): void {
+    if (this.stale > Math.max(256, this.sorted.length >> 1)) {
+      // most of the index is names that left the map: rebuild it from the map
+      this.sorted = [...this.live.keys()].sort();
+      this.pending = [];
+      this.stale = 0;
+      return;
+    }
+    if (this.pending.length === 0) return;
+    const add = [...new Set(this.pending)].sort();
+    this.pending = [];
+    const out: string[] = [];
+    let i = 0;
+    let j = 0;
+    while (i < this.sorted.length || j < add.length) {
+      const a = this.sorted[i];
+      const b = add[j];
+      if (b === undefined || (a !== undefined && a < b)) {
+        out.push(a as string);
+        i++;
+      } else if (a === undefined || b < a) {
+        out.push(b);
+        j++;
+      } else {
+        out.push(a); // a name that is in both: it left the map and came back
+        i++;
+        j++;
+      }
+    }
+    this.sorted = out;
+  }
+
+  /** The index of the first name that is not below `prefix`. */
+  private lowerBound(prefix: string): number {
+    let lo = 0;
+    let hi = this.sorted.length;
+    while (lo < hi) {
+      const m = (lo + hi) >>> 1;
+      if ((this.sorted[m] as string) < prefix) lo = m + 1;
+      else hi = m;
+    }
+    return lo;
+  }
+
+  /** The names that the map holds and that start with `prefix`. */
+  withPrefix(prefix: string): string[] {
+    this.settle();
+    const out: string[] = [];
+    for (let i = this.lowerBound(prefix); i < this.sorted.length; i++) {
+      const n = this.sorted[i] as string;
+      if (!n.startsWith(prefix)) break;
+      if (this.live.has(n)) out.push(n);
+    }
+    return out;
+  }
+
+  /** Whether the map holds a name that starts with `prefix`. */
+  hasPrefix(prefix: string): boolean {
+    this.settle();
+    for (let i = this.lowerBound(prefix); i < this.sorted.length; i++) {
+      const n = this.sorted[i] as string;
+      if (!n.startsWith(prefix)) return false;
+      if (this.live.has(n)) return true;
+    }
+    return false;
+  }
+}
+
 /** The confirmed state of a keyspace at a seq (05 [STATE-33], 14 [CLI-1]). */
 export class ReplicaState {
   private readonly keys = new Map<string, KeyRow>();
   private readonly tombs = new Map<string, Tombstone>();
   private readonly prefixes: Map<string, bigint> | null;
+  // the ordered indexes of the three maps' names (see NameIndex); every write of a map goes through the helpers below
+  private readonly keyIdx = new NameIndex(this.keys);
+  private readonly tombIdx = new NameIndex(this.tombs);
+  private readonly prefixIdx: NameIndex | null;
   private tombFloor = 0n;
   private seq_ = 0n;
   private logEpoch_ = 0;
@@ -141,6 +242,37 @@ export class ReplicaState {
 
   constructor(options: StateOptions = {}) {
     this.prefixes = options.trackPrefixes === true ? new Map() : null;
+    this.prefixIdx = this.prefixes === null ? null : new NameIndex(this.prefixes);
+  }
+
+  // ---- the writers of the three maps, which keep the indexes in step; no other code of the class writes a map ----
+
+  private setKeyRow(key: string, row: KeyRow): void {
+    if (!this.keys.has(key)) this.keyIdx.added(key);
+    this.keys.set(key, row);
+  }
+
+  private delKeyRow(key: string): void {
+    if (this.keys.delete(key)) this.keyIdx.removed();
+  }
+
+  private setTomb(key: string, t: Tombstone): void {
+    if (!this.tombs.has(key)) this.tombIdx.added(key);
+    this.tombs.set(key, t);
+  }
+
+  private delTomb(key: string): void {
+    if (this.tombs.delete(key)) this.tombIdx.removed();
+  }
+
+  private setPrefix(prefix: string, version: bigint): void {
+    const m = this.prefixes as Map<string, bigint>;
+    if (!m.has(prefix)) (this.prefixIdx as NameIndex).added(prefix);
+    m.set(prefix, version);
+  }
+
+  private delPrefix(prefix: string): void {
+    if ((this.prefixes as Map<string, bigint>).delete(prefix)) (this.prefixIdx as NameIndex).removed();
   }
 
   /** The seq of the last record applied: the cursor. 0 for a keyspace with none (05 [STATE-39]). */
@@ -318,14 +450,14 @@ export class ReplicaState {
    * them from `seqs` when the change keeps them (05 [STATE-60], [STATE-85]).
    */
   putKey(key: string, row: KeyRow): void {
-    this.keys.set(key, row);
-    this.tombs.delete(key);
+    this.setKeyRow(key, row);
+    this.delTomb(key);
   }
 
   /** Stores a tombstone for an absent key, and makes sure that no present key holds the name. It serves a loader of tombstone entries. */
   putTombstone(key: string, t: Tombstone): void {
-    this.keys.delete(key);
-    this.tombs.set(key, t);
+    this.delKeyRow(key);
+    this.setTomb(key, t);
   }
 
   /** Sets the tombstone floor without discarding anything; `discardTombstones` is the rule of 05 [STATE-83]. It serves a loader. */
@@ -336,8 +468,8 @@ export class ReplicaState {
   /** Sets the version of a prefix; a version of 0 removes it (05 [STATE-51]). A state that does not track prefixes ignores it. */
   setPrefixVersion(prefix: string, version: bigint): void {
     if (this.prefixes === null) return;
-    if (version === 0n) this.prefixes.delete(prefix);
-    else this.prefixes.set(prefix, version);
+    if (version === 0n) this.delPrefix(prefix);
+    else this.setPrefix(prefix, version);
   }
 
   /**
@@ -353,7 +485,7 @@ export class ReplicaState {
       // a key is never present and tombstoned at once
       t.overrideSeq = k.overrideSeq;
       t.resetSeq = k.resetSeq;
-      this.keys.delete(key);
+      this.delKeyRow(key);
     } else {
       const prev = this.tombs.get(key);
       if (prev !== undefined) {
@@ -364,7 +496,7 @@ export class ReplicaState {
         }
       }
     }
-    this.tombs.set(key, t);
+    this.setTomb(key, t);
   }
 
   /**
@@ -372,15 +504,15 @@ export class ReplicaState {
    * the same record decides (05 [STATE-37], [STATE-43]).
    */
   dropKey(key: string): void {
-    this.keys.delete(key);
-    this.tombs.delete(key);
+    this.delKeyRow(key);
+    this.delTomb(key);
   }
 
   /** Gives the key's key tombstone the reset seq of 05 [STATE-85], and reports whether the key holds one. A key with no key tombstone gets none. */
   setResetSeq(key: string, seq: bigint): boolean {
     const t = this.tombs.get(key);
     if (t === undefined || t.kind !== "key") return false;
-    this.tombs.set(key, { ...t, resetSeq: seq });
+    this.tombs.set(key, { ...t, resetSeq: seq }); // the name is held already: the index stays as it is
     return true;
   }
 
@@ -388,7 +520,7 @@ export class ReplicaState {
   touchPrefixes(key: string, seq: bigint): void {
     if (this.prefixes === null) return;
     for (let i = 0; i < key.length; i++) {
-      if (key[i] === "/") this.prefixes.set(key.slice(0, i + 1), seq);
+      if (key[i] === "/") this.setPrefix(key.slice(0, i + 1), seq);
     }
   }
 
@@ -401,10 +533,12 @@ export class ReplicaState {
     const out: string[] = [];
     const prefix = `${root}/`;
     const visit = (key: string): void => {
-      if (key.startsWith(prefix) && top.isMarker(key) && inSubtree(top, root, key)) out.push(key);
+      if (top.isMarker(key) && inSubtree(top, root, key)) out.push(key);
     };
-    for (const key of this.keys.keys()) visit(key);
-    for (const key of this.tombs.keys()) {
+    // the subtree is the range of the names that start with `root/`: the cost is that of the range and a search, whatever the size of the
+    // keyspace (a key is never present and tombstoned at once, so the two ranges hold no name twice)
+    for (const key of this.keyIdx.withPrefix(prefix)) visit(key);
+    for (const key of this.tombIdx.withPrefix(prefix)) {
       if (!this.keys.has(key)) visit(key);
     }
     return out.sort(compareUtf8);
@@ -427,28 +561,28 @@ export class ReplicaState {
 
     const prefix = `${d.root}/`;
     const gone: string[] = [];
-    for (const key of this.keys.keys()) {
-      if (key.startsWith(prefix) && inSubtree(top, d.root, key)) gone.push(key);
+    for (const key of this.keyIdx.withPrefix(prefix)) {
+      if (inSubtree(top, d.root, key)) gone.push(key);
     }
-    for (const key of this.tombs.keys()) {
-      if (key.startsWith(prefix) && inSubtree(top, d.root, key)) gone.push(key);
+    for (const key of this.tombIdx.withPrefix(prefix)) {
+      if (inSubtree(top, d.root, key)) gone.push(key);
     }
     for (const key of gone) {
-      this.keys.delete(key);
-      this.tombs.delete(key);
+      this.delKeyRow(key);
+      this.delTomb(key);
     }
-    this.keys.delete(d.root);
+    this.delKeyRow(d.root);
 
-    this.tombs.set(d.root, { kind, version: seq, mark: rootMark, overrideSeq: 0n, resetSeq: 0n });
+    this.setTomb(d.root, { kind, version: seq, mark: rootMark, overrideSeq: 0n, resetSeq: 0n });
     d.nested.forEach((n, i) => {
-      if (n.key !== d.root) this.tombs.set(n.key, { kind, version: seq, mark: nestedMark[i] as boolean, overrideSeq: 0n, resetSeq: 0n });
+      if (n.key !== d.root) this.setTomb(n.key, { kind, version: seq, mark: nestedMark[i] as boolean, overrideSeq: 0n, resetSeq: 0n });
     });
 
+    // 05 [STATE-51]: the prefix `root/` and every prefix below it that has a version
     if (this.prefixes !== null) {
-      this.prefixes.set(prefix, seq);
-      for (const p of this.prefixes.keys()) {
-        if (p.startsWith(prefix)) this.prefixes.set(p, seq);
-      }
+      const below = (this.prefixIdx as NameIndex).withPrefix(prefix);
+      this.setPrefix(prefix, seq);
+      for (const p of below) this.setPrefix(p, seq);
     }
   }
 
@@ -460,21 +594,17 @@ export class ReplicaState {
    */
   discardTombstones(floor: bigint): void {
     for (const [key, t] of [...this.tombs]) {
-      if (t.version <= floor) this.tombs.delete(key);
+      if (t.version <= floor) this.delTomb(key);
     }
     this.tombFloor = floor;
     if (this.prefixes === null) return;
     // A prefix keeps its version while some key below it has a version above 0: a present key, a key tombstone that is left,
     // or a key covered by the tombstone of a marker key above the prefix.
-    const names: string[] = [...this.keys.keys()];
-    for (const key of this.tombs.keys()) {
-      if (!this.keys.has(key)) names.push(key);
-    }
     for (const [p, v] of [...this.prefixes]) {
       if (v > floor) continue;
-      if (names.some((n) => n.startsWith(p))) continue;
+      if (this.keyIdx.hasPrefix(p) || this.tombIdx.hasPrefix(p)) continue;
       if (this.coveredPrefix(p)) continue;
-      this.prefixes.delete(p);
+      this.delPrefix(p);
     }
   }
 
