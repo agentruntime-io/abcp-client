@@ -72,8 +72,10 @@ describe("14 [CLI-61], 10 [AUTH-25]: a handover ends the old flusher's work befo
     expect(kept?.outcome?.kind).toBe("appended"); // the new flusher got the stored result of its resend, and wrote it
     await r.clock.advance(61_000); // the old answer arrives (the server handled both requests, the second one first)
     await settleAll(a.engine, b.engine);
-    // the answer that came late found a tab that writes nothing
-    expect(a.engine.internalErrors.some((e) => e instanceof Error && /not the flusher/.test(e.message))).toBe(true);
+    // the answer that came late found a tab that writes nothing: it is of a client_id that is over (03 [ID-35]: the old flusher keeps none), so it is not applied
+    // at all; where it would be (a GATED action has no slot to lose), the write is refused, and that is the only failure that the tab notes
+    expect(a.engine.clientId).toBe("");
+    expect(a.engine.internalErrors.filter((e) => !(e instanceof Error && /not the flusher/.test(e.message)))).toEqual([]);
     expect(store.entry(x.mutationId)?.outcome).toEqual(kept?.outcome);
     r.server.resumeDelivery();
     await r.clock.advance(5000);

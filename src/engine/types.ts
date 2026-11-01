@@ -399,6 +399,8 @@ export interface SyncStatus {
   /** The changes that records carried and that their kind does not define, per keyspace (02 [ARC-46]); they count among `skippedChanges`. */
   anomalies: Record<string, number>;
   unacknowledgedRejections: number;
+  /** The rows of the storage that were malformed and were left out when it was read (V19 N5); `Engine.unreadableRows()` lists them. */
+  unreadableRows: number;
   cursors: Record<string, { seq: bigint; logEpoch: number }>;
   /** The interest prefixes of each followed keyspace; empty is the whole keyspace (14 [CLI-71]). */
   interest: Record<string, string[]>;

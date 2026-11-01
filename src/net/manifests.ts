@@ -4,7 +4,8 @@
 //
 // What the client reads of a manifest (not a validator: the server judged it at publish, 04 §4.11):
 //  - for the fold (`fold.Rules`): for each key template (`keys`) its merge rule, whether it is an entity marker, and its parent, which is the
-//    longest proper prefix of the template that is an entity template (04 [MAN-20]);
+//    longest proper prefix of the template that is an entity template (04 [MAN-20]). The templates are indexed by their segments (`TemplateIndex`): a lookup, a
+//    parent and a `writes` selection cost by the segments that they name, however many templates the manifest has (V19 N4);
 //  - for the engine: for each op type its dispatch, `optimistic`, `barrier`, `offline_mode`, whether it is a spend op type (`escrow`), the
 //    declared templates that its `writes` select (03 [ID-21]); the `crdt_roots` of a CRDT template; the range of a counter; the owning key of a
 //    fenced key (`fenced_by`, 04 [MAN-24]).
@@ -16,13 +17,15 @@
 
 import { create } from "@bufbuild/protobuf";
 import { GetManifestRequestSchema, GetManifestResponseSchema, type GetManifestResponse } from "../gen/abpc/v2/sync_pb.js";
+import { pushBounded } from "../engine/bounded.js";
 import type { EngineManifest, Manifests, OpTypeInfo } from "../engine/manifests.js";
 import { ProtocolViolation, RpcError } from "../engine/errors.js";
+import { TemplateIndex, type SelectForm } from "../engine/template-index.js";
 import type { Transport } from "../engine/transport.js";
 import { decodeMessage, encodeMessage } from "../engine/wire.js";
 import { sha256 } from "../rules/crypto.js";
 import type { Roots, RootType } from "../rules/crdt/index.js";
-import { expandKeyTemplate, matchKeyTemplate, parseKeyTemplate, type KeyTemplate, type Rule, type Template } from "../rules/fold/index.js";
+import { expandKeyTemplate, parseKeyTemplate, type KeyTemplate, type Rule, type Template } from "../rules/fold/index.js";
 import { JsonV1Error, getMember, intRange, parseDocument, schemaFromValue, type JsonValue, type Range } from "../rules/jsonv1/index.js";
 
 const ROOT_TYPES: ReadonlySet<string> = new Set(["text", "map", "array", "xml_fragment"]);
@@ -34,6 +37,8 @@ const MODULE_OP_TYPES: Readonly<Record<string, readonly string[]>> = {
   escrow: ["abpc.escrow.v1.Grant", "abpc.escrow.v1.Return"],
 };
 
+const FETCHES_KEPT = 1000;
+
 interface Compiled {
   tpl: KeyTemplate;
   template: Template;
@@ -44,7 +49,7 @@ interface Compiled {
 
 /** One version of a manifest, as the client reads it. */
 export class ParsedManifest implements EngineManifest {
-  private readonly bySegments = new Map<number, Compiled[]>();
+  private readonly index = new TemplateIndex<Compiled>();
   private readonly ops = new Map<string, OpTypeInfo>();
 
   constructor(
@@ -56,33 +61,29 @@ export class ParsedManifest implements EngineManifest {
     doc: JsonValue,
   ) {
     const keys = getMember(doc, "keys");
-    const texts = keys instanceof Map ? [...keys.keys()] : [];
-    const parsed = new Map<string, KeyTemplate>();
-    for (const t of texts) {
-      const p = parseKeyTemplate(t);
-      if (p !== undefined) parsed.set(t, p);
+    const compiled: Compiled[] = [];
+    if (keys instanceof Map) {
+      for (const [text, attrs] of keys) {
+        const tpl = parseKeyTemplate(text);
+        if (tpl === undefined) continue;
+        const merge = getMember(attrs, "merge");
+        const rule: Rule = merge === "crdt:yjs/v1" ? "crdt" : merge === "cas" ? "cas" : merge === "counter" ? "counter" : "lww";
+        const fb = getMember(attrs, "fenced_by");
+        const c: Compiled = {
+          tpl,
+          template: { rule, entity: getMember(attrs, "entity") === true, parent: "" },
+          roots: rootsOf(getMember(attrs, "crdt_roots")),
+          range: rule === "counter" ? counterRange(getMember(attrs, "value_schema")) : undefined,
+          fencedBy: typeof fb === "string" ? parseKeyTemplate(fb) : undefined,
+        };
+        this.index.add(tpl, c);
+        compiled.push(c);
+      }
     }
-    const entities = new Set<string>();
-    if (keys instanceof Map) for (const [t, a] of keys) if (getMember(a, "entity") === true) entities.add(t);
-    for (const [text, tpl] of parsed) {
-      const attrs = (keys as Map<string, JsonValue>).get(text) as JsonValue;
-      const merge = getMember(attrs, "merge");
-      const rule: Rule = merge === "crdt:yjs/v1" ? "crdt" : merge === "cas" ? "cas" : merge === "counter" ? "counter" : "lww";
-      const entity = getMember(attrs, "entity") === true;
-      const fb = getMember(attrs, "fenced_by");
-      const c: Compiled = {
-        tpl,
-        template: { rule, entity, parent: parentOf(tpl, parsed, entities) },
-        roots: rootsOf(getMember(attrs, "crdt_roots")),
-        range: rule === "counter" ? counterRange(getMember(attrs, "value_schema")) : undefined,
-        fencedBy: typeof fb === "string" ? parseKeyTemplate(fb) : undefined,
-      };
-      const bucket = this.bySegments.get(tpl.segments.length) ?? [];
-      bucket.push(c);
-      this.bySegments.set(tpl.segments.length, bucket);
-    }
+    // 04 [MAN-20]: the parent of a template is the longest proper prefix of it, by segments, that is an entity template: read after every template is indexed
+    for (const c of compiled) c.template.parent = this.index.nearestAncestor(c.tpl, (x) => x.template.entity)?.tpl.text ?? "";
     const ops = getMember(doc, "op_types");
-    if (ops instanceof Map) for (const [name, o] of ops) this.ops.set(name, opInfo(name, o, parsed));
+    if (ops instanceof Map) for (const [name, o] of ops) this.ops.set(name, opInfo(name, o, this.index));
     // 03 [ID-51]: `abpc.Override` exists in every manifest version, SEQUENCED
     this.ops.set("abpc.Override", { name: "abpc.Override", lane: "SEQUENCED", optimistic: true, barrier: false, offlineMode: "queue_recheck", spend: false, logIntent: false });
     const coordination = getMember(doc, "coordination");
@@ -95,12 +96,13 @@ export class ParsedManifest implements EngineManifest {
   }
 
   private find(key: string): { c: Compiled; bindings: Map<string, string> } | undefined {
-    const segments = key.split("/").length;
-    for (const c of this.bySegments.get(segments) ?? []) {
-      const bindings = matchKeyTemplate(c.tpl, key);
-      if (bindings !== undefined) return { c, bindings };
-    }
-    return undefined;
+    const hit = this.index.find(key);
+    return hit === undefined ? undefined : { c: hit.value, bindings: hit.bindings };
+  }
+
+  /** The nodes that the template index has visited in all, for a test: what a manifest costs is by segments, not by templates (V19 N4). */
+  get indexSteps(): number {
+    return this.index.steps;
   }
 
   template(_version: number, key: string): Template | undefined {
@@ -130,28 +132,6 @@ export class ParsedManifest implements EngineManifest {
   }
 }
 
-/** The shape of a template segment: a variable, whatever its name, or a literal (03 [ID-21]). */
-function sameShape(a: KeyTemplate, b: KeyTemplate, n: number): boolean {
-  for (let i = 0; i < n; i++) {
-    const x = a.segments[i] as KeyTemplate["segments"][number];
-    const y = b.segments[i] as KeyTemplate["segments"][number];
-    if ("variable" in x !== "variable" in y) return false;
-    if ("literal" in x && "literal" in y && x.literal !== y.literal) return false;
-  }
-  return true;
-}
-
-/** 04 [MAN-20]: the longest proper prefix of the template, by segments, that is an entity template; its text, or "". */
-function parentOf(tpl: KeyTemplate, all: ReadonlyMap<string, KeyTemplate>, entities: ReadonlySet<string>): string {
-  for (let n = tpl.segments.length - 1; n >= 1; n--) {
-    for (const e of entities) {
-      const p = all.get(e);
-      if (p !== undefined && p.segments.length === n && sameShape(p, tpl, n)) return e;
-    }
-  }
-  return "";
-}
-
 function rootsOf(v: JsonValue | undefined): Roots | undefined {
   if (!(v instanceof Map)) return undefined;
   const out = new Map<string, RootType>();
@@ -169,26 +149,29 @@ function counterRange(schema: JsonValue | undefined): Range {
   }
 }
 
-/** The declared templates that the patterns of `writes` select (03 [ID-21]): `T`, `T/*` (one more segment) and `T/**` (one or more). */
-function selected(patterns: JsonValue | undefined, all: ReadonlyMap<string, KeyTemplate>): string[] {
+/**
+ * The declared templates that the patterns of `writes` select (03 [ID-21]): `T`, `T/*` (one more segment) and `T/**` (one or more), a variable selecting a
+ * variable whatever its name. Each pattern's templates come in the order declared, and none twice.
+ */
+function selected(patterns: JsonValue | undefined, index: TemplateIndex<Compiled>): string[] {
   const out: string[] = [];
   if (!Array.isArray(patterns)) return out;
+  const seen = new Set<string>();
   for (const p of patterns) {
     if (typeof p !== "string") continue;
-    const form = p.endsWith("/**") ? "many" : p.endsWith("/*") ? "one" : "plain";
+    const form: SelectForm = p.endsWith("/**") ? "many" : p.endsWith("/*") ? "one" : "plain";
     const base = parseKeyTemplate(form === "many" ? p.slice(0, -3) : form === "one" ? p.slice(0, -2) : p);
     if (base === undefined) continue;
-    const n = base.segments.length;
-    for (const [text, t] of all) {
-      const len = t.segments.length;
-      if (form === "plain" ? len !== n : form === "one" ? len !== n + 1 : len <= n) continue;
-      if (sameShape(base, t, n) && !out.includes(text)) out.push(text);
+    for (const t of index.select(base, form)) {
+      if (seen.has(t.tpl.text)) continue;
+      seen.add(t.tpl.text);
+      out.push(t.tpl.text);
     }
   }
   return out;
 }
 
-function opInfo(name: string, o: JsonValue, all: ReadonlyMap<string, KeyTemplate>): OpTypeInfo {
+function opInfo(name: string, o: JsonValue, index: TemplateIndex<Compiled>): OpTypeInfo {
   const flag = (k: string, d: boolean): boolean => {
     const v = getMember(o, k);
     return typeof v === "boolean" ? v : d;
@@ -202,7 +185,7 @@ function opInfo(name: string, o: JsonValue, all: ReadonlyMap<string, KeyTemplate
     barrier: flag("barrier", false),
     offlineMode: getMember(o, "offline_mode") === "fail_fast" ? "fail_fast" : "queue_recheck",
     spend: typeof escrow === "string" && escrow !== "",
-    writes: selected(getMember(o, "writes"), all),
+    writes: selected(getMember(o, "writes"), index),
     logIntent: gated ? flag("log_intent", true) : false,
   };
 }
@@ -253,7 +236,7 @@ export interface ConnectManifestsOptions {
 export class ConnectManifests implements Manifests {
   private readonly loaded = new Map<number, ParsedManifest>();
   private readonly pending = new Map<number, Promise<boolean>>();
-  /** How many times each version was fetched from the server, for a test. */
+  /** The versions that were fetched from the server, the last `FETCHES_KEPT` of them, for a test (a long-lived client reloads a version for each hold's probe). */
   readonly fetches: number[] = [];
 
   constructor(private readonly o: ConnectManifestsOptions) {}
@@ -303,7 +286,7 @@ export class ConnectManifests implements Manifests {
     }
     let resp: GetManifestResponse;
     try {
-      this.fetches.push(version);
+      pushBounded(this.fetches, version, FETCHES_KEPT);
       resp = await this.o.transport.getManifest(create(GetManifestRequestSchema, { version }));
     } catch (e) {
       if (e instanceof RpcError && e.status === "NotFound") return false; // the server holds no such version (04 §4.7)

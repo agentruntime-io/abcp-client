@@ -749,7 +749,7 @@ export abstract class ReactionLayer extends ReplicaLayer {
    * polled answers under the old `client_id` and is re-stamped when it is next sent.
    */
   protected reidentify(_why: string): void {
-    this.clientId = this.mintClientId();
+    this.clientId = this.newClientId();
     for (const f of this.follows.values()) {
       f.lanes.SEQUENCED.reset();
       f.lanes.GATED.reset();

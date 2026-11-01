@@ -37,6 +37,8 @@ export {
   type StorageMode,
   type StoredState,
   type StoreName,
+  type UnreadableRow,
+  MAX_UNREADABLE_LISTED,
 } from "./storage.js";
 export { MemoryStorage, type MemoryStorageOptions } from "./memory-storage.js";
 export { KeyspaceView, type ViewValue } from "./overlay.js";

@@ -219,7 +219,7 @@ export function snapToCodePoint(s: string, i: number): number {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// The user's own edits of a root text (14 [CLI-13], verifier V19 MUST-4)
+// The user's own edits of a text of the view document (14 [CLI-13], verifier V19 MUST-4, Q67)
 
 /**
  * The UTF-16 unit at `index` of the text as Yjs counts it (an embed counts one and has none), or null when the text holds no string unit
@@ -247,7 +247,7 @@ function insidePair(t: Y.Text, index: number): boolean {
   return after !== null && isLow(after);
 }
 
-/** The text of a root text as a string of one unit for each unit that Yjs counts: an embed is a U+0000. */
+/** The text of a Y.Text as a string of one unit for each unit that Yjs counts: an embed is a U+0000. */
 function unitsOf(t: Y.Text): string {
   let out = "";
   for (let item = t._start; item !== null; item = item.right) {
@@ -284,10 +284,12 @@ function snapDelta(units: string, delta: readonly Record<string, unknown>[]): Re
   return moved ? out : null;
 }
 
-const GUARDED = Symbol("abpc.surrogate-guard");
+/** The view documents of the engine: every `Y.Text` in one of them, a root or one nested in a map or an array, is guarded (`guardViewDocument`). */
+const GUARDED_DOCS = new WeakSet<Y.Doc>();
+let textGuardInstalled = false;
 
 /**
- * Makes the edits that the user, or the editor binding that the app puts on the view document, makes of a root text keep every bound out of
+ * Makes the edits that the user, or the editor binding that the app puts on the view document, makes of a text of it keep every bound out of
  * a surrogate pair (14 [CLI-13]): "A client MUST NOT author an insert, a delete or a format whose bound falls between the two code units of a
  * surrogate pair: it moves the bound to the boundary before the pair, so that no update it authors would split a pair, which 05 [STATE-76]
  * makes a no-op for good". Every update that the view document records as unsent comes of a transaction of the user, and Yjs would
@@ -296,32 +298,46 @@ const GUARDED = Symbol("abpc.surrogate-guard");
  * of the text are called, with each bound that falls inside a pair taken to the boundary before it (a delete that starts inside a pair then
  * deletes the pair, and one that ends inside it leaves it), and a delta (`applyDelta`) with the bounds between its ops moved the same way.
  *
- * SPEC-QUESTION (14 [CLI-13]): the text says where a bound goes, not what a delete whose start is inside a pair then takes. The pair, here:
+ * Every text of the document is covered, whoever made it and wherever it is: a root text; a `Y.Text` or `Y.XmlText` that the app puts in a map or an array
+ * (the edits that it made before the text was in the document are queued by Yjs and made through the same methods when it is); one that a confirmed
+ * update brought; one in a view document that a rebuild made. A text cannot be guarded where it is made, so the methods of `Y.Text` are the guard: they
+ * move the bounds of a text whose document is a view document of the engine (`GUARDED_DOCS`), and do what Yjs does for every other text. `Y.XmlText`
+ * inherits them. The guard is installed once, when the first view document is made.
+ *
+ * SPEC-QUESTION (14 [CLI-13], Q67): the text says where a bound goes, not what a delete whose start is inside a pair then takes. The pair, here:
  * the bound moves to before it, so the range reaches the high unit that the user's delete did not name. A delete that ends inside a pair
- * leaves the pair whole, by the same move. A text that the app creates inside a map or an array (a nested Y.Text) is not a root, and is not
- * guarded: its edits are authored as they are made.
+ * leaves the pair whole, by the same move.
  */
-function guardText(t: Y.Text): void {
-  const g = t as unknown as Record<symbol, boolean>;
-  if (g[GUARDED] === true) return;
-  g[GUARDED] = true;
+function guardViewDocument(doc: Y.Doc): void {
+  GUARDED_DOCS.add(doc);
+  if (textGuardInstalled) return;
+  textGuardInstalled = true;
   const P = Y.Text.prototype;
-  const at = (index: number): number => (insidePair(t, index) ? index - 1 : index);
-  t.insert = (index: number, text: string, attributes?: Parameters<Y.Text["insert"]>[2]): void => P.insert.call(t, at(index), text, attributes);
-  t.insertEmbed = (index: number, embed: Parameters<Y.Text["insertEmbed"]>[1], attributes?: Parameters<Y.Text["insertEmbed"]>[2]): void =>
-    P.insertEmbed.call(t, at(index), embed, attributes);
-  t.delete = (index: number, length: number): void => {
-    const start = at(index);
-    P.delete.call(t, start, at(index + length) - start);
+  const { insert, insertEmbed, delete: del, format, applyDelta } = P;
+  const guarded = (t: Y.Text): boolean => t.doc !== null && GUARDED_DOCS.has(t.doc);
+  const at = (t: Y.Text, index: number): number => (guarded(t) && insidePair(t, index) ? index - 1 : index);
+  P.insert = function (this: Y.Text, index: number, text: string, attributes?: Parameters<Y.Text["insert"]>[2]): void {
+    insert.call(this, at(this, index), text, attributes);
   };
-  t.format = (index: number, length: number, attributes: Parameters<Y.Text["format"]>[2]): void => {
-    const start = at(index);
-    P.format.call(t, start, at(index + length) - start, attributes);
+  P.insertEmbed = function (this: Y.Text, index: number, embed: Parameters<Y.Text["insertEmbed"]>[1], attributes?: Parameters<Y.Text["insertEmbed"]>[2]): void {
+    insertEmbed.call(this, at(this, index), embed, attributes);
   };
-  t.applyDelta = (delta: Parameters<Y.Text["applyDelta"]>[0], opts?: Parameters<Y.Text["applyDelta"]>[1]): void => {
-    const units = unitsOf(t);
+  P.delete = function (this: Y.Text, index: number, length: number): void {
+    const start = at(this, index);
+    del.call(this, start, at(this, index + length) - start);
+  };
+  P.format = function (this: Y.Text, index: number, length: number, attributes: Parameters<Y.Text["format"]>[2]): void {
+    const start = at(this, index);
+    format.call(this, start, at(this, index + length) - start, attributes);
+  };
+  P.applyDelta = function (this: Y.Text, delta: Parameters<Y.Text["applyDelta"]>[0], opts?: Parameters<Y.Text["applyDelta"]>[1]): void {
+    if (!guarded(this)) {
+      applyDelta.call(this, delta, opts);
+      return;
+    }
+    const units = unitsOf(this);
     const snapped = units.length === 0 ? null : snapDelta(units, delta as Record<string, unknown>[]);
-    P.applyDelta.call(t, snapped ?? delta, opts);
+    applyDelta.call(this, snapped ?? delta, opts);
   };
 }
 
@@ -479,7 +495,7 @@ export class CrdtKey {
     }
     const kinds = this.kinds(v);
     ensureRoots(v, kinds);
-    for (const [name, kind] of kinds) if (kind === "text") guardText(v.getText(name)); // 14 [CLI-13]: the user's edits keep every bound out of a pair
+    guardViewDocument(v); // 14 [CLI-13]: the user's edits of every text of the document keep their bounds out of a pair
     v.on("update", (u: Uint8Array) => {
       if (this.integrating) return;
       this.unsent.push(u);

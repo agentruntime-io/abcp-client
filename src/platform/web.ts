@@ -4,6 +4,12 @@
 // a platform that lacks one is told so: without Web Locks `reliable` is false and each tab is an engine of its own; without IndexedDB there is no
 // storage, and `createWebHost` throws instead of falling back to memory silently (14 [CLI-21]).
 //
+// A duplicated tab copies `sessionStorage` (as does a window that a page opens), so two live tabs can find one id there (V19 N5). Where no reliable lock exists
+// the id names the tab's outbox (14 [CLI-61]), and two tabs with one id would be two flushers of one outbox (10 [AUTH-25]). A page that finds its id in
+// `sessionStorage` therefore asks the other pages of the origin, over a `BroadcastChannel`, whether a live tab holds it, and takes a fresh id when one says so
+// (`ready` resolves when the id is settled, and the engine waits for it). A reload is the same tab: no live page answers for the id, and it is kept. A page that is
+// frozen and cannot answer in time is not told apart: that is the limit of asking.
+//
 // Untested in a browser (nothing here runs in Node but the lock and the channel, against Node's own `navigator.locks` and `BroadcastChannel`).
 
 import type { MemoryStorageOptions } from "../engine/memory-storage.js";
@@ -32,8 +38,13 @@ export interface WebHostOptions extends MemoryStorageOptions {
   env?: WebEnv;
   /** How long a sign-out waits for another tab that keeps the database open, in real ms; default 10 s. */
   blockedWaitMs?: number;
-  /** The id of the tab; default the one that `sessionStorage` keeps for this tab, or a new one. */
+  /** The id of the tab; default the one that `sessionStorage` keeps for this tab, or a new one. An id that is given is the app's: no other tab is asked about it. */
   tabId?: string;
+  /**
+   * How long a tab that found its id in `sessionStorage` waits for a live tab that holds it to say so, in real ms (a host has no engine clock); default 150.
+   * A tab that mints its id, or is given one, waits for nothing.
+   */
+  claimWaitMs?: number;
 }
 
 /** What the global scope gives. */
@@ -66,21 +77,102 @@ export function globalWebEnv(): WebEnv {
 }
 
 const TAB_KEY = "abpc.tabId";
+/** The channel on which the pages of an origin say which tab ids they hold (a `BroadcastChannel` reaches the pages of its origin only). */
+const ID_CHANNEL = "abpc.tab-ids";
+const DEFAULT_CLAIM_WAIT_MS = 150;
+
+/** What the pages of an origin say to each other about tab ids. */
+type IdMessage = { t: "claim"; id: string; nonce: string } | { t: "held"; id: string; to: string };
+
+const newTabId = (env: WebEnv): string => env.randomUUID?.() ?? `tab-${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
 
 export class WebTab implements TabHost {
-  readonly tabId: string;
+  private id: string;
   readonly locks: CrossTabLocks;
   readonly storage: StorageProvider;
   private readonly channels = new Set<TabChannel>();
+  /** The channel of tab ids, open for as long as the page is: it answers for the id that this page holds. */
+  private readonly idChannel: TabChannel | undefined;
+  /** This page among the pages of the origin: the pages of two tabs that copy one id are told apart by it. */
+  private readonly nonce: string;
+  private readonly settled: Promise<void>;
+  /** The page has asked whether a live tab holds the id, and the wait is not over. */
+  private asking = false;
+  /** Another page holds the id, or won the tie of two pages that asked for it at once. */
+  private taken = false;
+  private stopAsking: (() => void) | undefined;
 
+  /** `inherited`: the id came from `sessionStorage`, which a duplicate of the tab copies, so it is asked about before it is used. */
   constructor(
     private readonly env: WebEnv,
     storage: StorageProvider,
     tabId: string,
+    o: { inherited?: boolean; claimWaitMs?: number } = {},
   ) {
-    this.tabId = tabId;
+    this.id = tabId;
     this.storage = storage;
     this.locks = new WebLocks(env.locks);
+    this.nonce = `${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`; // told apart, not secret: it is not a tab id, and costs the host's id source nothing
+    const ctor = env.BroadcastChannel;
+    if (ctor !== undefined) {
+      this.idChannel = new BroadcastTabChannel(ctor, ID_CHANNEL, { unref: true });
+      this.idChannel.onMessage((m) => this.onIdMessage(m));
+    }
+    this.settled = o.inherited === true && this.idChannel !== undefined ? this.ask(o.claimWaitMs ?? DEFAULT_CLAIM_WAIT_MS) : Promise.resolve();
+  }
+
+  get tabId(): string {
+    return this.id;
+  }
+
+  ready(): Promise<void> {
+    return this.settled;
+  }
+
+  /** Asks the other pages whether a live tab holds the id; takes a fresh one, and keeps it in `sessionStorage`, when one does. */
+  private async ask(waitMs: number): Promise<void> {
+    this.asking = true;
+    this.idChannel?.post({ t: "claim", id: this.id, nonce: this.nonce } satisfies IdMessage);
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, waitMs);
+      this.stopAsking = (): void => {
+        clearTimeout(timer);
+        resolve();
+      };
+    });
+    this.asking = false;
+    if (!this.taken) return;
+    this.id = newTabId(this.env);
+    try {
+      this.env.sessionStorage?.setItem(TAB_KEY, this.id);
+    } catch {
+      // storage blocked: the id lasts for as long as this tab object
+    }
+  }
+
+  private onIdMessage(m: unknown): void {
+    if (typeof m !== "object" || m === null) return;
+    const msg = m as IdMessage;
+    if (msg.t === "claim") {
+      if (msg.id !== this.id || msg.nonce === this.nonce) return;
+      // a page that holds the id says so; two pages that ask at once are settled by their nonces: the lower keeps the id
+      if (!this.asking || this.nonce < msg.nonce) this.idChannel?.post({ t: "held", id: this.id, to: msg.nonce } satisfies IdMessage);
+      else this.lose();
+    } else if (msg.t === "held" && this.asking && msg.to === this.nonce && msg.id === this.id) {
+      this.lose();
+    }
+  }
+
+  private lose(): void {
+    this.taken = true;
+    this.stopAsking?.();
+  }
+
+  /** Closes the channels of the tab: the page is going away (a browser does it itself; a test, and an app that tears its host down, call it). */
+  close(): void {
+    this.idChannel?.close();
+    for (const c of this.channels) c.close();
+    this.channels.clear();
   }
 
   channel(name: string): TabChannel {
@@ -107,22 +199,27 @@ export class WebTab implements TabHost {
 export function createWebHost(opts: WebHostOptions = {}): WebTab {
   const env = opts.env ?? globalWebEnv();
   if (env.indexedDB === undefined) throw new Error("this platform has no IndexedDB: the outbox would be memory only (14 [CLI-21]); give the engine a storage explicitly if that is meant");
-  const { env: _e, tabId: _t, blockedWaitMs, ...bounds } = opts;
+  const { env: _e, tabId: _t, blockedWaitMs, claimWaitMs, ...bounds } = opts;
   let tabId = opts.tabId;
+  let inherited = false;
   if (tabId === undefined) {
     try {
       tabId = env.sessionStorage?.getItem(TAB_KEY) ?? undefined;
+      inherited = tabId !== undefined;
     } catch {
       // storage blocked
     }
   }
   if (tabId === undefined) {
-    tabId = env.randomUUID?.() ?? `tab-${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+    tabId = newTabId(env);
     try {
       env.sessionStorage?.setItem(TAB_KEY, tabId);
     } catch {
       // storage blocked: the id lasts for as long as this tab object
     }
   }
-  return new WebTab(env, new IndexedDbStorageProvider(env.indexedDB, bounds, env.storageManager, { ...(env.IDBKeyRange !== undefined ? { keyRange: env.IDBKeyRange } : {}), ...(blockedWaitMs !== undefined ? { blockedWaitMs } : {}) }), tabId);
+  return new WebTab(env, new IndexedDbStorageProvider(env.indexedDB, bounds, env.storageManager, { ...(env.IDBKeyRange !== undefined ? { keyRange: env.IDBKeyRange } : {}), ...(blockedWaitMs !== undefined ? { blockedWaitMs } : {}) }), tabId, {
+    inherited,
+    ...(claimWaitMs !== undefined ? { claimWaitMs } : {}),
+  });
 }

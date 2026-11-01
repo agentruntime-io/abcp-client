@@ -92,6 +92,12 @@ export interface TabHost {
    * other than the engine's own), for the app to flush or discard once the host knows that the tab is gone.
    */
   readonly tabId: string;
+  /**
+   * Resolves when `tabId` is settled, for a host that has to ask the other tabs first whether a live tab already has the id (a browser tab that was
+   * duplicated copies its `sessionStorage`, and with it its id: two live tabs would share one outbox, V19 N5). The engine waits for it before it reads `tabId`
+   * (the name of the outbox, the sender of every message); a host whose id never changes leaves it out.
+   */
+  ready?(): Promise<void>;
   readonly locks: CrossTabLocks;
   readonly storage: StorageProvider;
   /** Opens a local broadcast channel by name. */

@@ -515,7 +515,8 @@ export abstract class SessionLayer extends SenderLayer {
     const f = this.follows.get(cur.keyspaceId);
     if (f === undefined || !f.loaded) return;
     f.awaitingAdd = false;
-    if (cur.logEpoch !== 0 && cur.logEpoch !== f.logEpoch) {
+    // 03 [ID-40], 09 [READ-65]: "In KeyspaceCursor.log_epoch, 0 is a value that matches no epoch": a cursor of epoch 0 is a mismatch, not "no epoch given"
+    if (cur.logEpoch === 0 || cur.logEpoch !== f.logEpoch) {
       this.onEpochMismatch(f);
       return;
     }
@@ -602,7 +603,10 @@ export abstract class SessionLayer extends SenderLayer {
   private async keyspaceDeleted(f: Follow): Promise<void> {
     // 14 [CLI-77]: the dead-letter and export entries that the keyspace has now are handed to the app once more and purged; the ones that
     // the endings below write stay
-    const before = { deadLetters: [...this.deadLetters.values()].filter((d) => d.keyspaceId === f.id).map((d) => d.mutationId), exports: [...this.exports.values()].filter((x) => x.keyspaceId === f.id).map((x) => x.mutationId) };
+    const before = {
+      deadLetters: this.authoringOrder(this.deadLetters.values()).filter((d) => d.keyspaceId === f.id).map((d) => d.mutationId),
+      exports: this.authoringOrder(this.exports.values()).filter((x) => x.keyspaceId === f.id).map((x) => x.mutationId),
+    };
     await this.retireAtOnce(f);
     for (const e of this.entriesOf(f.id)) {
       if (!this.entries.has(e.mutationId) || e.outcome !== undefined || this.ending.has(e.mutationId)) continue;

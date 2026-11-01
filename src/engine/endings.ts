@@ -151,6 +151,7 @@ export abstract class EndingLayer extends EngineCore {
           firstFailureMs: en.firstFailureMs ?? now,
           lastFailureMs: now,
           failedDependents: it === items[0] ? deps.map((d) => d.mutationId) : [],
+          ordinal: en.ordinal,
           ...(it.dependencyOf !== undefined ? { dependencyOf: it.dependencyOf } : {}),
         };
         ops.push({ op: "putDeadLetter", entry: dl });
@@ -166,6 +167,7 @@ export abstract class EndingLayer extends EngineCore {
           ...(this.lastResultText(en) !== undefined ? { lastResult: this.lastResultText(en) as string } : {}),
           ...(it.dependencyOf !== undefined ? { dependencyOf: it.dependencyOf } : {}),
           atMs: now,
+          ordinal: en.ordinal,
         };
         ops.push({ op: "putExport", entry: ex });
       }

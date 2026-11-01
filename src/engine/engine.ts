@@ -22,7 +22,7 @@ import { checkInterest, covers } from "./replica-store.js";
 import { getMember, parse as parseJson } from "../rules/jsonv1/index.js";
 import { StateValue } from "../rules/fold/index.js";
 import { TabLayer } from "./tab-layer.js";
-import type { DeadLetterEntry, DraftEntry, ExportEntry, JournalEntry, OutboxEntry, RejectionRecord } from "./storage.js";
+import type { DeadLetterEntry, DraftEntry, ExportEntry, JournalEntry, OutboxEntry, RejectionRecord, UnreadableRow } from "./storage.js";
 import type { PartitionKey } from "./tabs.js";
 import type { ActionInput, ChangeInput, EngineEvent, PreconditionInput, SubmitOptions, SubmitResult, SyncStatus } from "./types.js";
 import { Code, ErrorClass } from "../gen/abpc/v2/types_pb.js";
@@ -129,7 +129,7 @@ export class Engine extends TabLayer {
     this.runtimes.clear();
     const s = await this.loadStored();
     // 14 [CLI-63]: a new client_id at every engine start and every flusher handover, kept in memory only
-    this.clientId = this.mintClientId();
+    this.clientId = this.newClientId();
     // 14 [CLI-2]: the persisted replicas; one rehydration path (14 [CLI-8]): each is asked whether it can resume, by a load from its cursor
     // 14 [CLI-66], [CLI-7], [CLI-8]: a keyspace that a revocation stopped is not followed again with the old token: its copy is purged, and what the
     // revocation left (the quarantine, the actions that are asked about) is finished
@@ -492,6 +492,7 @@ export class Engine extends TabLayer {
       loadsWithSkipped: rt?.loadsWithSkipped ?? loadsWithSkipped,
       anomalies: rt?.anomalies ?? anomalies,
       unacknowledgedRejections: this.rejections.size,
+      unreadableRows: this.unreadable.length,
       cursors,
       interest,
       stopped: rt?.stopped ?? stopped,
@@ -541,16 +542,23 @@ export class Engine extends TabLayer {
     return this.provider === undefined ? [this.partition] : this.provider.list(this.partition.origin, this.partition.appId);
   }
 
+  /** The dead-letter store, in the authoring order of the actions (14 [CLI-28], [CLI-38]). */
   deadLetterEntries(): DeadLetterEntry[] {
-    return [...this.deadLetters.values()];
+    return this.authoringOrder(this.deadLetters.values());
   }
 
   journalEntries(): JournalEntry[] {
     return [...this.journal.values()];
   }
 
+  /** The export-hook entries that the app has not acknowledged, in the authoring order of the actions (14 [CLI-83]). */
   exportEntries(): ExportEntry[] {
-    return [...this.exports.values()];
+    return this.authoringOrder(this.exports.values());
+  }
+
+  /** The rows of the storage that the engine could not read and left out (V19 N5): a malformed row is reported, and the rest of the partition is the engine's. */
+  unreadableRows(): UnreadableRow[] {
+    return [...this.unreadable];
   }
 
   rejectionEntries(): RejectionRecord[] {
@@ -691,8 +699,8 @@ export class Engine extends TabLayer {
     }
     // 14 [CLI-28], [CLI-83]: "Entries stay durable until the app acknowledges them": the purge takes the ones that it has not, so each is handed to the app once
     // more first (a dead-letter entry with `dead-lettered`, an export-hook entry with `exported` and the hook), as 14 [CLI-77] does for a deleted keyspace
-    for (const d of [...this.deadLetters.values()]) this.emit({ type: "dead-lettered", mutationId: d.mutationId, keyspaceId: d.keyspaceId, reason: d.reason });
-    for (const x of [...this.exports.values()]) {
+    for (const d of this.deadLetterEntries()) this.emit({ type: "dead-lettered", mutationId: d.mutationId, keyspaceId: d.keyspaceId, reason: d.reason });
+    for (const x of this.exportEntries()) {
       this.emit({ type: "exported", mutationId: x.mutationId, keyspaceId: x.keyspaceId, reason: x.reason });
       this.callExportHook(this.exportRecord(x));
     }

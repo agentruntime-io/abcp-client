@@ -10,7 +10,8 @@
 //    reliable cross-tab lock exists, each tab is an engine of its own, with an outbox of its own (the partition key names the tab),
 //    its own session and its own `client_id`.
 //  - [CLI-63] A flusher mints a new `client_id` at its start and at every handover (`becomeFlusher`), keeps it in memory only, and
-//    re-stamps every action without a definitive result before it sends under it (the rehydration of `engine.ts`).
+//    re-stamps every action without a definitive result before it sends under it (the rehydration of `engine.ts`). The tab that hands the role over keeps
+//    none (03 [ID-35]: a follower has no client instance), and mints another if it takes the role back.
 //  - What a follower reads is the flusher's durable state: the outbox, the stores and the persisted replica are re-read from the
 //    storage when the flusher says that they changed (`state` messages); its events are the flusher's, relayed (`event`); the
 //    connection and the holds are the flusher's runtime (`state`). A follower that reads the replica folds the pages and the tail
@@ -156,6 +157,7 @@ export abstract class TabLayer extends RevocationLayer {
 
   /** Opens the partition's storage (14 [CLI-74]), asks the platform to keep it (14 [CLI-75]), and elects the flusher (14 [CLI-61]). */
   protected async boot(cfg: EngineConfig): Promise<void> {
+    await this.tabHost?.ready?.(); // the tab id names the outbox where no reliable lock exists, and is the sender of every message: it is read after this
     const mode = cfg.mode ?? "personal";
     const reliable = this.tabHost === undefined || this.tabHost.locks.reliable;
     this.partition = {
@@ -721,6 +723,8 @@ export abstract class TabLayer extends RevocationLayer {
     this.stopped = false;
     this.resetRuntime();
     this.runtimeMirror = undefined;
+    // 03 [ID-35], 14 [CLI-63]: the instance that sent under this client_id is over, and a follower is none: the next flusher mints its own, and so does this tab if it takes the role back
+    this.clientId = "";
     this.emit({ type: "role", role: "follower", cause: "HANDED_OVER" });
     const lease = this.lease;
     this.lease = undefined;

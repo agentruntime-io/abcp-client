@@ -24,8 +24,15 @@
 import { StorageError } from "../engine/errors.js";
 import {
   draftKey,
+  MAX_UNREADABLE_LISTED,
   StoreFull,
+  type DeadLetterEntry,
+  type DraftEntry,
+  type ExportEntry,
+  type JournalEntry,
+  type OutboxEntry,
   type OutboxStorage,
+  type RejectionRecord,
   type ReplicaBase,
   type ReplicaHead,
   type ReplicaImage,
@@ -34,6 +41,7 @@ import {
   type StoredLight,
   type StoredState,
   type StoreName,
+  type UnreadableRow,
 } from "../engine/storage.js";
 import type { MemoryStorageOptions } from "../engine/memory-storage.js";
 import { partitionId, sameKey, type PartitionKey, type StorageProvider } from "../engine/tabs.js";
@@ -152,6 +160,102 @@ const BOUNDED: { name: StoreName; store: Bounded; opts: "maxOutbox" | "maxDeadLe
   { name: "exports", store: "exports", opts: "maxExports" },
 ];
 
+// ---- rows that are not what this storage wrote (V19 N5) -------------------------------------------------------------
+//
+// A row that was damaged, or written by another build in another shape, used to make every read throw, so that the partition never opened again. Each row
+// is checked for what the engine reads of it; one that fails is left out of what the read returns and listed in `unreadable` (14 [CLI-29]: "one bad entry MUST
+// NOT stop the flush of others"). The checks are of the shape, not of the meaning: the engine judges the content of an action as it always has.
+
+/** The keys and the rows of one store, in key order. */
+type Rows = [string[], unknown[]];
+
+/** Why a row is not what the storage wrote, or undefined when it is. */
+type Check = (key: string, row: unknown) => string | undefined;
+
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+/** Bytes, whichever realm made them (a worker, a frame): `instanceof` would call a row of another realm malformed. */
+const isBytes = (v: unknown): v is Uint8Array => Object.prototype.toString.call(v) === "[object Uint8Array]";
+
+/** The rows of the stores that hold an action: the id is the key, and the engine reads the keyspace, the op type, the content and the author. */
+const actionRow: Check = (key, row) => {
+  if (!isObject(row)) return "the row is not an object";
+  if (row["mutationId"] !== key) return "its mutation id is not its key";
+  if (typeof row["keyspaceId"] !== "string" || typeof row["opType"] !== "string") return "it names no keyspace or no op type";
+  if (!isBytes(row["content"])) return "its content is not bytes";
+  if (row["author"] !== undefined && !isObject(row["author"])) return "its author is not an object";
+  return undefined;
+};
+
+const entryRow: Check = (key, row) => {
+  const why = actionRow(key, row);
+  if (why !== undefined) return why;
+  const r = row as Record<string, unknown>;
+  if (typeof r["ordinal"] !== "number" || !Number.isFinite(r["ordinal"])) return "its ordinal is not a number";
+  if (r["lane"] !== "SEQUENCED" && r["lane"] !== "GATED") return "its lane is not one";
+  if (!Array.isArray(r["dependsOn"])) return "its dependencies are not a list";
+  return undefined;
+};
+
+const draftRow: Check = (key, row) => {
+  if (!isObject(row)) return "the row is not an object";
+  if (typeof row["keyspaceId"] !== "string" || typeof row["key"] !== "string") return "it names no keyspace or no key";
+  if (draftKey(row as unknown as DraftEntry) !== key) return "its key is not the key of its draft";
+  return undefined;
+};
+
+const replicaHeaderRow: Check = (_key, row) => {
+  if (!isObject(row)) return "the row is not an object";
+  const head = row["head"];
+  const base = row["base"];
+  if (!isObject(head) || typeof head["seq"] !== "bigint" || !Array.isArray(head["interest"])) return "its head is not a replica head";
+  if (!isObject(base) || typeof base["checkpointSeq"] !== "bigint") return "its base is not a replica base";
+  if (typeof row["entryCount"] !== "number") return "it holds no count of its pages";
+  return undefined;
+};
+
+const pageRow: Check = (_key, row) => (isObject(row) && typeof row["key"] === "string" ? undefined : "the row is not a key entry");
+const tailRow: Check = (_key, row) => (isObject(row) && typeof row["seq"] === "bigint" ? undefined : "the row is not a record");
+
+/** The rows that a read left out, as many as are listed (`MAX_UNREADABLE_LISTED`). */
+class Unreadable {
+  readonly rows: UnreadableRow[] = [];
+  add(store: string, key: string, why: string): void {
+    if (this.rows.length < MAX_UNREADABLE_LISTED) this.rows.push({ store, key, why });
+  }
+}
+
+/** The rows of a store that pass `check`, with their keys; `onBad` hears the key of each that does not. */
+function good<T>(store: StoreId, [keys, rows]: Rows, check: Check, into: Unreadable, onBad?: (key: string) => void): [string, T][] {
+  const out: [string, T][] = [];
+  keys.forEach((k, i) => {
+    const why = check(k, rows[i]);
+    if (why === undefined) out.push([k, rows[i] as T]);
+    else {
+      into.add(store, k, why);
+      onBad?.(k);
+    }
+  });
+  return out;
+}
+
+const values = <T>(rows: [string, T][]): T[] => rows.map(([, v]) => v);
+
+/** The replica headers that are whole, by keyspace. */
+function readHeaders(rows: Rows, into: Unreadable): Map<string, ReplicaHeader> {
+  return new Map(good<ReplicaHeader>("replicas", rows, replicaHeaderRow, into));
+}
+
+/** The meta rows whose value is a scalar. */
+function metaOf(rows: Rows, into: Unreadable): Record<string, string | number | bigint> {
+  const meta: Record<string, string | number | bigint> = {};
+  rows[0].forEach((k, i) => {
+    const v = rows[1][i];
+    if (typeof v === "string" || typeof v === "number" || typeof v === "bigint") meta[k] = v;
+    else into.add("meta", k, "its value is not a string, a number or a bigint");
+  });
+  return meta;
+}
+
 /** What a commit reads of the database before it writes. */
 interface Fresh {
   headers: Map<string, ReplicaHeader | undefined>;
@@ -222,47 +326,49 @@ export class IndexedDbStorage implements OutboxStorage {
     await this.chain;
     const tx = this.connection().transaction([...STORES], "readonly");
     const finished = done(tx); // listened to from the start: the transaction can complete before the requests' promises are awaited
-    const all = (s: StoreId): Promise<unknown[]> => wait(tx.objectStore(s).getAll());
-    const keys = (s: StoreId): Promise<string[]> => wait(tx.objectStore(s).getAllKeys());
-    const [entries, deadLetters, journal, exports, rejections, drafts, metaKeys, metaValues, headerKeys, headers, entryKeys, entryValues, tailKeys, tailValues] = await Promise.all([
-      all("entries"),
-      all("deadLetters"),
-      all("journal"),
-      all("exports"),
-      all("rejections"),
-      all("drafts"),
-      keys("meta"),
-      all("meta"),
-      keys("replicas"),
-      all("replicas"),
-      keys("replicaEntries"),
-      all("replicaEntries"),
-      keys("replicaTail"),
-      all("replicaTail"),
+    // every request is made at once, while the transaction is active; the rows of a store are read with their keys, which name a row that is not one
+    const rowsOf = (s: StoreId): Promise<Rows> => Promise.all([wait(tx.objectStore(s).getAllKeys()), wait(tx.objectStore(s).getAll())]);
+    const [entries, deadLetters, journal, exports, rejections, drafts, meta, headers, pages, tail] = await Promise.all([
+      rowsOf("entries"),
+      rowsOf("deadLetters"),
+      rowsOf("journal"),
+      rowsOf("exports"),
+      rowsOf("rejections"),
+      rowsOf("drafts"),
+      rowsOf("meta"),
+      rowsOf("replicas"),
+      rowsOf("replicaEntries"),
+      rowsOf("replicaTail"),
     ]);
     await finished;
-    // what this read saw is what the bounds are judged on from here: a tab that became the flusher reads before it writes (V19 MUST-2)
-    const idsOf = (rows: unknown[]): Set<string> => new Set((rows as { mutationId: string }[]).map((e) => e.mutationId));
-    this.ids = { entries: idsOf(entries), deadLetters: idsOf(deadLetters), journal: idsOf(journal), exports: idsOf(exports) };
-    const meta: Record<string, string | number | bigint> = {};
-    metaKeys.forEach((k, i) => (meta[k] = metaValues[i] as string | number | bigint));
+    // what this read saw is what the bounds are judged on from here: a tab that became the flusher reads before it writes (V19 MUST-2); a row that is
+    // left out below is still a row of the database
+    this.ids = { entries: new Set(entries[0]), deadLetters: new Set(deadLetters[0]), journal: new Set(journal[0]), exports: new Set(exports[0]) };
+    const unreadable = new Unreadable();
     const images = new Map<string, ReplicaImage>();
-    headerKeys.forEach((k, i) => {
-      const h = headers[i] as ReplicaHeader;
-      images.set(k, { keyspaceId: k, head: h.head, base: { ...h.base, entries: [] }, tail: [] });
-    });
-    entryKeys.forEach((k, i) => images.get(keyspaceOf(k))?.base.entries.push(entryValues[i] as KeyEntry));
-    tailKeys.forEach((k, i) => images.get(keyspaceOf(k))?.tail.push(tailValues[i] as RecordMessage));
-    return {
-      entries: entries as StoredState["entries"],
-      deadLetters: deadLetters as StoredState["deadLetters"],
-      journal: journal as StoredState["journal"],
-      exports: exports as StoredState["exports"],
-      rejections: rejections as StoredState["rejections"],
-      drafts: drafts as StoredState["drafts"],
+    const headerOf = readHeaders(headers, unreadable);
+    // V19 N5: a page or a tail row of a keyspace that is not one leaves the image out whole: an image with a gap would show a wrong confirmed state
+    const damaged = new Set<string>();
+    const pageRows = good<KeyEntry>("replicaEntries", pages, pageRow, unreadable, (k) => damaged.add(keyspaceOf(k)));
+    const tailRows = good<RecordMessage>("replicaTail", tail, tailRow, unreadable, (k) => damaged.add(keyspaceOf(k)));
+    for (const [ks, h] of headerOf) {
+      if (damaged.has(ks)) unreadable.add("replicas", ks, "a row of its pages or its tail is unreadable, so its image is not used");
+      else images.set(ks, { keyspaceId: ks, head: h.head, base: { ...h.base, entries: [] }, tail: [] });
+    }
+    for (const [k, e] of pageRows) images.get(keyspaceOf(k))?.base.entries.push(e);
+    for (const [k, r] of tailRows) images.get(keyspaceOf(k))?.tail.push(r);
+    const state: StoredState = {
+      entries: values(good<OutboxEntry>("entries", entries, entryRow, unreadable)),
+      deadLetters: values(good<DeadLetterEntry>("deadLetters", deadLetters, actionRow, unreadable)),
+      journal: values(good<JournalEntry>("journal", journal, actionRow, unreadable)),
+      exports: values(good<ExportEntry>("exports", exports, actionRow, unreadable)),
+      rejections: values(good<RejectionRecord>("rejections", rejections, actionRow, unreadable)),
+      drafts: values(good<DraftEntry>("drafts", drafts, draftRow, unreadable)),
       replicas: [...images.values()],
-      meta,
+      meta: metaOf(meta, unreadable),
     };
+    if (unreadable.rows.length > 0) state.unreadable = unreadable.rows;
+    return state;
   }
 
   async loadLight(): Promise<StoredLight> {
@@ -270,37 +376,25 @@ export class IndexedDbStorage implements OutboxStorage {
     const names: StoreId[] = ["entries", "deadLetters", "journal", "exports", "rejections", "drafts", "meta", "replicas"];
     const tx = this.connection().transaction(names, "readonly");
     const finished = done(tx);
-    const all = (s: StoreId): Promise<unknown[]> => wait(tx.objectStore(s).getAll());
-    const [entries, deadLetters, journal, exports, rejections, drafts, metaKeys, metaValues, headerKeys, headers] = await Promise.all([
-      all("entries"),
-      all("deadLetters"),
-      all("journal"),
-      all("exports"),
-      all("rejections"),
-      all("drafts"),
-      wait(tx.objectStore("meta").getAllKeys()),
-      all("meta"),
-      wait(tx.objectStore("replicas").getAllKeys()),
-      all("replicas"),
-    ]);
+    const rowsOf = (s: StoreId): Promise<Rows> => Promise.all([wait(tx.objectStore(s).getAllKeys()), wait(tx.objectStore(s).getAll())]);
+    const [entries, deadLetters, journal, exports, rejections, drafts, meta, headers] = await Promise.all(names.map(rowsOf));
     await finished;
-    const meta: Record<string, string | number | bigint> = {};
-    metaKeys.forEach((k, i) => (meta[k] = metaValues[i] as string | number | bigint));
-    return {
-      entries: entries as StoredState["entries"],
-      deadLetters: deadLetters as StoredState["deadLetters"],
-      journal: journal as StoredState["journal"],
-      exports: exports as StoredState["exports"],
-      rejections: rejections as StoredState["rejections"],
-      drafts: drafts as StoredState["drafts"],
-      replicas: headerKeys.map((k, i) => {
-        const h = headers[i] as ReplicaHeader;
-        return { keyspaceId: k, head: h.head, base: h.base, entryCount: h.entryCount };
-      }),
-      meta,
+    const unreadable = new Unreadable();
+    const light: StoredLight = {
+      entries: values(good<OutboxEntry>("entries", entries as Rows, entryRow, unreadable)),
+      deadLetters: values(good<DeadLetterEntry>("deadLetters", deadLetters as Rows, actionRow, unreadable)),
+      journal: values(good<JournalEntry>("journal", journal as Rows, actionRow, unreadable)),
+      exports: values(good<ExportEntry>("exports", exports as Rows, actionRow, unreadable)),
+      rejections: values(good<RejectionRecord>("rejections", rejections as Rows, actionRow, unreadable)),
+      drafts: values(good<DraftEntry>("drafts", drafts as Rows, draftRow, unreadable)),
+      replicas: [...readHeaders(headers as Rows, unreadable)].map(([keyspaceId, h]) => ({ keyspaceId, head: h.head, base: h.base, entryCount: h.entryCount })),
+      meta: metaOf(meta as Rows, unreadable),
     };
+    if (unreadable.rows.length > 0) light.unreadable = unreadable.rows;
+    return light;
   }
 
+  /** The image of one keyspace; undefined when there is none, and when a row of it is not readable (`load` lists the rows, V19 N5). */
   async loadImage(keyspaceId: string, opts: { entries?: boolean; tailAfter?: bigint } = {}): Promise<ReplicaImage | undefined> {
     await this.chain;
     const tx = this.connection().transaction(["replicas", "replicaEntries", "replicaTail"], "readonly");
@@ -315,16 +409,26 @@ export class IndexedDbStorage implements OutboxStorage {
     const tailRows = wait(tx.objectStore("replicaTail").getAll(range));
     void Promise.allSettled([header, entryKeys, entryRows, tailKeys, tailRows]);
     await finished;
-    const h = (await header) as ReplicaHeader | undefined;
+    const h = (await header) as unknown;
     if (h === undefined) return undefined;
-    const mine = <T>(keys: string[], rows: T[]): T[] => (this.range === undefined ? rows.filter((_, i) => keyspaceOf(keys[i] as string) === keyspaceId) : rows);
-    const tail = mine(await tailKeys, (await tailRows) as RecordMessage[]);
+    const unreadable = new Unreadable();
+    if (replicaHeaderRow(keyspaceId, h) !== undefined) return undefined;
+    const mine = (keys: string[], rows: unknown[]): Rows => {
+      if (this.range !== undefined) return [keys, rows];
+      const idx = keys.map((_, i) => i).filter((i) => keyspaceOf(keys[i] as string) === keyspaceId);
+      return [idx.map((i) => keys[i] as string), idx.map((i) => rows[i])];
+    };
+    const pages = good<KeyEntry>("replicaEntries", mine(await entryKeys, await entryRows), pageRow, unreadable);
+    const tail = good<RecordMessage>("replicaTail", mine(await tailKeys, await tailRows), tailRow, unreadable);
+    if (unreadable.rows.length > 0) return undefined;
+    const header_ = h as ReplicaHeader;
     const after = opts.tailAfter;
+    const records = values(tail);
     return {
       keyspaceId,
-      head: h.head,
-      base: { ...h.base, entries: withEntries ? (mine(await entryKeys, await entryRows) as KeyEntry[]) : [] },
-      tail: after === undefined ? tail : tail.filter((r) => r.seq > after),
+      head: header_.head,
+      base: { ...header_.base, entries: withEntries ? values(pages) : [] },
+      tail: after === undefined ? records : records.filter((r) => r.seq > after),
     };
   }
 

@@ -11,13 +11,14 @@ import { create } from "@bufbuild/protobuf";
 import { type AppLimits, type KeyChange, KeyChangeSchema } from "../gen/abpc/v2/types_pb.js";
 import type { Mutation } from "../gen/abpc/v2/sync_pb.js";
 import { VersionTopology, DEFAULT_FEATURES } from "../rules/fold/index.js";
-import { pushBounded } from "./bounded.js";
+import { BoundedSet, pushBounded } from "./bounded.js";
 import { systemClock, systemRandom, type Clock, type Random } from "./clock.js";
 import { CanonError, decodeContent } from "./entry.js";
 import { StorageError } from "./errors.js";
 import { EventBus } from "./events.js";
 import type { Follow } from "./follow.js";
 import { HoldRegistry, type Hold, type HoldKind, holdKey, type HoldScope } from "./holds.js";
+import { newUuid } from "./ids.js";
 import type { LaneName, Manifests, OpTypeInfo } from "./manifests.js";
 import { MemoryStorage } from "./memory-storage.js";
 import { buildOverlay, KeyspaceView, type PendingAction } from "./overlay.js";
@@ -35,6 +36,7 @@ import {
   type StorageOp,
   type StoredLight,
   type StoredState,
+  type UnreadableRow,
 } from "./storage.js";
 import type { Transport } from "./transport.js";
 import type { StorageProvider, TabHost } from "./tabs.js";
@@ -51,6 +53,8 @@ import type {
 import { ChangeKind } from "../gen/abpc/v2/types_pb.js";
 
 const INTERNAL_ERRORS_KEPT = 100;
+/** How many of its own client ids an engine remembers: an engine mints one at each start, handover and fork, which are rare. */
+const CLIENT_IDS_REMEMBERED = 1024;
 
 export interface EngineConfig {
   appId: string;
@@ -158,13 +162,17 @@ export abstract class EngineCore {
   exportHook: ExportHook | undefined;
   tokens: TokenProvider | undefined;
   readonly predictors: Record<string, Predictor>;
-  protected readonly mintClientId: () => string;
+  private readonly mintClientId: () => string;
+  /** The client ids that this engine has had (a bounded memory of them, in memory only): 10 [AUTH-19] "MUST NOT reuse a `client_id`". */
+  private readonly clientIdsUsed = new BoundedSet<string>(CLIENT_IDS_REMEMBERED);
 
   // -- the outbox and the other stores, mirrored in memory (the storage holds the durable copy) --
   /** Entries of the partition whose author is not the current principal: kept in place, never sent, never shown (14 [CLI-59], [CLI-60]). */
   lockedEntries: OutboxEntry[] = [];
   readonly entries = new Map<string, OutboxEntry>();
   readonly deadLetters = new Map<string, DeadLetterEntry>();
+  /** The rows of the storage that the last read left out because they were malformed (V19 N5). */
+  protected unreadable: UnreadableRow[] = [];
   readonly journal = new Map<string, JournalEntry>();
   readonly exports = new Map<string, ExportEntry>();
   readonly rejections = new Map<string, RejectionRecord>();
@@ -225,15 +233,20 @@ export abstract class EngineCore {
     this.tokens = cfg.tokens;
     this.predictors = cfg.predictors ?? {};
     this.features = cfg.features ?? DEFAULT_FEATURES;
-    this.mintClientId = cfg.newClientId ?? ((): string => this.newUuidFromRandom());
+    this.mintClientId = cfg.newClientId ?? ((): string => newUuid(this.random));
   }
 
-  private newUuidFromRandom(): string {
-    const b = this.random.bytes(16);
-    b[6] = ((b[6] as number) & 0x0f) | 0x40;
-    b[8] = ((b[8] as number) & 0x3f) | 0x80;
-    const h = [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
-    return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+  /**
+   * A new `client_id` (03 [ID-35], 14 [CLI-63]): at an engine's start and at every flusher handover, and when a fork or an unknown instance has the engine
+   * re-identify. It is kept in memory only (`putOp`) and never one that this engine has had before (10 [AUTH-19]: "MUST NOT reuse a `client_id`"): an id that the
+   * source gives again is asked for again, and a source that keeps repeating is given up for the default one; a random source that repeats too is broken, and
+   * the engine goes on with what it has rather than wait for it.
+   */
+  protected newClientId(): string {
+    let id = this.mintClientId();
+    for (let tries = 0; this.clientIdsUsed.has(id) && tries < 16; tries++) id = tries < 8 ? this.mintClientId() : newUuid(this.random);
+    this.clientIdsUsed.add(id);
+    return id;
   }
 
   // ---------------------------------------------------------------------------------------------------------------------
@@ -538,6 +551,7 @@ export abstract class EngineCore {
     for (const e of s.exports) if (mine(e.author)) this.exports.set(e.mutationId, e);
     for (const e of s.rejections) if (mine(e.author)) this.rejections.set(e.mutationId, e);
     for (const e of s.drafts) if (mine(e.author)) this.drafts.set(draftKey(e), e);
+    this.unreadable = s.unreadable === undefined ? [] : [...s.unreadable];
     const ord = s.meta["nextOrdinal"];
     this.nextOrdinal = typeof ord === "number" ? ord : 1;
     for (const e of s.entries) if (e.ordinal >= this.nextOrdinal) this.nextOrdinal = e.ordinal + 1;
@@ -549,6 +563,14 @@ export abstract class EngineCore {
 
   // ---------------------------------------------------------------------------------------------------------------------
   // Entries
+
+  /**
+   * The entries of a store of the engine in the authoring order of their actions (14 [CLI-38], [CLI-77]): not the order in which they ended, and not the key
+   * order of a storage that reads by key. An entry with no ordinal (an earlier build's) goes first, in the order that it came.
+   */
+  protected authoringOrder<T extends { ordinal?: number }>(entries: Iterable<T>): T[] {
+    return [...entries].sort((a, b) => (a.ordinal ?? 0) - (b.ordinal ?? 0));
+  }
 
   /** The entry's decoded content, or undefined when it cannot be decoded (14 [CLI-29]). */
   protected content(e: OutboxEntry): Mutation | undefined {

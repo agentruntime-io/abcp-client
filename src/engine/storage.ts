@@ -124,6 +124,12 @@ export interface DeadLetterEntry {
   failedDependents: string[];
   /** For `DEPENDENCY_FAILED`: the action that failed. */
   dependencyOf?: string;
+  /**
+   * The authoring order of the action in its outbox (`OutboxEntry.ordinal`): the order in which the entries are listed (14 [CLI-38], [CLI-77]: "in the authoring
+   * order of the actions"), which is neither the order in which they ended nor the key order of a storage that reads by key. Absent in an entry that an earlier
+   * build wrote: it is listed before the ones that have one, in the order that the storage gave.
+   */
+  ordinal?: number;
 }
 
 /** An entry of the journal of 14 [CLI-53]: the content of an action that retired with a successful outcome. */
@@ -163,6 +169,8 @@ export interface ExportEntry {
   lastResult?: string;
   dependencyOf?: string;
   atMs: number;
+  /** The authoring order of the action (see `DeadLetterEntry.ordinal`). */
+  ordinal?: number;
 }
 
 /** A rejection that the app has not acknowledged (14 [CLI-41]). */
@@ -273,6 +281,15 @@ export interface ReplicaSummary {
 /** A stored state with the replicas as summaries. */
 export type StoredLight = Omit<StoredState, "replicas"> & { replicas: ReplicaSummary[] };
 
+/** A row of a storage that is not what the storage wrote (damage, another build's shape): it is left out of what a read returns, and listed here (V19 N5). */
+export interface UnreadableRow {
+  /** The store of the row (`entries`, `deadLetters`, `replicas`, ...). */
+  store: string;
+  /** The key of the row in that store. */
+  key: string;
+  why: string;
+}
+
 export interface StoredState {
   entries: OutboxEntry[];
   deadLetters: DeadLetterEntry[];
@@ -282,7 +299,12 @@ export interface StoredState {
   drafts: DraftEntry[];
   replicas: ReplicaImage[];
   meta: Record<string, string | number | bigint>;
+  /** The rows that the read left out because they are malformed, at most `MAX_UNREADABLE_LISTED` of them (a storage that cannot find a malformed row leaves this out). */
+  unreadable?: UnreadableRow[];
 }
+
+/** How many unreadable rows a read lists: a damaged partition may hold any number, and the list is for a report. */
+export const MAX_UNREADABLE_LISTED = 100;
 
 /** The key of a draft in a partition: the keyspace, the key and the author, so that two principals of a shared device never overwrite each other's (14 [CLI-59]). */
 export function draftKey(d: { keyspaceId: string; key: string; author?: Author | undefined }): string {
