@@ -26,6 +26,22 @@ import type { PartitionKey } from "./tabs.js";
 import type { ActionInput, ChangeInput, EngineEvent, PreconditionInput, SubmitOptions, SubmitResult, SyncStatus } from "./types.js";
 import { Code, ErrorClass } from "../gen/abpc/v2/types_pb.js";
 
+/** What a reader of a keyspace's copy needs to know of it, in one call (the query layer, `query/`). */
+export interface KeyspaceInfo {
+  /** A load or a restored replica gave the copy its confirmed state; before that the copy is empty and says nothing of the keyspace. */
+  loaded: boolean;
+  /** The copy was purged (14 [CLI-66], [CLI-67], [CLI-77]): nothing of the keyspace is shown. */
+  purged: boolean;
+  /** Why the engine no longer follows the keyspace (a drop reason of A.6), when it does not; its copy stays unless it was purged. */
+  stopped: string | undefined;
+  seq: bigint;
+  logEpoch: number;
+  /** The manifest version of the confirmed state. */
+  manifestVersion: number;
+  /** The interest prefixes; empty is the whole keyspace (14 [CLI-71]). */
+  interest: string[];
+}
+
 /** The handle of a CRDT key shown in the view (14 [CLI-13]). */
 export class CrdtHandle {
   constructor(
@@ -306,6 +322,13 @@ export class Engine extends TabLayer {
   /** The confirmed state alone. */
   confirmed(keyspaceId: string): KeyspaceView {
     return this.confirmedViewOf(this.followed(keyspaceId));
+  }
+
+  /** The state of a keyspace's local copy, or undefined for a keyspace that the engine does not follow. */
+  keyspaceInfo(keyspaceId: string): KeyspaceInfo | undefined {
+    const f = this.follows.get(keyspaceId);
+    if (f === undefined) return undefined;
+    return { loaded: f.loaded, purged: f.purged, stopped: f.stopped, seq: f.state.seq, logEpoch: f.state.logEpoch, manifestVersion: f.state.manifestVersion, interest: [...f.interest] };
   }
 
   /** Whether a keyspace's confirmed state is loaded, and its cursor. */

@@ -19,7 +19,7 @@
 import { ChangeKind, type KeyChange } from "../gen/abpc/v2/types_pb.js";
 import { counterText, parse as parseJson, parseCounter, type JsonValue } from "../rules/jsonv1/index.js";
 import { compareUtf8 } from "../rules/bytes.js";
-import { StateNull, StateRedacted, StateValue, type KeyRow, type ReplicaState, type Rule, type Topology } from "../rules/fold/index.js";
+import { StateNull, StateRedacted, StateValue, type KeyRow, type ReplicaState, type Rule, type Template, type Topology } from "../rules/fold/index.js";
 
 /** An action as prediction reads it. */
 export interface PendingAction {
@@ -231,6 +231,30 @@ export function buildOverlay(st: ReplicaState, ctx: PredictContext, pending: rea
   return o;
 }
 
+function sameCell(a: Cell, b: Cell): boolean {
+  if (a.state !== b.state || a.predicted !== b.predicted || a.encoding !== b.encoding || a.counter !== b.counter) return false;
+  if (a.pending.length !== b.pending.length || a.pending.some((p, i) => p !== b.pending[i])) return false;
+  return equalBytes(a.value, b.value);
+}
+
+/**
+ * What differs between two overlays of one keyspace, for the local query layer (query/, `view-feed.ts`): the keys whose cell is not the same
+ * in both (a cell that one overlay lacks included), and the marker keys whose pending `DELETE` one overlay holds and the other does not
+ * (each hides a whole subtree). Cost: the pending actions' keys, never the keyspace.
+ */
+export function overlayChange(prev: Overlay, next: Overlay): { keys: string[]; subtrees: string[] } {
+  const keys: string[] = [];
+  for (const [k, c] of next.cells) {
+    const p = prev.cells.get(k);
+    if (p === undefined || !sameCell(p, c)) keys.push(k);
+  }
+  for (const k of prev.cells.keys()) if (!next.cells.has(k)) keys.push(k);
+  const subtrees: string[] = [];
+  for (const m of next.hidden) if (!prev.hidden.has(m)) subtrees.push(m);
+  for (const m of prev.hidden) if (!next.hidden.has(m)) subtrees.push(m);
+  return { keys, subtrees };
+}
+
 const KNOWN_ENCODINGS = new Set(["json/v1", "bytes/v1", "yjs/v1", "redacted/v1"]);
 
 const decodableMemo = new WeakMap<object, boolean>();
@@ -261,7 +285,7 @@ export class KeyspaceView {
     readonly keyspaceId: string,
     private readonly st: ReplicaState,
     private readonly overlay: Overlay,
-    private readonly top: Topology,
+    private readonly top: Topology & { template?(key: string): Template | undefined },
   ) {}
 
   /** The confirmed cursor: the seq and the epoch of the confirmed state. */
@@ -271,6 +295,34 @@ export class KeyspaceView {
 
   get logEpoch(): number {
     return this.st.logEpoch;
+  }
+
+  /** The manifest version of the confirmed state: the keyspace's effective version (06 [LOG-8]). */
+  get manifestVersion(): number {
+    return this.st.manifestVersion;
+  }
+
+  /**
+   * The merge rule of a key as the view shows it (for the query layer): a pending `INCR` or CRDT edit makes the key a counter or a CRDT key,
+   * a key that the confirmed state holds has its recorded rule, and any other key the rule of its template; undefined when none is known.
+   */
+  ruleOf(key: string): Rule | undefined {
+    const c = this.overlay.cells.get(key);
+    if (c !== undefined && c.predicted) {
+      if (c.state === "counter") return "counter";
+      if (c.state === "crdt") return "crdt";
+    }
+    return this.st.key(key)?.rule ?? this.top.template?.(key)?.rule;
+  }
+
+  /** The ancestor marker keys of a key under the manifest version in force, nearest first (05 §5.6); none for a key that matches no template. */
+  ancestors(key: string): string[] {
+    return this.top.ancestors(key);
+  }
+
+  /** @internal The overlay, which the change feed compares from one task to the next (`view-feed.ts`). */
+  overlaySnapshot(): Overlay {
+    return this.overlay;
   }
 
   private confirmedRow(key: string): Readonly<KeyRow> | undefined {

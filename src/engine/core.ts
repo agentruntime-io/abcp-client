@@ -21,6 +21,7 @@ import { HoldRegistry, type Hold, type HoldKind, holdKey, type HoldScope } from 
 import type { LaneName, Manifests, OpTypeInfo } from "./manifests.js";
 import { MemoryStorage } from "./memory-storage.js";
 import { buildOverlay, KeyspaceView, type PendingAction } from "./overlay.js";
+import { FollowMap, ViewFeed, type ViewChangeListener } from "./view-feed.js";
 import type {
   Author,
   DeadLetterEntry,
@@ -171,7 +172,9 @@ export abstract class EngineCore {
   protected nextOrdinal = 1;
 
   // -- followed keyspaces --
-  readonly follows = new Map<string, Follow>();
+  /** What changed in the view of each keyspace, reported at the end of each task, for the query layer (view-feed.ts). */
+  protected readonly feed = new ViewFeed();
+  readonly follows: Map<string, Follow> = new FollowMap(this.feed);
 
   // -- identity --
   clientId = "";
@@ -238,10 +241,21 @@ export abstract class EngineCore {
   protected run<T>(fn: () => T | Promise<T>): Promise<T> {
     this.queued++;
     this.activity++;
-    const result = this.tail.then(() => {
-      this.activity++;
-      return fn();
-    });
+    const result = this.tail
+      .then(() => {
+        this.activity++;
+        return fn();
+      })
+      .then(
+        (v) => {
+          this.flushViewChanges();
+          return v;
+        },
+        (e: unknown) => {
+          this.flushViewChanges();
+          throw e;
+        },
+      );
     this.tail = result.then(
       () => {
         this.queued--;
@@ -339,6 +353,29 @@ export abstract class EngineCore {
 
   on(listener: EngineEventListener): () => void {
     return this.bus.on(listener);
+  }
+
+  /**
+   * Registers a listener for the changes of the view of the followed keyspaces, which the local query layer is driven by (`query/`): at the
+   * end of each task of the engine, one `ViewChange` for each keyspace whose confirmed state or prediction changed in it, with the keys that
+   * changed (view-feed.ts). A listener that throws never stops the engine. Returns the function that removes it.
+   */
+  onViewChange(listener: ViewChangeListener): () => void {
+    return this.feed.on(listener, () => {
+      for (const f of this.follows.values()) f.shown = this.feed.shownOf(f, this.viewOf(f));
+    });
+  }
+
+  /**
+   * Reports the pending changes of the view to the listeners now, which the end of the task would do: for a reader that is asked in the middle of one
+   * (an app's listener of an event), so that what it keeps in step with the feed is the engine's state at that moment. Nothing pending: no cost.
+   */
+  flushViewChanges(): void {
+    try {
+      this.feed.flush(this.follows, (f) => this.viewOf(f));
+    } catch (e) {
+      this.noteInternalError(e);
+    }
   }
 
   // ---------------------------------------------------------------------------------------------------------------------

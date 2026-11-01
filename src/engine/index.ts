@@ -1,7 +1,7 @@
 // The client engine (14 §14.1 to §14.6): `Engine`, its configuration and hooks, the events it emits, the storage interface of the
 // durable outbox, the transport interface, and the helpers to build actions.
 
-export { Engine, CrdtHandle, type SignOutOptions, type SignOutResult } from "./engine.js";
+export { Engine, CrdtHandle, type KeyspaceInfo, type SignOutOptions, type SignOutResult } from "./engine.js";
 export type { EngineConfig } from "./core.js";
 export * from "./types.js";
 export { LocalRefusal, ProtocolViolation, RpcError, StorageError, type LocalRefusalCode, type RpcStatus } from "./errors.js";
@@ -39,6 +39,7 @@ export {
 } from "./storage.js";
 export { MemoryStorage, type MemoryStorageOptions } from "./memory-storage.js";
 export { KeyspaceView, type ViewValue } from "./overlay.js";
+export type { KeyTouch, ViewChange, ViewChangeListener } from "./view-feed.js";
 export { jsonBytes, set, setNull, del, incr, cas, crdtUpdate } from "./changes.js";
 export { CLIENT_BACKOFF, HOLD_BACKOFF, RECONNECT_BACKOFF, fullJitter, bound, resendDelay } from "./backoff.js";
 export { DEFAULT_CLASS, codeName, reactionOf, type Reaction } from "./codes.js";

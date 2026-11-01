@@ -13,7 +13,7 @@
 //    record whole and the keys outside the interest are dropped at once ("MUST NOT present keys outside its interest as current",
 //    09 [READ-26]); a deleted marker's tombstone stays, since the ancestor test of 05 [STATE-38] needs it.
 
-import { KeyspaceLifecycle, type KeyEntry, type Record as RecordMessage } from "../gen/abpc/v2/types_pb.js";
+import { ChangeKind, KeyspaceLifecycle, type KeyEntry, type Record as RecordMessage } from "../gen/abpc/v2/types_pb.js";
 import type { LoadStateResponse } from "../gen/abpc/v2/sync_pb.js";
 import { applyRecord, FoldError, installEntry, isReservedKey, ReplicaState, VersionTopology, type Anomaly } from "../rules/fold/index.js";
 import { isSegment } from "../rules/fold/template.js";
@@ -103,6 +103,11 @@ export abstract class ReplicaStoreLayer extends EndingLayer {
     let plan: CrdtPlanItem[] = planCrdt(st, this.manifests, rec);
     const anomalies: Anomaly[] = [];
     applyRecord(st, this.manifests, rec, { supported: (feature) => this.features.includes(feature), report: (a) => anomalies.push(a) });
+    // the change feed (view-feed.ts): every key that the record names may read differently now, and below a `DELETE`d key the whole subtree (05 [STATE-43])
+    f.touch(
+      rec.changes.map((c) => c.key),
+      rec.changes.filter((c) => c.kind === ChangeKind.DELETE).map((c) => c.key),
+    );
     if (f.interest.length > 0) {
       this.pruneOutside(f, appliedKeys(rec));
       plan = plan.filter((item) => this.isInInterest(f, item.key));

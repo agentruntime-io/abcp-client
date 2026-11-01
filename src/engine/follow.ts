@@ -7,6 +7,7 @@ import type { Random } from "./clock.js";
 import { CrdtStore } from "./crdt-view.js";
 import type { LaneName } from "./manifests.js";
 import type { KeyspaceView } from "./overlay.js";
+import type { KeyTouch, Shown, ViewFeed } from "./view-feed.js";
 
 /** The state of one lane of the current client instance in one keyspace (07 §7.4). */
 export class LaneState {
@@ -118,8 +119,21 @@ export class Follow {
   needsLoad: { cause: string; resume: boolean } | undefined;
   readonly crdt: CrdtStore;
   readonly lanes: Record<LaneName, LaneState> = { SEQUENCED: new LaneState(), GATED: new LaneState() };
-  /** The engine no longer follows the keyspace (a drop reason of A.6): the local copy stays, the outbox stays. */
-  stopped: string | undefined;
+  /**
+   * The engine no longer follows the keyspace (a drop reason of A.6): the local copy stays, the outbox stays. A change of it is reported to the change
+   * feed (view-feed.ts): a reader of the copy says that the engine stopped following it, though no key changed.
+   */
+  get stopped(): string | undefined {
+    return this.stoppedBecause;
+  }
+
+  set stopped(v: string | undefined) {
+    if (v === this.stoppedBecause) return;
+    this.stoppedBecause = v;
+    this.feed?.mark(this);
+  }
+
+  private stoppedBecause: string | undefined;
   /** The fold stopped at a record it cannot read (14 [CLI-4]): the confirmed state is frozen at the previous seq. */
   frozen: string | undefined;
   /** The live session follows the keyspace: a `KeyspaceAdded` was seen and no `KeyspaceDropped` since. */
@@ -181,7 +195,35 @@ export class Follow {
     return this.state.logEpoch;
   }
 
+  /** The engine's change feed, which `FollowMap` sets when the follow enters the map (view-feed.ts). */
+  feed: ViewFeed | undefined;
+  /** What the feed last reported of this follow, which its next report is compared with; only kept while the feed has a listener. */
+  shown: Shown | undefined;
+  private touchedKeys = new Set<string>();
+  private touchedSubtrees = new Set<string>();
+
+  /** The view changed: the overlay (the pending actions) or the confirmed state; the feed reports it at the end of the engine's task. */
   invalidate(): void {
     this.cachedView = undefined;
+    this.feed?.mark(this);
+  }
+
+  /**
+   * Records the keys that an applied record names, for the change feed: each key's row may differ, and, for a `DELETE`, the subtree below
+   * the key may too (05 [STATE-43]). Nothing is kept while no one listens.
+   */
+  touch(keys: Iterable<string>, subtrees: Iterable<string> = []): void {
+    if (this.feed === undefined || !this.feed.active) return;
+    for (const k of keys) this.touchedKeys.add(k);
+    for (const k of subtrees) this.touchedSubtrees.add(k);
+    this.feed.mark(this);
+  }
+
+  /** The keys recorded by `touch` since the last call. */
+  takeTouched(): KeyTouch {
+    const out = { keys: this.touchedKeys, subtrees: this.touchedSubtrees };
+    this.touchedKeys = new Set();
+    this.touchedSubtrees = new Set();
+    return out;
   }
 }

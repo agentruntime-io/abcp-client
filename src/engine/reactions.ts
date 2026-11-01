@@ -811,6 +811,7 @@ export abstract class ReactionLayer extends ReplicaLayer {
     Object.assign(e, copy);
     this.decoded.set(e.mutationId, moved);
     f?.invalidate();
+    this.follows.get(target)?.invalidate(); // the action now shapes the successor's view
     this.emit({ type: "rerouted", mutationId: e.mutationId, from, to: target });
   }
 

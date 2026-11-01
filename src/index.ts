@@ -5,3 +5,4 @@ export * as admin from "./gen/abpc/v2/admin_pb.js";
 export * as rules from "./rules/index.js";
 export * as engine from "./engine/index.js";
 export * as fake from "./fake/index.js";
+export * as query from "./query/index.js";
