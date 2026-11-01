@@ -494,9 +494,9 @@ export const ModuleConfigSchema: GenMessage<ModuleConfig> = /*@__PURE__*/
 /**
  * Field rules: spec/04 §4.10. Every connection the server makes for it (issuer discovery and the jwks_uri of a
  * discovery document, jwks_uri, policy_hosts[].url, authorizer.url, webhook contacts) follows spec/04 [MAN-85],
- * judged by the address actually connected; a config that breaks it gets Reject{ADMIN_REFUSED}, reason INVALID_CONFIG,
- * except a URL over 2,048 octets, or with a query, a fragment or user information, which is malformed:
- * InvalidArgument with Reject{INVALID_ENVELOPE} (spec/04 [MAN-80]).
+ * judged by the address actually connected; which breaks are malformed fields (InvalidArgument with
+ * Reject{INVALID_ENVELOPE}) and which are refusals (Reject{ADMIN_REFUSED}, reason INVALID_CONFIG) is spec/04
+ * [MAN-80]'s and Table 4.13's.
  * The server stores normalized values, and GetAppConfig returns them (spec/04 [MAN-90]). The stored config is at most
  * 1 MiB in the binary encoding: a larger one gets InvalidArgument with Reject{PAYLOAD_TOO_LARGE} (spec/04 [MAN-94]).
  * In the admin enums (Placement, AuthorizerConfig.Mode, AdminRecovery.Mode, RetentionClass.OnExpiry, OwnerContact.Kind),
@@ -1014,7 +1014,7 @@ export type PublishManifestRequest = Message<"abpc.v2.PublishManifestRequest"> &
   encoding: string;
 
   /**
-   * optimistic guard: the latest published version, or 0
+   * optimistic guard: the latest published version, or 0 when the app has none
    *
    * @generated from field: uint32 expected_version = 4;
    */
@@ -1034,6 +1034,10 @@ export const PublishManifestRequestSchema: GenMessage<PublishManifestRequest> = 
   messageDesc(file_abpc_v2_admin, 21);
 
 /**
+ * warnings: an entry for each occurrence of an issue, naming its attribute path and requirement id (spec/04 [MAN-78]);
+ * at most 1,000, the first in the order that spec/12 [ADM-23] gives `problems`, the rest counted in no field. The
+ * republish that spec/04 [MAN-43] answers with the stored version returns the warnings stored with it.
+ *
  * @generated from message abpc.v2.PublishManifestResponse
  */
 export type PublishManifestResponse = Message<"abpc.v2.PublishManifestResponse"> & {
@@ -1193,8 +1197,9 @@ export const SetKeyspaceManifestPinResponseSchema: GenMessage<SetKeyspaceManifes
 /**
  * A repeated archive with the same successors succeeds and changes nothing (spec/12 [ADM-10]); the map keeps the order
  * of the first call (spec/12 [ADM-45]). successors: at most
- * 1,000 rules and 256 KiB, else InvalidArgument with Reject{PAYLOAD_TOO_LARGE} (spec/12 [ADM-45]). A successor that
- * does not exist, is deleted or is seeding gets its existence answer before any state refusal (spec/12 [ADM-32]).
+ * 1,000 rules and 256 KiB, else InvalidArgument with Reject{PAYLOAD_TOO_LARGE} (spec/12 [ADM-45]). The refusals of
+ * spec/12 [ADM-110] (the app's suspension, a frozen keyspace) come first; then a successor that does not exist, is
+ * deleted or is seeding gets its existence answer before any other state refusal (spec/12 [ADM-32]).
  *
  * @generated from message abpc.v2.ArchiveKeyspaceRequest
  */
@@ -1432,13 +1437,15 @@ export type CheckpointHeader = Message<"abpc.v2.CheckpointHeader"> & {
   keyspaceId: string;
 
   /**
-   * the epoch of the record at `seq`
+   * the epoch of the record at `seq`; for a split successor's base checkpoint at S, the
    *
    * @generated from field: uint32 log_epoch = 2;
    */
   logEpoch: number;
 
   /**
+   * source's epoch at S, which is the successor's base_epoch (spec/12 [ADM-105])
+   *
    * the checkpoint's seq C
    *
    * @generated from field: uint64 seq = 3;
@@ -1980,7 +1987,8 @@ export type RedactResponse = Message<"abpc.v2.RedactResponse"> & {
   /**
    * call matches them (spec/12 [ADM-62]), in
    * increasing byte order: the first ones, as many as fit in 1 MiB of JSON array;
-   * for a resend, those that the entry still records as skipped (spec/12 [ADM-62],
+   * for a resend, none, since a keyspace that the entry still records as skipped is
+   * one on which the caller holds no redact; the total counts them all (spec/12
    * [ADM-70])
    *
    * each "<keyspace_id>/<blob_id>", in increasing byte order: the first of the blobs
@@ -2182,7 +2190,7 @@ export type AuditEntry = Message<"abpc.v2.AuditEntry"> & {
   auditId: string;
 
   /**
-   * server time
+   * the server time at which the entry is written (spec/12 [ADM-4])
    *
    * @generated from field: google.protobuf.Timestamp at = 2;
    */
@@ -2263,20 +2271,24 @@ export type AuditEntry = Message<"abpc.v2.AuditEntry"> & {
   recordSeq: bigint;
 
   /**
-   * break-glass: the operator's people who approved the change (spec/16 [SEC-44])
+   * break-glass: the operator's people who approved the change; at most 10, each at
    *
    * @generated from field: repeated string approvers = 13;
    */
   approvers: string[];
 
   /**
-   * break-glass: the reference of the request the entry belongs to
+   * most 256 octets with no U+0000 (spec/16 [SEC-44])
+   *
+   * break-glass: the reference of the request the entry belongs to; at most 256
    *
    * @generated from field: string request_ref = 14;
    */
   requestRef: string;
 
   /**
+   * octets with no U+0000 (spec/16 [SEC-44])
+   *
    * further facts of the entry, never values or personal key paths, except the
    *
    * @generated from field: map<string, string> details = 15;

@@ -247,7 +247,7 @@ export type EvaluateResponse_Commit = Message<"abpc.v2.EvaluateResponse.Commit">
   /**
    * the seen_version that spec/08 [GATE-27] gives it
    *
-   * key or prefix → version the decision was based on
+   * key or prefix → version the decision was based on; at most 1,000 entries
    *
    * @generated from field: map<string, uint64> read_versions = 2;
    */
@@ -498,7 +498,7 @@ export type CheckResponse = Message<"abpc.v2.CheckResponse"> & {
   allow: boolean;
 
   /**
-   * how long ABPC may cache this answer
+   * how long ABPC may cache this answer; 0 means not at all (spec/10 [AUTH-43])
    *
    * @generated from field: uint32 max_age_seconds = 2;
    */

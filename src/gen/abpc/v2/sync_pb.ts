@@ -469,7 +469,7 @@ export type MutateResponse = Message<"abpc.v2.MutateResponse"> & {
   results: MutationResult[];
 
   /**
-   * one for every lane the request touched; they, not the codes, tell slot consumption (spec/07 §7.4)
+   * one for every lane the request touched; they, not the codes, tell slot consumption (spec/07 §7.4);
    *
    * @generated from field: repeated abpc.v2.LaneWatermark watermarks = 2;
    */
@@ -811,7 +811,7 @@ export type LoadStateResponse = Message<"abpc.v2.LoadStateResponse"> & {
   kind: string;
 
   /**
-   * for LoadStateRequest.client_id
+   * for LoadStateRequest.client_id; in the order of spec/07 [MUT-7]
    *
    * @generated from field: repeated abpc.v2.LaneWatermark lane_watermarks = 11;
    */
@@ -837,7 +837,7 @@ export type LoadStateResponse = Message<"abpc.v2.LoadStateResponse"> & {
   skippedUnsupported: boolean;
 
   /**
-   * lacks, by loading from a checkpoint above them (spec/09 §9.2, [READ-17];
+   * lacks, by loading from a checkpoint at or above them (spec/09 §9.2, [READ-17];
    * spec/15 [COMPAT-15]); the client emits `skipped` (spec/14)
    *
    * a cold load that answers a resume check: every erasure-ledger redaction newer
@@ -940,7 +940,7 @@ export type HeartbeatFrame = Message<"abpc.v2.HeartbeatFrame"> & {
   serverTime?: Timestamp;
 
   /**
-   * this session's client instance
+   * this session's client instance; in the order of spec/07 [MUT-7]
    *
    * @generated from field: repeated abpc.v2.LaneWatermark lane_watermarks = 3;
    */

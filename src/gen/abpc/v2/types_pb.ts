@@ -424,7 +424,7 @@ export type Reject = Message<"abpc.v2.Reject"> & {
    * Appendix A.9), "lifecycle" (KEYSPACE_ARCHIVED), "quota" (QUOTA_EXCEEDED: a
    * quota of spec/04 Table 4.10, or "seq" for the seq bound of spec/06 [LOG-2]),
    * "keyspaces" (ADMIN_REFUSED WRONG_STATE, spec/04 [MAN-62]), "keys" (CONTENDED),
-   * "effect_key" (an effect's RANGE_EXCEEDED, STALE MOVING, STALE LEASE or STALE EPOCH),
+   * "effect_key" (an effect's RANGE_EXCEEDED, STALE MOVING, STALE LEASE, STALE EPOCH or POLICY_CHANGED),
    * "code" (POLICY_CHANGED after a re-validation), "replacement" (POLICY_CHANGED,
    * spec/07 Table 7-4), "cause" (CANCELLED, INTENT_EXPIRED, OFFLINE_TOO_LONG,
    * PERMISSION_DENIED), "app_code_invalid" (GATE_REJECTED), "moved_to" (STALE with
@@ -634,14 +634,15 @@ export type Record = Message<"abpc.v2.Record"> & {
   serverTime?: Timestamp;
 
   /**
-   * advisory, from the client, never used by the server (spec/07 [MUT-86]);
+   * advisory, from the client; validated by spec/07 Table 7-2 item 1, never used
    *
    * @generated from field: google.protobuf.Timestamp authored_at = 8;
    */
   authoredAt?: Timestamp;
 
   /**
-   * unset in host and module actions (spec/07 [MUT-90])
+   * in the horizon check (spec/07 [MUT-86]); unset in host and module actions
+   * (spec/07 [MUT-90])
    *
    * @generated from field: uint32 manifest_version = 9;
    */
@@ -928,6 +929,8 @@ export type ServerInfo = Message<"abpc.v2.ServerInfo"> & {
   protocolName: string;
 
   /**
+   * at most 256 octets, no U+0000, as host.proto DescribeResponse.build
+   *
    * @generated from field: string revision = 2;
    */
   revision: string;
@@ -938,6 +941,8 @@ export type ServerInfo = Message<"abpc.v2.ServerInfo"> & {
   features: string[];
 
   /**
+   * at most 256 octets, no U+0000, as host.proto DescribeResponse.build (spec/06 [LOG-34])
+   *
    * @generated from field: string build = 4;
    */
   build: string;
@@ -1450,7 +1455,7 @@ export enum Code {
   CANCELLED = 23,
 
   /**
-   * "REDACTED" (spec/12 [ADM-64]), "APP_DELETED" (spec/12 [ADM-102]) or "KEYSPACE_DELETED"
+   * "REDACTED" (spec/12 [ADM-64]), "APP_DELETED" (spec/12 [ADM-20]) or "KEYSPACE_DELETED"
    * (spec/12 [ADM-35]); Appendix A.12 lists the causes
    *
    * class DEAD_LETTER: no decision before decision_deadline; details["cause"] = "APP_SUSPENDED"
