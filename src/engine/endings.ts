@@ -363,8 +363,10 @@ export abstract class EndingLayer extends EngineCore {
       ordinal: e.ordinal,
       verifiedEpoch: o.logEpoch,
     };
+    // 14 [CLI-66], [CLI-67]: the journal of a keyspace whose local copy was purged is not written: its purge list names it
+    const keepJournal = f?.purged !== true;
     try {
-      await this.tx([{ op: "deleteEntry", mutationId: e.mutationId }, { op: "putJournal", entry: journal }]);
+      await this.tx(keepJournal ? [{ op: "deleteEntry", mutationId: e.mutationId }, { op: "putJournal", entry: journal }] : [{ op: "deleteEntry", mutationId: e.mutationId }]);
     } catch (err) {
       if (err instanceof StoreFull && err.store === "journal") {
         // 14 [CLI-84]: it stays in the outbox, final and never sent again, until its journal entry can be written
@@ -381,7 +383,7 @@ export abstract class EndingLayer extends EngineCore {
       throw err;
     }
     this.entries.delete(e.mutationId);
-    this.journal.set(e.mutationId, journal);
+    if (keepJournal) this.journal.set(e.mutationId, journal);
     this.dropRuntime(e.mutationId); // the slot is consumed: it stays with the lane until the watermark passes it (14 [CLI-27])
     f?.invalidate();
     this.reportRetired(e, reported, keys, cause, seq);

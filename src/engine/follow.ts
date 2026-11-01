@@ -145,6 +145,25 @@ export class Follow {
   cachedView: KeyspaceView | undefined;
   /** Stamped by the engine's own `CreateKeyspace` and not yet answered (07 [MUT-101]). */
   creating = false;
+  /** The interest prefixes of the keyspace (14 [CLI-71]); empty is the whole keyspace. The state holds only the keys under them. */
+  interest: string[] = [];
+  /**
+   * A widening of the interest is under way or waits for a session (14 [CLI-72]): `to` is the interest that the app asked for, `added`
+   * the prefixes that the load of the widening names. `interest` is the old one until the load is installed.
+   */
+  widening: { to: string[]; added: string[] } | undefined;
+  /** The persisted replica (§14.10): whether the image of this keyspace follows the in-memory state, and what its tail holds. */
+  image: { ok: boolean; seqs: Set<bigint>; headMs: number; baseSeq?: bigint } = { ok: false, seqs: new Set(), headMs: 0 };
+  /** The estimate of the server time, in ms, of the last successful sync of the keyspace (14 [CLI-56]); 0 when none was. */
+  lastSyncMs = 0;
+  /** The local copy was purged (14 [CLI-66], [CLI-67]): nothing of the keyspace is shown, and nothing is authored into it. */
+  purged = false;
+  /** `ACCESS_REVOKED` or the revocation of the subject was handled for this keyspace (14 [CLI-66]): its copy is purged and its outbox quarantined, once. */
+  revoked = false;
+  /** The changes that records carried and that their kind does not define, counted (02 [ARC-46]). */
+  anomalies = 0;
+  /** Keys outside the interest that the app loaded to author a change (14 [CLI-73]): the version that the load showed, or 0 for a key that was absent. */
+  readonly outside = new Map<string, bigint>();
 
   constructor(
     readonly id: string,

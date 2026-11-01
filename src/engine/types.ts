@@ -4,6 +4,7 @@
 import type { ChangeKind, Reject, Stale } from "../gen/abpc/v2/types_pb.js";
 import type { KeyChange, Precondition } from "../gen/abpc/v2/types_pb.js";
 import type { LaneName } from "./manifests.js";
+import type { StorageMode } from "./storage.js";
 
 export type { LaneName } from "./manifests.js";
 
@@ -235,6 +236,13 @@ export interface SkippedEvent extends Base {
   seq: bigint;
   /** The keys whose value could not be decoded; empty for a load that skipped records. */
   keys: string[];
+  /**
+   * `ANOMALY`: the record carried changes that its kind does not define, and the fold ignored them (02 [ARC-46], 06 [LOG-41]); the keys
+   * are theirs. Absent for an undecodable value ([CLI-5]) and for a load that skipped records.
+   */
+  cause?: "ANOMALY";
+  /** For `ANOMALY`: each ignored change, with the rule that makes it ignored. */
+  anomalies?: { index: number; key: string; rule: string; detail: string }[];
 }
 
 export interface LeaseExpiringEvent extends Base {
@@ -247,8 +255,33 @@ export interface LeaseExpiringEvent extends Base {
 export interface OfflineHorizonEvent extends Base {
   type: "offline-horizon";
   keyspaceId: string;
+  /** The age that reached the warning threshold (14 [CLI-56]), in ms of server time ([CLI-55]). */
   ageMs: number;
+  /** The `max_offline` in force, in ms ([CLI-54]). */
   maxOfflineMs: number;
+  /** `ACTION`: the oldest unsynced action of the keyspace; `SYNC`: the time since the keyspace's last successful sync. */
+  kind?: "ACTION" | "SYNC";
+  /** For `ACTION`: the oldest unsynced action (not `mutationId`, which would make the warning an event of that action: it is not one of its outcomes, 14 [CLI-38]). */
+  oldestMutationId?: string;
+}
+
+/** The engine's role among the tabs of its device changed (14 [CLI-61]). */
+export interface RoleEvent extends Base {
+  type: "role";
+  role: "flusher" | "follower" | "stopped";
+  /** `ELECTED`: it holds the flusher lock (at start, or as the next in line after a handover); `STOPPED`: it gave the lock up. */
+  cause: "ELECTED" | "FOLLOWING" | "STOPPED" | "HANDED_OVER";
+  /** For a flusher: its new `client_id` (14 [CLI-63]). */
+  clientId?: string;
+}
+
+/** The interest of a keyspace changed (14 [CLI-71], [CLI-72]). */
+export interface InterestChangedEvent extends Base {
+  type: "interest-changed";
+  keyspaceId: string;
+  /** The interest now: empty is the whole keyspace. */
+  interest: string[];
+  cause: "WIDENED" | "NARROWED";
 }
 
 export interface ProtocolErrorEvent extends Base {
@@ -279,6 +312,8 @@ export type EngineEvent =
   | SkippedEvent
   | LeaseExpiringEvent
   | OfflineHorizonEvent
+  | RoleEvent
+  | InterestChangedEvent
   | ProtocolErrorEvent;
 
 export type EngineEventType = EngineEvent["type"];
@@ -323,6 +358,12 @@ export type ExportHook = (entry: ExportRecord) => void | Promise<void>;
 export interface TokenProvider {
   /** Gets a valid token and installs it in the transport. Resolves false when none can be had (the hold `NO_TOKEN`). */
   refresh(): Promise<boolean>;
+  /**
+   * The expiry of the token that the transport sends now, in ms since the epoch (server time), when the app knows it. The engine
+   * refreshes the token in band before it expires (14 [CLI-68], 10 §10.7): it asks for a new one with `refresh` and tells the session with
+   * `RefreshSession`. Without it the engine refreshes when a call or the session is refused for the token.
+   */
+  expiresAt?(): number | undefined;
 }
 
 /**
@@ -351,9 +392,20 @@ export interface SyncStatus {
   exports: number;
   skippedChanges: number;
   loadsWithSkipped: number;
+  /** The changes that records carried and that their kind does not define, per keyspace (02 [ARC-46]); they count among `skippedChanges`. */
+  anomalies: Record<string, number>;
   unacknowledgedRejections: number;
   cursors: Record<string, { seq: bigint; logEpoch: number }>;
-  storageMode: "memory" | "durable";
+  /** The interest prefixes of each followed keyspace; empty is the whole keyspace (14 [CLI-71]). */
+  interest: Record<string, string[]>;
+  /** The keyspaces that the engine no longer follows, with the reason (a drop reason of A.6): `ACCESS_REVOKED`, `GRANT_CHANGED`, `DELETED`, `MOVED`, `ARCHIVED`, `NOT_FOUND`. */
+  stopped: Record<string, string>;
+  /** The engine's role among the tabs of its device (14 [CLI-61]). */
+  role: "flusher" | "follower" | "stopped";
+  /** Entries of the partition whose author is not the current principal: kept in place and never sent (14 [CLI-60]). */
+  lockedEntries: number;
+  /** `persisted`, `best-effort` or `memory` (14 [CLI-75]). */
+  storageMode: StorageMode;
   fullStores: string[];
   connection: "live" | "connecting" | "offline" | "stopped";
   suspended: boolean;

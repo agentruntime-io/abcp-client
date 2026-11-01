@@ -20,16 +20,7 @@ describe("14 [CLI-50] transport errors", () => {
     expect(types(r, a.mutationId)).toEqual(["committed"]);
   });
 
-  it("Unauthenticated with the SUBJECT_REVOKED detail: the request is never resent (TODO: purge and quarantine, 14 [CLI-79])", async () => {
-    const r = await rig();
-    r.server.inject("mutate", { kind: "status", status: "Unauthenticated", reject: mk(Code.PERMISSION_DENIED, { details: { cause: "SUBJECT_REVOKED" } }) });
-    const a = await r.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/a", 1)] });
-    await r.engine.settle();
-    await tick(r, 600_000);
-    expect(sentIds(r)).toEqual([a.mutationId]);
-    expect(r.engine.status().holds).toEqual([expect.objectContaining({ scope: "app", code: "SUBJECT_REVOKED" })]);
-    expect(r.engine.outbox()).toHaveLength(1); // kept, never deleted unreported
-  });
+  // Unauthenticated with the SUBJECT_REVOKED detail purges and quarantines (14 [CLI-50], [CLI-79]): test/engine-revocation.test.ts
 
   it("ResourceExhausted with no detail splits the request; a single mutation that is still too large is dead-lettered with PAYLOAD_TOO_LARGE", async () => {
     const r = await rig();

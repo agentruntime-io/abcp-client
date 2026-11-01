@@ -70,7 +70,11 @@ export type LocalRefusalCode =
   /** An action of an op type with `offline_mode: fail_fast`, authored while offline (14 [CLI-82]). */
   | "OFFLINE"
   /** Any other refusal that the app causes: a write under an entity that is deleted, an unknown dependency. */
-  | "REFUSED";
+  | "REFUSED"
+  /** A follower tab carried a call to the flusher, and no flusher answered (14 [CLI-61]): nothing was accepted. */
+  | "NO_FLUSHER"
+  /** The call is the flusher tab's: a follower tab has no view document of a CRDT key, and does not sign the principal out. */
+  | "NOT_FLUSHER";
 
 /** A local refusal of an action: nothing was stored and nothing is shown. */
 export class LocalRefusal extends Error {

@@ -21,6 +21,24 @@
 //  - the lifecycle hold (11 [COORD-96]): a keyspace with an open item (a pending intent, a present hold key) cannot be archived, split or
 //    deleted; a split seeds the successors from the source at its split seq.
 //
+// Added for C3 (14 §14.7 to §14.10), after `server/internal/session` and `server/internal/auth`:
+//
+//  - revocation (10 [AUTH-51], [AUTH-52], 12 [ADM-87]): `revokeSubject` sends `KeyspaceDropped{ACCESS_REVOKED}` for every followed
+//    keyspace of every session of the subject and then `Closing{SUBJECT_REVOKED}` with the stream status PermissionDenied
+//    (`session.RevokeSubject`); a token issued before `not_before` (plus the 60 s leeway) is refused with Unauthenticated, and the refusal
+//    carries `Reject{PERMISSION_DENIED}` with `details["cause"] = "SUBJECT_REVOKED"` until a token of the same device binding that is not
+//    issued before it has been accepted (the recovery mark); `revokeKeyspaces` drops the matching keyspaces with ACCESS_REVOKED
+//    (`session.RevokeKeyspaces`), and a token issued before `not_before` holds no grant on them: the answers for a keyspace that the caller
+//    may not read, never ACCESS_REVOKED (09 [READ-32], [READ-64]);
+//  - grants (09 [READ-39], 10 [AUTH-49]): `denyRead` drops a keyspace with GRANT_CHANGED at once or at the next `RefreshSession`, which lists
+//    it in `dropped_keyspace_ids`; a keyspace that a principal may not read is dropped with GRANT_CHANGED at a `Subscribe` and an add, and its
+//    loads and mutations are PermissionDenied;
+//  - interest (09 §9.3, §9.7): records that do not touch a session's interest are not delivered, and the delivery watermark moves over
+//    them; `KeyspaceAdded` echoes the interest; `set_interest` announces its switch point with a `KeyspaceAdded` (the seq examined under
+//    the old interest, SPEC-QUESTIONS Q28); a cold load names its interest and returns the keys under it and the ancestor tombstones;
+//  - the offline horizon (07 [MUT-84], [MUT-89]): an action whose base seq + 1 names a record older than `max_offline` is refused with the
+//    recorded `OFFLINE_TOO_LONG`, `details["cause"] = "HORIZON"`.
+//
 // What it does not do: it is no reference of the other checks of 07 Table 7-1 (values are not validated against schemas, grants are
 // not judged, key ownership and staged moves are not modelled); it checks what the engine's reactions depend on: the envelope,
 // idempotency, lanes, the base epoch, preconditions, CAS, entity tombstones, and CRDT well-formedness.
@@ -148,7 +166,9 @@ export type Behavior =
   /** The server waits this long, on its clock, before it handles the call. */
   | { kind: "delay"; ms: number }
   /** For `mutate`: the result of a mutation, instead of processing it. `recorded`: the result is bound as the id's outcome and consumes its slot (07 §7.6). */
-  | { kind: "result"; result: (m: Mutation) => MutationResult | undefined; recorded?: boolean };
+  | { kind: "result"; result: (m: Mutation) => MutationResult | undefined; recorded?: boolean }
+  /** For `loadState`: the server answers, then runs `fn`, and only then returns the answer: what `fn` writes is delivered to the sessions before the client reads the page (a load that is older than the stream). */
+  | { kind: "after"; fn: () => void };
 
 interface Injection {
   method: Method;
@@ -199,6 +219,7 @@ interface AppLimitsInit {
   maxRequestBytes: number;
   maxValueBytes: number;
   keyspaceNotFoundWaitSeconds: number;
+  maxInterestPrefixes: number;
 }
 
 const DEFAULT_LIMITS: AppLimitsInit = {
@@ -210,6 +231,7 @@ const DEFAULT_LIMITS: AppLimitsInit = {
   maxRequestBytes: 4 << 20,
   maxValueBytes: 1 << 20,
   keyspaceNotFoundWaitSeconds: 3600,
+  maxInterestPrefixes: 64,
 };
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -265,6 +287,8 @@ class FakeKeyspace {
   seeding = false;
   /** The prune floor (06 [LOG-57]): a cursor below it cannot be resumed. */
   pruneFloor = 0n;
+  /** The floor was set by `prune` (a split successor's floor is its split seq, and is judged against its source, 07 [MUT-84]). */
+  pruned = false;
   bindings = new Map<string, Binding>();
   voided = new Map<string, Voided>();
   lanes = new Map<string, LaneSlots>();
@@ -286,6 +310,8 @@ class FakeKeyspace {
 }
 
 interface FrameState {
+  /** The interest of the session in the keyspace (09 §9.3); empty is the whole keyspace. */
+  interest: string[];
   /** The server's delivery watermark: what it has examined and handed to the frame policy. */
   watermark: bigint;
   /** The watermark of the frames that were pushed to the stream: what a heartbeat may claim (09 [READ-55]). */
@@ -404,6 +430,13 @@ export class FakeServer {
   private readonly heartbeatMs: number;
   private readonly maxSessions: number | undefined;
   private principalCounter = 0;
+  /** The token of each transport's principal object: when it was issued (10 [AUTH-52]). */
+  readonly tokens = new Map<Principal, { iat: number }>();
+  private readonly revocations: { sub: string; notBefore: number; recorded: number }[] = [];
+  private readonly keyspaceRevocations: { pattern: string; notBefore: number; recorded: number }[] = [];
+  /** The recovery marks of 10 [AUTH-51]: the device binding (`sub|device_id`) and the recording time of the revocation that it has recovered from. */
+  private readonly marks = new Map<string, number>();
+  private readonly denied = new Set<string>();
 
   constructor(opts: FakeOptions) {
     this.appId = opts.appId ?? "app";
@@ -456,6 +489,95 @@ export class FakeServer {
 
   resume(): void {
     this.suspended = false;
+  }
+
+  // -- revocation and grants (10 §10.7) --
+
+  /**
+   * `RevokeAccess{subject}` (12 [ADM-87], 10 [AUTH-51]): every session of the subject gets `KeyspaceDropped{ACCESS_REVOKED}` for each
+   * followed keyspace, then `Closing{SUBJECT_REVOKED}` and the stream status PermissionDenied; from then on a token issued before
+   * `notBefore` (default: now) is refused. Returns the number of sessions that it closed.
+   */
+  revokeSubject(sub: string, opts: { notBefore?: number } = {}): number {
+    const now = this.clock.now();
+    this.revocations.push({ sub, notBefore: opts.notBefore ?? now, recorded: now });
+    let n = 0;
+    for (const s of [...this.sessions]) {
+      if (s.principal.sub !== sub && !s.principal.actorChain.includes(sub)) continue;
+      for (const id of [...s.follows.keys()]) {
+        s.follows.delete(id);
+        s.push(this.control({ case: "keyspaceDropped", value: create(ControlFrame_KeyspaceDroppedSchema, { keyspaceId: id, reason: 2 /* ACCESS_REVOKED */ }) }));
+      }
+      s.push(this.control({ case: "closing", value: create(ControlFrame_ClosingSchema, { reason: CloseReasonEnum.SUBJECT_REVOKED, message: "access was revoked" }) }));
+      s.push({ error: new RpcError("PermissionDenied", "access was revoked") });
+      n++;
+    }
+    return n;
+  }
+
+  /**
+   * `RevokeAccess{keyspace_pattern}` (10 [AUTH-52]): every session that follows a matching keyspace gets `KeyspaceDropped{ACCESS_REVOKED}`
+   * for it. A pattern is a keyspace id, or a prefix and a trailing `*`. Tokens issued before `notBefore` hold no grant on a matching keyspace.
+   */
+  revokeKeyspaces(pattern: string, opts: { notBefore?: number } = {}): number {
+    const now = this.clock.now();
+    this.keyspaceRevocations.push({ pattern, notBefore: opts.notBefore ?? now, recorded: now });
+    let n = 0;
+    for (const s of [...this.sessions]) {
+      for (const id of [...s.follows.keys()]) {
+        if (!matchesPattern(pattern, id)) continue;
+        s.follows.delete(id);
+        s.push(this.control({ case: "keyspaceDropped", value: create(ControlFrame_KeyspaceDroppedSchema, { keyspaceId: id, reason: 2 /* ACCESS_REVOKED */ }) }));
+        n++;
+      }
+    }
+    return n;
+  }
+
+  /**
+   * The principal no longer holds `read` on the keyspace (10 [AUTH-49], [AUTH-54]). With `drop` (the default) the sessions that follow it get
+   * `KeyspaceDropped{GRANT_CHANGED}` now, as after a re-check; without it the drop comes with the next `RefreshSession`.
+   */
+  denyRead(sub: string, keyspaceId: string, opts: { drop?: boolean } = {}): void {
+    this.denied.add(`${sub}|${keyspaceId}`);
+    if (opts.drop === false) return;
+    for (const s of [...this.sessions]) {
+      if (s.principal.sub !== sub || !s.follows.delete(keyspaceId)) continue;
+      s.push(this.control({ case: "keyspaceDropped", value: create(ControlFrame_KeyspaceDroppedSchema, { keyspaceId, reason: 1 /* GRANT_CHANGED */ }) }));
+    }
+  }
+
+  allowRead(sub: string, keyspaceId: string): void {
+    this.denied.delete(`${sub}|${keyspaceId}`);
+  }
+
+  /** Whether the token of the principal grants `read` on the keyspace now. */
+  private readable(principal: Principal, keyspaceId: string): boolean {
+    if (this.denied.has(`${principal.sub}|${keyspaceId}`)) return false;
+    const iat = this.tokens.get(principal)?.iat ?? Number.MAX_SAFE_INTEGER;
+    for (const r of this.keyspaceRevocations) {
+      if (matchesPattern(r.pattern, keyspaceId) && iat < r.notBefore + 60_000) return false;
+    }
+    return true;
+  }
+
+  /**
+   * The token of a call (10 [AUTH-51], [AUTH-52]): a token of a revoked subject that is issued before `not_before` (with the 60 s leeway) is
+   * refused with Unauthenticated; the refusal carries the `SUBJECT_REVOKED` detail until a token of the same device binding that is not issued
+   * before it has been accepted (the recovery mark), which this call sets when it is that token.
+   */
+  private authenticate(principal: Principal): void {
+    const mine = this.revocations.filter((r) => r.sub === principal.sub || principal.actorChain.includes(r.sub));
+    if (mine.length === 0) return;
+    const latest = mine.reduce((a, b) => (b.recorded >= a.recorded ? b : a));
+    const iat = this.tokens.get(principal)?.iat ?? Number.MAX_SAFE_INTEGER;
+    const binding = `${principal.sub}|${principal.deviceId}`;
+    if (iat < latest.notBefore + 60_000) {
+      const marked = this.marks.get(binding);
+      const detail = marked !== undefined && marked >= latest.recorded ? undefined : mkReject(Code.PERMISSION_DENIED, { details: { cause: "SUBJECT_REVOKED" } });
+      throw new RpcError("Unauthenticated", "the token is refused: the subject was revoked", detail !== undefined ? { reject: detail } : {});
+    }
+    this.marks.set(binding, latest.recorded);
   }
 
   // -- keyspaces --
@@ -540,6 +662,9 @@ export class FakeServer {
 
   /** The cold loads of this keyspace answer `skipped_unsupported = true` (09 [READ-18]). */
   skippedUnsupported = false;
+
+  /** The `decision_deadline` of the GATED intents that the fake registers, from their registration (08 [GATE-10]). */
+  decisionDeadlineMs = 60_000;
 
   /** Decides a GATED intent (08 §8.4): appends the DECISION and binds the outcome, which consumes the slot. */
   decide(id: string, intentId: string, d: GateDecision): bigint {
@@ -649,8 +774,12 @@ export class FakeServer {
   }
 
   /** Prunes the log up to seq: a cursor below it gets RESUME_TOO_OLD, and a resume check a cold load (09 [READ-17], [READ-65]). */
-  prune(id: string, seq: bigint): void {
-    this.ks(id).pruneFloor = seq;
+  prune(id: string, seq: bigint, opts: { judgeHorizon?: boolean } = {}): void {
+    const k = this.ks(id);
+    k.pruneFloor = seq;
+    // 07 [MUT-84], [MUT-87]: a record at or below the prune floor is older than the horizon, so an action whose base is below it gets OFFLINE_TOO_LONG;
+    // a test that prunes young records for the sake of RESUME_TOO_OLD says so with `judgeHorizon: false`
+    k.pruned = opts.judgeHorizon !== false;
   }
 
   /** Removes the keyspace from every session's follows without a frame: a following keyspace that heartbeats no longer list (09 [READ-54]). */
@@ -941,12 +1070,31 @@ export class FakeServer {
   private pump(s: FakeSession, k: FakeKeyspace): void {
     const fs = s.follows.get(k.id);
     if (fs === undefined || fs.epoch !== k.epoch) return;
-    const recs = k.log.filter((r) => r.seq > fs.watermark);
-    if (recs.length === 0) return;
-    const cursor = (recs[recs.length - 1] as RecordMessage).seq;
-    const frame = create(SubscribeResponseSchema, { frame: { case: "records", value: create(RecordsFrameSchema, { keyspaceId: k.id, prevCursor: fs.watermark, cursor, records: recs }) } });
+    const examined = k.log.filter((r) => r.seq > fs.watermark);
+    if (examined.length === 0) return;
+    const cursor = (examined[examined.length - 1] as RecordMessage).seq;
+    // 09 [READ-23], [READ-24]: the records that touch the interest are delivered whole; the watermark covers the others, examined and not sent
+    const recs = fs.interest.length === 0 ? examined : examined.filter((r) => this.touches(k, r, fs.interest));
+    const prev = fs.watermark;
     fs.watermark = cursor;
+    if (recs.length === 0) {
+      if (fs.pushed === prev) fs.pushed = cursor; // nothing of what the watermark passed is held back or lost: a heartbeat may claim it
+      return;
+    }
+    const frame = create(SubscribeResponseSchema, { frame: { case: "records", value: create(RecordsFrameSchema, { keyspaceId: k.id, prevCursor: prev, cursor, records: recs }) } });
     this.emit(s, frame);
+  }
+
+  /** Whether a record touches an interest (09 [READ-23]): a change to a key under a prefix or an ancestor of one, a SYSTEM record, or a DECISION whose INTENT touches. */
+  private touches(k: FakeKeyspace, rec: RecordMessage, interest: readonly string[]): boolean {
+    if (rec.kind === RecordKind.SYSTEM) return true;
+    const hit = (key: string): boolean => interest.some((p) => key === p || key.startsWith(`${p}/`) || p.startsWith(`${key}/`));
+    if (rec.changes.some((c) => hit(c.key))) return true;
+    if (rec.kind === RecordKind.DECISION) {
+      const intent = k.log.find((r) => r.kind === RecordKind.INTENT && r.mutationId === rec.mutationId);
+      if (intent !== undefined && intent.changes.some((c) => hit(c.key))) return true;
+    }
+    return false;
   }
 
   // ---------------------------------------------------------------------------------------------------------------------
@@ -954,6 +1102,7 @@ export class FakeServer {
 
   private async prologue(method: Method, req: unknown, principal: Principal): Promise<Injection | undefined> {
     this.calls.push({ method, sub: principal.sub, request: req, at: this.clock.now() });
+    this.authenticate(principal); // 10 [AUTH-51], [AUTH-52]: before the body is read
     const inj = this.take(method, req, principal);
     const b = inj?.behavior;
     if (b?.kind === "status") throw new RpcError(b.status, b.message ?? "injected", { ...(b.reject !== undefined ? { reject: b.reject } : {}), ...(b.retry !== undefined ? { retry: b.retry } : {}) });
@@ -981,7 +1130,18 @@ export class FakeServer {
 
   async refreshSession(principal: Principal, req: RefreshSessionRequest): Promise<RefreshSessionResponse> {
     await this.prologue("refreshSession", req, principal);
-    return create(RefreshSessionResponseSchema, { expiresAt: timestampFromMs(this.clock.now() + 3600_000), droppedKeyspaceIds: [] });
+    // 09 [READ-37], 10 [AUTH-49]: `read` is judged again on every followed keyspace against the new token; each one that it no longer allows is
+    // dropped with GRANT_CHANGED, and listed, informationally, in the answer
+    const s = [...this.sessions].find((x) => x.id === req.sessionId);
+    if (s === undefined) throw new RpcError("NotFound", "no such session");
+    const dropped: string[] = [];
+    for (const id of [...s.follows.keys()]) {
+      if (this.readable(principal, id)) continue;
+      s.follows.delete(id);
+      dropped.push(id);
+      s.push(this.control({ case: "keyspaceDropped", value: create(ControlFrame_KeyspaceDroppedSchema, { keyspaceId: id, reason: 1 /* GRANT_CHANGED */ }) }));
+    }
+    return create(RefreshSessionResponseSchema, { expiresAt: timestampFromMs(this.clock.now() + 3600_000), droppedKeyspaceIds: dropped });
   }
 
   // -- GetMutationResult(s) (07 [MUT-53]) --
@@ -1084,15 +1244,24 @@ export class FakeServer {
   }
 
   async loadState(principal: Principal, req: LoadStateRequest): Promise<LoadStateResponse> {
-    await this.prologue("loadState", req, principal);
+    const inj = await this.prologue("loadState", req, principal);
+    const resp = this.loadStateNow(principal, req);
+    if (inj?.behavior.kind === "after") inj.behavior.fn();
+    return resp;
+  }
+
+  private loadStateNow(principal: Principal, req: LoadStateRequest): LoadStateResponse {
     const cur = req.cursor;
     const id = cur?.keyspaceId ?? "";
     const k = this.keyspaces.get(id);
     if (k === undefined) throw new RpcError("NotFound", "no such keyspace", { reject: mkReject(Code.KEYSPACE_NOT_FOUND) });
     if (k.deleted) throw new RpcError("NotFound", "deleted", { reject: mkReject(Code.KEYSPACE_DELETED) });
+    if (!this.readable(principal, id)) throw new RpcError("PermissionDenied", "no read grant", { reject: mkReject(Code.PERMISSION_DENIED) });
     if (k.frozen) throw new RpcError("FailedPrecondition", "frozen", { reject: mkReject(Code.HISTORY_DIVERGED) });
     const subject = subjectOf(principal);
     void subject;
+    const interest = cur?.interestPrefixes ?? [];
+    if (interest.length > Number(this.limits.maxInterestPrefixes)) throw new RpcError("ResourceExhausted", "too many interest prefixes", { reject: mkReject(Code.QUOTA_EXCEEDED, { details: { quota: "max_interest_prefixes" } }) });
     const base = { logEpoch: k.epoch, headSeq: k.head, manifestVersion: k.manifestVersion, limits: this.limits, kind: k.kind, lifecycle: k.lifecycle, successors: k.successors, serverInfo: create(ServerInfoSchema, { protocolName: "abpc.v2", revision: "2.0", features: [], build: "fake" }) };
     const wms = req.clientId !== "" ? this.laneWatermarks(k, req.clientId) : [];
     // a page of a load in progress
@@ -1115,8 +1284,9 @@ export class FakeServer {
         return create(LoadStateResponse_, { ...base, checkpointSeq: afterSeq, entries: [], nextPageToken: "", resumed: true, laneWatermarks: wms });
       }
     }
-    // a cold load: the state at one checkpoint, as pages
-    const all = this.entriesOf(k);
+    // a cold load: the state at one checkpoint, as pages; with an interest (09 [READ-9]): the keys under it, the tombstones that match it, and
+    // the entity and staged tombstones of the ancestors of its prefixes
+    const all = this.entriesOf(k).filter((e) => entryInInterest(e, interest));
     const size = req.pageSize === 0 ? this.pageSize : Math.min(req.pageSize, 10000);
     const first = all.slice(0, size);
     const more = all.length > size;
@@ -1179,6 +1349,7 @@ export class FakeServer {
       s.push(this.control({ case: "keyspaceDropped", value: create(ControlFrame_KeyspaceDroppedSchema, { keyspaceId: c.keyspaceId, reason: reason as DropReason, successors }) }));
     };
     const k = this.keyspaces.get(c.keyspaceId);
+    if (!this.readable(s.principal, c.keyspaceId)) return drop(1 /* GRANT_CHANGED */); // 09 [READ-32]: whether or not the keyspace exists
     if (k === undefined) return drop(10 /* NOT_FOUND */);
     if (k.deleted) return drop(7);
     if (k.frozen) return drop(5);
@@ -1188,8 +1359,8 @@ export class FakeServer {
     const rec = k.log.find((r) => r.seq === c.afterSeq);
     const hashOk = c.afterRecordHash.length === 0 || (rec !== undefined && toHex(rec.recordHash) === toHex(c.afterRecordHash));
     if (c.afterSeq > k.head || c.afterSeq < k.pruneFloor || !hashOk) return drop(4 /* RESUME_TOO_OLD */);
-    s.follows.set(c.keyspaceId, { watermark: c.afterSeq, pushed: c.afterSeq, epoch: k.epoch });
-    s.push(this.control({ case: "keyspaceAdded", value: create(ControlFrame_KeyspaceAddedSchema, { cursor: create(KeyspaceCursorSchema, { keyspaceId: c.keyspaceId, afterSeq: c.afterSeq, logEpoch: k.epoch }) }) }));
+    s.follows.set(c.keyspaceId, { interest: [...c.interestPrefixes], watermark: c.afterSeq, pushed: c.afterSeq, epoch: k.epoch });
+    s.push(this.control({ case: "keyspaceAdded", value: create(ControlFrame_KeyspaceAddedSchema, { cursor: create(KeyspaceCursorSchema, { keyspaceId: c.keyspaceId, afterSeq: c.afterSeq, logEpoch: k.epoch, interestPrefixes: [...c.interestPrefixes] }) }) }));
     this.pump(s, k);
   }
 
@@ -1206,6 +1377,14 @@ export class FakeServer {
     for (const id of req.remove) s.follows.delete(id);
     const rejected = [];
     for (const c of req.add) {
+      if (!this.readable(s.principal, c.keyspaceId)) {
+        rejected.push(create(UpdateSubscriptionResponse_RejectionSchema, { keyspaceId: c.keyspaceId, outcome: { case: "reject", value: mkReject(Code.PERMISSION_DENIED) } }));
+        continue;
+      }
+      if (c.interestPrefixes.length > Number(this.limits.maxInterestPrefixes)) {
+        rejected.push(create(UpdateSubscriptionResponse_RejectionSchema, { keyspaceId: c.keyspaceId, outcome: { case: "reject", value: mkReject(Code.QUOTA_EXCEEDED, { details: { quota: "max_interest_prefixes" } }) } }));
+        continue;
+      }
       if (!this.keyspaces.has(c.keyspaceId)) {
         rejected.push(create(UpdateSubscriptionResponse_RejectionSchema, { keyspaceId: c.keyspaceId, outcome: { case: "reject", value: mkReject(Code.KEYSPACE_NOT_FOUND) } }));
         continue;
@@ -1216,6 +1395,19 @@ export class FakeServer {
         continue;
       }
       this.addFollow(s, c);
+    }
+    // 09 [READ-62], [READ-64]: `set_interest` after `add`; each entry is checked in order: the form, that the session follows the keyspace, the limit
+    for (const i of req.setInterest) {
+      const bad = i.interestPrefixes.some((p) => p === "" || p.endsWith("/") || p.split("/").some((seg) => !/^[A-Za-z0-9._-]{1,64}$/.test(seg) || seg === "." || seg === ".."));
+      const fs = s.follows.get(i.keyspaceId);
+      if (bad) rejected.push(create(UpdateSubscriptionResponse_RejectionSchema, { keyspaceId: i.keyspaceId, outcome: { case: "reject", value: mkReject(Code.INVALID_KEY) } }));
+      else if (fs === undefined) rejected.push(create(UpdateSubscriptionResponse_RejectionSchema, { keyspaceId: i.keyspaceId, outcome: { case: "reject", value: mkReject(Code.INVALID_ENVELOPE) } }));
+      else if (i.interestPrefixes.length > Number(this.limits.maxInterestPrefixes)) rejected.push(create(UpdateSubscriptionResponse_RejectionSchema, { keyspaceId: i.keyspaceId, outcome: { case: "reject", value: mkReject(Code.QUOTA_EXCEEDED, { details: { quota: "max_interest_prefixes" } }) } }));
+      else {
+        // 09 [READ-27]: the switch point is the delivery watermark when the change takes effect, announced before any frame under the new interest
+        fs.interest = [...i.interestPrefixes];
+        s.push(this.control({ case: "keyspaceAdded", value: create(ControlFrame_KeyspaceAddedSchema, { cursor: create(KeyspaceCursorSchema, { keyspaceId: i.keyspaceId, afterSeq: fs.watermark, logEpoch: fs.epoch, interestPrefixes: [...i.interestPrefixes] }) }) }));
+      }
     }
     return create(UpdateSubscriptionResponseSchema, { rejected });
   }
@@ -1350,6 +1542,8 @@ export class FakeServer {
     if (m.lane !== Lane.SEQUENCED && m.lane !== Lane.GATED) return rej(mkReject(Code.INVALID_ENVELOPE, { message: "no lane" }));
     if (m.clientId !== "" && m.clientSeq === 0n) return rej(mkReject(Code.INVALID_ENVELOPE, { message: "client_seq 0" }));
     if (k === undefined) return rej(mkReject(Code.KEYSPACE_NOT_FOUND));
+    // Table 7-1 step 7: no `write` without `read` (10 §10.5): the unrecorded PERMISSION_DENIED, whatever else is wrong with the action
+    if (!this.readable(principal, m.keyspaceId)) return rej(mkReject(Code.PERMISSION_DENIED));
     const manifest = this.manifests.get(k.manifestVersion);
     const op = manifest?.opType(m.opType);
     // step 6: the duplicate lookup (07 §7.6)
@@ -1419,6 +1613,16 @@ export class FakeServer {
     // the base epoch (05 [STATE-81]): not for a spend action
     if (m.baseLogEpoch !== 0 && m.baseLogEpoch !== k.epoch && !op.spend) {
       return this.final(k, principal, m, content, mkReject(Code.STALE, { stale: { cause: StaleCause.EPOCH, currentSeq: k.head } }), passed);
+    }
+    // step 12, after the base epoch: the offline horizon (07 [MUT-84]): the record at seq base_seq + 1 is older than `max_offline`, or at or below the prune floor
+    {
+      const n = m.baseSeq + 1n;
+      const rec = k.log.find((r) => r.seq === n);
+      const maxOffline = Number(this.limits.maxOfflineSeconds) * 1000;
+      const recMs = rec?.serverTime === undefined ? undefined : Number(rec.serverTime.seconds) * 1000 + Math.floor(rec.serverTime.nanos / 1e6);
+      if ((k.pruned && n <= k.pruneFloor) || (recMs !== undefined && recMs < this.clock.now() - maxOffline)) {
+        return this.final(k, principal, m, content, mkReject(Code.OFFLINE_TOO_LONG, { details: { cause: "HORIZON" } }), passed);
+      }
     }
     const err = this.checkChanges(k, m, manifest);
     if (err !== undefined) return this.final(k, principal, m, content, err, passed);
@@ -1577,7 +1781,8 @@ export class FakeServer {
     // 08 §8.2: registered; with `log_intent` it is logged as an INTENT record with the intent row (06 [LOG-22]), without it nothing is logged
     let intentSeq = 0n;
     if (logIntent) {
-      const row = create(KeyChangeSchema, { key: `abpc.intent/${m.mutationId}`, kind: ChangeKind.SET, value: new TextEncoder().encode(JSON.stringify({ status: "PENDING" })), encoding: "json/v1" });
+      // 06 §6.5: a PENDING row holds `status`, `op_type` and `deadline`, in canonical order
+      const row = create(KeyChangeSchema, { key: `abpc.intent/${m.mutationId}`, kind: ChangeKind.SET, value: new TextEncoder().encode(JSON.stringify({ deadline: new Date(this.clock.now() + this.decisionDeadlineMs).toISOString(), op_type: m.opType, status: "PENDING" })), encoding: "json/v1" });
       const rec = this.record(k, RecordKind.INTENT, { principal, mutationId: m.mutationId, opType: m.opType, changes: [...m.changes, row], authoredAt: m.authoredAt });
       this.commit(k, rec);
       intentSeq = rec.seq;
@@ -1610,6 +1815,18 @@ export class FakeServer {
 // create() needs the schema object under a stable name here
 const LoadStateResponse_ = LoadStateResponseSchema;
 
+/** A keyspace pattern of `RevokeAccess` (03 §3.7): a keyspace id, or a prefix and a trailing `*`. */
+function matchesPattern(pattern: string, id: string): boolean {
+  return pattern.endsWith("*") ? id.startsWith(pattern.slice(0, -1)) : pattern === id;
+}
+
+/** Whether a load entry is in an interest (09 [READ-9]): under a prefix, or a tombstone entry of an entity or staged marker that is an ancestor of one. */
+function entryInInterest(e: KeyEntry, interest: readonly string[]): boolean {
+  if (interest.length === 0) return true;
+  if (interest.some((p) => e.key === p || e.key.startsWith(`${p}/`))) return true;
+  return e.deleted && interest.some((p) => p.startsWith(`${e.key}/`));
+}
+
 function kindFits(rule: Rule | undefined, kind: ChangeKind): boolean {
   switch (kind) {
     case ChangeKind.DELETE:
@@ -1629,10 +1846,21 @@ function kindFits(rule: Rule | undefined, kind: ChangeKind): boolean {
 
 /** The transport of one principal over the fake server. */
 export class FakeTransport implements Transport {
+  readonly principal: Principal;
+
   constructor(
     readonly server: FakeServer,
-    readonly principal: Principal,
-  ) {}
+    principal: Principal,
+  ) {
+    // each transport has a token of its own, issued now (10 [AUTH-52]): the server judges it against the revocations by its principal object
+    this.principal = { ...principal };
+    server.tokens.set(this.principal, { iat: server.clock.now() });
+  }
+
+  /** The app gets a new token: issued now (or at `iat`). A token issued before a revocation's `not_before` (plus 60 s) is refused. */
+  renewToken(iat?: number): void {
+    this.server.tokens.set(this.principal, { iat: iat ?? this.server.clock.now() });
+  }
 
   getManifest(req: GetManifestRequest): Promise<GetManifestResponse> {
     return this.server.getManifest(this.principal, req);

@@ -34,6 +34,7 @@ import type {
   StoredState,
 } from "./storage.js";
 import type { Transport } from "./transport.js";
+import type { StorageProvider, TabHost } from "./tabs.js";
 import type {
   ActionSnapshot,
   ChangeInput,
@@ -67,6 +68,27 @@ export interface EngineConfig {
   features?: readonly string[];
   /** Mints a client id; the default is a random UUID of version 4 (03 [ID-35]). */
   newClientId?: () => string;
+  /** The server origin, which keys the local storage with the app and the partition (14 [CLI-74]); default `local`. */
+  origin?: string;
+  /**
+   * `personal` (the default): the partition is the user's subject. `shared-device`: the partition is the `device_id`, and the engine of a
+   * kiosk or a till authenticates as the device (14 [CLI-59], 10 [AUTH-28]).
+   */
+  mode?: "personal" | "shared-device";
+  /** The tab's platform: the lock that elects the flusher, the broadcast between tabs, the storage (14 [CLI-61]). Without it the engine is its own flusher. */
+  tab?: TabHost;
+  /** Opens the storage of the partition when `storage` is not given (14 [CLI-74]); a tab's host has one. */
+  store?: StorageProvider;
+  /** The flusher hands its role over to a visible tab when its own tab is hidden (14 [CLI-61]); default false. */
+  handOverWhenHidden?: boolean;
+  /** The share of `max_offline` at which `offline-horizon` is emitted: above 0 and below 1; default 0.8 (14 [CLI-56]). */
+  horizonWarning?: number;
+  /** What the engine does with the local copy of a keyspace that it stops following because of `GRANT_CHANGED` or `ARCHIVED` (14 [CLI-67], [CLI-77]); default `keep`. */
+  copyPolicy?: "keep" | "purge" | ((keyspaceId: string, reason: "GRANT_CHANGED" | "ARCHIVED") => "keep" | "purge");
+  /** Whether the engine keeps the persisted replica (14 [CLI-2], §14.10); default true. */
+  persistReplica?: boolean;
+  /** The longest tail of records that a persisted replica may hold at a restart; a longer one is dropped and the keyspace is loaded again. */
+  replicaTailLimit?: number;
 }
 
 /** The limits in force, as the engine uses them (04 Table 4.10a). */
@@ -79,6 +101,8 @@ export interface Limits {
   maxActionBytes: number;
   maxValueBytes: number;
   keyspaceNotFoundWaitMs: number;
+  /** Interest prefixes per followed keyspace (09 [READ-22], 04 Table 4.10). */
+  maxInterestPrefixes: number;
 }
 
 /**
@@ -98,6 +122,7 @@ export const FLOOR_LIMITS: Limits = {
   maxActionBytes: 256 << 10,
   maxValueBytes: 64 << 10,
   keyspaceNotFoundWaitMs: 60 * 1000,
+  maxInterestPrefixes: 16,
 };
 
 /** What the engine keeps of an outbox entry in memory only: its runtime state, rebuilt from the answers of the server after a restart. */
@@ -121,7 +146,7 @@ export abstract class EngineCore {
   readonly author: Author;
   readonly transport: Transport;
   readonly manifests: Manifests;
-  readonly storage: OutboxStorage;
+  storage!: OutboxStorage;
   readonly clock: Clock;
   readonly random: Random;
   readonly bus = new EventBus();
@@ -133,6 +158,8 @@ export abstract class EngineCore {
   protected readonly mintClientId: () => string;
 
   // -- the outbox and the other stores, mirrored in memory (the storage holds the durable copy) --
+  /** Entries of the partition whose author is not the current principal: kept in place, never sent, never shown (14 [CLI-59], [CLI-60]). */
+  lockedEntries: OutboxEntry[] = [];
   readonly entries = new Map<string, OutboxEntry>();
   readonly deadLetters = new Map<string, DeadLetterEntry>();
   readonly journal = new Map<string, JournalEntry>();
@@ -148,6 +175,11 @@ export abstract class EngineCore {
 
   // -- identity --
   clientId = "";
+  /**
+   * The engine's role among the tabs of its device (14 [CLI-61]): the flusher owns the outbox, the session and the `client_id`; a
+   * follower reads through the flusher and never sends. A stopped engine is neither. An engine with no tab host is its own flusher.
+   */
+  role: "flusher" | "follower" | "stopped" = "flusher";
 
   // -- limits and time --
   limits: Limits = { ...FLOOR_LIMITS };
@@ -372,9 +404,29 @@ export abstract class EngineCore {
     take("max_request_bytes", l.maxRequestBytes, FLOOR_LIMITS.maxRequestBytes, (n) => (next.maxRequestBytes = n));
     take("max_inflight_gated_per_client", l.maxInflightGatedPerClient, FLOOR_LIMITS.maxInflightGated, (n) => (next.maxInflightGated = n));
     take("keyspace_not_found_wait_seconds", l.keyspaceNotFoundWaitSeconds, FLOOR_LIMITS.keyspaceNotFoundWaitMs / 1000, (n) => (next.keyspaceNotFoundWaitMs = n * 1000));
+    take("max_interest_prefixes", l.maxInterestPrefixes, FLOOR_LIMITS.maxInterestPrefixes, (n) => (next.maxInterestPrefixes = n));
     const changed = next.maxOfflineMs !== this.limits.maxOfflineMs;
     this.limits = next;
-    if (changed) this.post(() => this.tx([{ op: "setMeta", key: "maxOfflineSeconds", value: next.maxOfflineMs / 1000 }]).catch(() => undefined));
+    if (changed) {
+      // 14 [CLI-54]: the horizon is kept with the stored state, so that it applies while the client is offline
+      if (this.role === "flusher") this.post(() => this.tx([{ op: "setMeta", key: "maxOfflineSeconds", value: next.maxOfflineMs / 1000 }]).catch(() => undefined));
+      this.onLimitsChanged();
+    }
+  }
+
+  /** Something durable changed: the other tabs of the engine are told (tab-layer.ts). */
+  protected touchPersisted(): void {
+    // nothing here
+  }
+
+  /** The runtime that a follower mirrors changed: the connection, a hold (tab-layer.ts). */
+  protected onRuntimeChanged(): void {
+    // nothing here
+  }
+
+  /** The limits changed in a way that other layers read (the offline horizon, 14 [CLI-56]); a layer that does overrides it. */
+  protected onLimitsChanged(): void {
+    // nothing here
   }
 
   // ---------------------------------------------------------------------------------------------------------------------
@@ -385,25 +437,37 @@ export abstract class EngineCore {
     if (ops.length === 0) return;
     try {
       await this.storage.commit(ops);
+      this.touchPersisted();
     } catch (e) {
       if (e instanceof StorageError || (e instanceof Error && e.name === "StoreFull")) throw e;
       throw new StorageError(e instanceof Error ? e.message : String(e));
     }
   }
 
+  /**
+   * The operation that stores an entry. The `client_id` is kept in memory only and never persisted (03 [ID-35]: so that backups, disk images and
+   * cloned profiles never carry it): the stored copy has none. It is never read back as an identity either: every start and every handover
+   * mints a new one and re-stamps what has no definitive result (14 [CLI-63]).
+   */
   protected putOp(e: OutboxEntry): StorageOp {
-    return { op: "putEntry", entry: e };
+    return { op: "putEntry", entry: e.clientId === "" ? e : { ...e, clientId: "" } };
   }
 
   /** Loads what the storage holds into the mirrors (14 [CLI-8]). */
   protected async loadStored(): Promise<StoredState> {
     const s = await this.storage.load();
-    for (const e of s.entries) this.entries.set(e.mutationId, e);
-    for (const e of s.deadLetters) this.deadLetters.set(e.mutationId, e);
-    for (const e of s.journal) this.journal.set(e.mutationId, e);
-    for (const e of s.exports) this.exports.set(e.mutationId, e);
+    this.lockedEntries = [];
+    // 14 [CLI-60]: only the entries whose author is the current principal are the engine's; the others stay in the store, locked
+    const mine = (a: Author | undefined): boolean => a === undefined || (a.issuer === this.author.issuer && a.sub === this.author.sub);
+    for (const e of s.entries) {
+      if (mine(e.author)) this.entries.set(e.mutationId, e);
+      else this.lockedEntries.push(e);
+    }
+    for (const e of s.deadLetters) if (mine(e.author)) this.deadLetters.set(e.mutationId, e);
+    for (const e of s.journal) if (mine(e.author)) this.journal.set(e.mutationId, e);
+    for (const e of s.exports) if (mine(e.author)) this.exports.set(e.mutationId, e);
     for (const e of s.rejections) this.rejections.set(e.mutationId, e);
-    for (const e of s.drafts) this.drafts.set(`${e.keyspaceId}\u0000${e.key}`, e);
+    for (const e of s.drafts) if (mine(e.author)) this.drafts.set(`${e.keyspaceId}\u0000${e.key}`, e);
     const ord = s.meta["nextOrdinal"];
     this.nextOrdinal = typeof ord === "number" ? ord : 1;
     for (const e of s.entries) if (e.ordinal >= this.nextOrdinal) this.nextOrdinal = e.ordinal + 1;
@@ -554,6 +618,7 @@ export abstract class EngineCore {
     if (hold.boundMs !== undefined) ev.bound = hold.boundMs;
     this.emit(ev);
     this.onHoldChanged();
+    this.onRuntimeChanged();
     return hold;
   }
 
@@ -566,6 +631,7 @@ export abstract class EngineCore {
     if (h.mutationId !== undefined) ev.mutationId = h.mutationId;
     this.emit(ev);
     this.onHoldChanged();
+    this.onRuntimeChanged();
     return true;
   }
 
@@ -583,7 +649,6 @@ export abstract class EngineCore {
       case "HISTORY_DIVERGED":
       case "UNKNOWN_DROP_REASON":
       case "EPOCH_RESOLUTION":
-      case "ACCESS_REVOKED":
         return "keyspace";
       case "CONFLICT_WAIT":
         return "action";

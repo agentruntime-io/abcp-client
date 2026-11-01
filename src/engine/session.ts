@@ -9,8 +9,8 @@
 //  - a lost action is reported, never resubmitted, except a lost spend action, which is resent once ([CLI-38], [CLI-64]);
 //  - the session ends and resumes with the backoffs of 09 [READ-57].
 //
-// TODO(14 §14.9, R/C3): `ACCESS_REVOKED` and `SUBJECT_REVOKED` purge and quarantine ([CLI-66], [CLI-79]); here the client holds the
-// keyspace and keeps its outbox and its copy.
+// Revocation (`ACCESS_REVOKED`, `SUBJECT_REVOKED`, `GRANT_CHANGED`, `DELETED`): the session reads the frame and calls what 14 §14.9 and
+// §14.10 define, which `revocation.ts` implements ([CLI-66], [CLI-67], [CLI-77], [CLI-79]).
 
 import { create } from "@bufbuild/protobuf";
 import {
@@ -86,6 +86,42 @@ export abstract class SessionLayer extends SenderLayer {
   protected online(): boolean {
     return this.sess.state === "live";
   }
+
+  protected sessionId(): string {
+    return this.sess.id;
+  }
+
+  protected abortSession(): void {
+    this.sess.abort?.abort();
+  }
+
+  /** `ACCESS_REVOKED` for a keyspace, or the revocation of its subject: purge the local copy and quarantine the outbox (14 [CLI-66]). */
+  protected abstract onAccessRevoked(f: Follow, cause: "ACCESS_REVOKED" | "SUBJECT_REVOKED"): Promise<void>;
+  /** `Closing{SUBJECT_REVOKED}`, or `Unauthenticated` with the `SUBJECT_REVOKED` detail: purge and quarantine every keyspace of the subject (14 [CLI-79], [CLI-50]). */
+  protected abstract onSubjectRevoked(): Promise<void>;
+  /** `GRANT_CHANGED` or `ARCHIVED` for a keyspace: the engine stops following it, and keeps or purges the local copy as the app's policy says (14 [CLI-67], [CLI-77]). */
+  protected abstract onCopyPolicy(f: Follow, reason: "GRANT_CHANGED" | "ARCHIVED"): Promise<void>;
+  /** `DELETED`: purge the local copy and the dead-letter and export entries of the keyspace (14 [CLI-77]). */
+  protected abstract onKeyspaceDeletedPurge(f: Follow, before: { deadLetters: string[]; exports: string[] }): Promise<void>;
+  /** Whether an error is the `Unauthenticated` of a revoked subject that reached a device that was offline (10 [AUTH-51], 14 [CLI-50]). */
+  protected isRevokedDetail(error: unknown): boolean {
+    return error instanceof RpcError && error.status === "Unauthenticated" && error.reject?.details["cause"] === "SUBJECT_REVOKED";
+  }
+  /** A call failed with the revocation detail: the subject is revoked, whatever the call was. */
+  protected noteRevoked(error: unknown): boolean {
+    if (!this.isRevokedDetail(error)) return false;
+    this.post(() => this.onSubjectRevoked());
+    return true;
+  }
+  /** The followed keyspaces and their interest are kept with the stored state, so that a restart or a handover follows them again (14 [CLI-70]). */
+  protected abstract persistFollowed(): Promise<void>;
+  /** A widening of the interest is due (14 [CLI-72]). */
+  protected abstract needsWidening(f: Follow): boolean;
+  /** A session is live: the widenings that waited for one are made now. */
+  protected abstract kickWidenings(): void;
+  protected abstract widenKeyspace(f: Follow): Promise<void>;
+  /** The token is refreshed in band before it expires (14 [CLI-68]). */
+  protected abstract armTokenRefresh(): void;
 
   /** The state of the connection for the sync status. */
   connection(): "live" | "connecting" | "offline" | "stopped" {
@@ -199,6 +235,8 @@ export abstract class SessionLayer extends SenderLayer {
       const ok = await this.syncKeyspace(f);
       if (!ok && !f.loaded) continue;
     }
+    // 14 [CLI-72]: a widening of the interest that waited for a session: its load, before the keyspace is followed with the new interest
+    for (const f of this.followList()) if (this.needsWidening(f)) await this.widenKeyspace(f);
     if (!this.running) return { kind: "clean" };
     const follows = this.followList().filter((f) => this.subscribable(f));
     const cursors: KeyspaceCursor[] = follows.map((f) => this.cursorOf(f));
@@ -206,6 +244,7 @@ export abstract class SessionLayer extends SenderLayer {
     const s = this.sess;
     s.abort = ac;
     s.state = "connecting";
+    this.onRuntimeChanged();
     s.closing = undefined;
     s.reconnectAfter = undefined;
     s.startedMono = this.clock.mono();
@@ -264,6 +303,7 @@ export abstract class SessionLayer extends SenderLayer {
       s.watchdog = undefined;
       s.state = "idle";
       s.id = "";
+      this.onRuntimeChanged();
       for (const f of this.followList()) {
         f.onSession = false;
         f.awaitingAdd = false;
@@ -288,16 +328,22 @@ export abstract class SessionLayer extends SenderLayer {
       keyspaceId: f.id,
       afterSeq: f.watermark,
       logEpoch: f.logEpoch,
+      interestPrefixes: [...f.interest],
       ...(useHash ? { afterRecordHash: f.lastRecordHash as Uint8Array } : {}),
     });
   }
 
   /** What follows the end of a session (09 [READ-57]): the attempt count, and the keyspaces that the session no longer follows. */
-  private onSessionEnded(end: SessionEnd, livedMs: number): void {
+  private async onSessionEnded(end: SessionEnd, livedMs: number): Promise<void> {
     const s = this.sess;
     if (livedMs >= SESSION_LIVE_RESET_MS) s.attempts = 0;
     else s.attempts++;
     for (const f of this.followList()) {
+      // 14 [CLI-56]: the time since the last successful sync of a keyspace counts from the end of the session that carried it
+      if (f.onSession) {
+        f.lastSyncMs = this.serverNow();
+        await this.persistHead(f, 0, true);
+      }
       f.onSession = false;
       f.resuming = false;
       f.awaitingAdd = false;
@@ -309,7 +355,7 @@ export abstract class SessionLayer extends SenderLayer {
       case "closing":
         break; // the holds were set when the frame came (14 [CLI-79])
       case "error":
-        this.onSessionError(end.error);
+        await this.onSessionError(end.error);
         break;
       default:
         break;
@@ -317,7 +363,7 @@ export abstract class SessionLayer extends SenderLayer {
   }
 
   /** The stream ended with a status, or a frame broke 02 [ARC-61] (A.7, 14 [CLI-50]). */
-  private onSessionError(error: unknown): void {
+  private async onSessionError(error: unknown): Promise<void> {
     if (error instanceof ProtocolViolation) {
       this.onProtocolViolation(error, error.keyspaces);
       return;
@@ -327,8 +373,8 @@ export abstract class SessionLayer extends SenderLayer {
     switch (error.status) {
       case "Unauthenticated":
         if (r?.details["cause"] === "SUBJECT_REVOKED") {
-          // TODO(14 [CLI-66], [CLI-79]): purge and quarantine
-          this.holdApp("SUBJECT_REVOKED", "SUBJECT_REVOKED");
+          // 14 [CLI-50], [CLI-79]: a revocation of the subject that reached a device that was offline or not connected: purge and quarantine
+          await this.onSubjectRevoked();
         } else this.noToken();
         break;
       case "PermissionDenied":
@@ -392,12 +438,15 @@ export abstract class SessionLayer extends SenderLayer {
       case "subscribed": {
         const s = this.sess;
         s.state = "live";
+        this.onRuntimeChanged();
         s.id = body.value.sessionId;
         s.hbMs = body.value.heartbeatIntervalMs > 0 ? body.value.heartbeatIntervalMs : 15_000;
         this.applyLimits(body.value.limits);
         // 14 Table 14.1: a Subscribe that succeeds clears the holds that waited for one
-        for (const kind of ["SESSION_CAP", "AUTHORIZER_UNAVAILABLE", "APP_SUSPENDED", "NO_TOKEN", "CLIENT_TOO_OLD"] as HoldKind[]) this.stopHold(kind);
+        for (const kind of ["SESSION_CAP", "AUTHORIZER_UNAVAILABLE", "APP_SUSPENDED", "NO_TOKEN", "CLIENT_TOO_OLD", "SUBJECT_REVOKED"] as HoldKind[]) this.stopHold(kind);
         this.armWatchdogFromSession();
+        this.armTokenRefresh();
+        this.kickWidenings();
         this.schedulePump();
         // the keyspaces added while connecting
         for (const f of this.followList()) if (f.loaded && !f.onSession && this.subscribable(f)) this.addToSession(f);
@@ -439,11 +488,13 @@ export abstract class SessionLayer extends SenderLayer {
     f.onSession = true;
     f.watermark = cur.afterSeq;
     f.resuming = false;
+    f.lastSyncMs = this.serverNow();
     this.schedulePump(); // the epoch is the one that the client follows: the keyspace may be sent to
     if (cur.afterSeq > f.state.seq) {
       f.state.setCursor(cur.afterSeq, f.logEpoch, f.state.manifestVersion);
+      await this.persistHead(f, 0, true);
       await this.afterCursorMoved(f);
-    }
+    } else await this.persistHead(f, 0, true);
   }
 
   /** The drop reasons of A.6 (14 [CLI-51], [CLI-52], [CLI-80], 15 [COMPAT-42]). */
@@ -456,15 +507,16 @@ export abstract class SessionLayer extends SenderLayer {
     const successors: SuccessorRule[] = [...d.successors];
     switch (d.reason) {
       case DropReason.GRANT_CHANGED:
-        // 14 [CLI-67]: stop following; the outbox stays; its actions get PERMISSION_DENIED when sent
+        // 14 [CLI-67]: stop following; the outbox stays; its actions get PERMISSION_DENIED when sent; the local copy stays or goes as the
+        // app's policy says
         f.stopped = "GRANT_CHANGED";
         await this.retireAtOnce(f);
+        await this.onCopyPolicy(f, "GRANT_CHANGED");
         return;
       case DropReason.ACCESS_REVOKED:
-        // TODO(14 [CLI-66], R/C3 §14.9): purge the purge list and quarantine the outbox; the client only holds the keyspace here
+        // 14 [CLI-66]: purge the purge list and quarantine the outbox
         f.stopped = "ACCESS_REVOKED";
-        this.holdKeyspace("ACCESS_REVOKED", "ACCESS_REVOKED", f.id);
-        await this.retireAtOnce(f);
+        await this.onAccessRevoked(f, "ACCESS_REVOKED");
         return;
       case DropReason.MOVED:
         f.stopped = "MOVED";
@@ -485,6 +537,7 @@ export abstract class SessionLayer extends SenderLayer {
         f.stopped = "ARCHIVED";
         await this.keyspaceEnded(f, KeyspaceLifecycle.ARCHIVED, successors);
         await this.retireAtOnce(f);
+        await this.onCopyPolicy(f, "ARCHIVED"); // 14 [CLI-77]: "On ARCHIVED, it keeps or purges it as the app's policy says"
         return;
       case DropReason.DELETED:
         f.stopped = "DELETED";
@@ -512,6 +565,9 @@ export abstract class SessionLayer extends SenderLayer {
 
   /** `DELETED` (14 [CLI-7], [CLI-83]): the actions of the keyspace end; one whose outcome cannot be learned is reported as outcome unknown. */
   private async keyspaceDeleted(f: Follow): Promise<void> {
+    // 14 [CLI-77]: the dead-letter and export entries that the keyspace has now are handed to the app once more and purged; the ones that
+    // the endings below write stay
+    const before = { deadLetters: [...this.deadLetters.values()].filter((d) => d.keyspaceId === f.id).map((d) => d.mutationId), exports: [...this.exports.values()].filter((x) => x.keyspaceId === f.id).map((x) => x.mutationId) };
     await this.retireAtOnce(f);
     for (const e of this.entriesOf(f.id)) {
       if (!this.entries.has(e.mutationId) || e.outcome !== undefined || this.ending.has(e.mutationId)) continue;
@@ -522,6 +578,7 @@ export abstract class SessionLayer extends SenderLayer {
         this.pollNow(e); // `GetMutationResult` answers from bindings alone, whatever the keyspace's state (07 [MUT-53])
       }
     }
+    await this.onKeyspaceDeletedPurge(f, before);
   }
 
   /** `Closing` (14 [CLI-79], A.8). */
@@ -533,8 +590,8 @@ export abstract class SessionLayer extends SenderLayer {
         if (!(await this.refreshOutsideQueue())) this.noToken();
         return;
       case CloseReason.SUBJECT_REVOKED:
-        // TODO(14 [CLI-66], [CLI-79]): purge the purge list and quarantine the outboxes of every keyspace of the subject
-        this.holdApp("SUBJECT_REVOKED", "SUBJECT_REVOKED");
+        // 14 [CLI-79]: purge the purge list and quarantine the outboxes of every keyspace of the subject; resume only with a new token
+        await this.onSubjectRevoked();
         return;
       case CloseReason.CLIENT_TOO_OLD:
         this.holdApp("CLIENT_TOO_OLD", "CLIENT_TOO_OLD");
@@ -567,7 +624,7 @@ export abstract class SessionLayer extends SenderLayer {
     this.wake();
   }
 
-  private addToSession(f: Follow): void {
+  protected addToSession(f: Follow): void {
     this.detach(this.addNow(f));
   }
 
@@ -649,6 +706,7 @@ export abstract class SessionLayer extends SenderLayer {
       added.push(nf);
     }
     // 09 [READ-70]: each successor is cold-loaded and added; on a live session at once, otherwise with the next session
+    if (added.length > 0) this.post(() => this.persistFollowed());
     for (const nf of added) this.kick(nf);
     if (added.length === 0) this.kick();
   }
@@ -703,6 +761,9 @@ export abstract class SessionLayer extends SenderLayer {
       return await this.run(async () => {
         try {
           const out = this.installLoad(f, pages, need.cause, need.resume);
+          // 14 [CLI-2]: a load that replaced the confirmed state begins the persisted replica anew
+          if (out.replaced) await this.persistBegin(f, pages);
+          else await this.persistHead(f, 30_000);
           f.loadFailures = 0;
           this.stopHold("PROTOCOL_ERROR", f.id);
           this.stopHold("HISTORY_DIVERGED", f.id);
@@ -740,9 +801,10 @@ export abstract class SessionLayer extends SenderLayer {
   }
 
   /** The pages of a load, one `checkpoint_seq` and one epoch (09 [READ-7]); a refused page token restarts the load (A.7). */
-  private async fetchLoad(f: Follow, resume: boolean): Promise<LoadStateResponse[]> {
+  protected async fetchLoad(f: Follow, resume: boolean, cursorInit?: { keyspaceId: string; interestPrefixes: string[] }): Promise<LoadStateResponse[]> {
     for (let restarts = 0; restarts < 3; restarts++) {
-      const cursor = create(KeyspaceCursorSchema, resume ? this.cursorFields(f) : { keyspaceId: f.id });
+      // 14 [CLI-71]: a load names the keyspace's interest; a widening load names only the prefixes that it adds ([CLI-72])
+      const cursor = create(KeyspaceCursorSchema, cursorInit ?? (resume ? this.cursorFields(f) : { keyspaceId: f.id, interestPrefixes: [...f.interest] }));
       const pages: LoadStateResponse[] = [];
       let token = "";
       try {
@@ -768,13 +830,13 @@ export abstract class SessionLayer extends SenderLayer {
     throw new RpcError("Unavailable", "the page tokens of the load kept expiring");
   }
 
-  private cursorFields(f: Follow): { keyspaceId: string; afterSeq: bigint; logEpoch: number; afterRecordHash?: Uint8Array } {
+  private cursorFields(f: Follow): { keyspaceId: string; afterSeq: bigint; logEpoch: number; interestPrefixes: string[]; afterRecordHash?: Uint8Array } {
     const useHash = f.lastRecordHash !== undefined && f.lastRecordSeq === f.watermark && f.watermark > 0n;
-    return { keyspaceId: f.id, afterSeq: f.watermark, logEpoch: f.logEpoch, ...(useHash ? { afterRecordHash: f.lastRecordHash as Uint8Array } : {}) };
+    return { keyspaceId: f.id, afterSeq: f.watermark, logEpoch: f.logEpoch, interestPrefixes: [...f.interest], ...(useHash ? { afterRecordHash: f.lastRecordHash as Uint8Array } : {}) };
   }
 
   /** A load that failed (A.7, 14 [CLI-50]). */
-  private onLoadError(f: Follow, e: unknown): void {
+  protected async onLoadError(f: Follow, e: unknown): Promise<void> {
     if (e instanceof ProtocolViolation) {
       this.onProtocolViolation(e, [f.id]);
       return;
@@ -800,7 +862,8 @@ export abstract class SessionLayer extends SenderLayer {
         else if (r?.code === Code.PERMISSION_DENIED) f.stopped = "GRANT_CHANGED";
         break;
       case "Unauthenticated":
-        this.noToken();
+        if (r?.details["cause"] === "SUBJECT_REVOKED") await this.onSubjectRevoked(); // 14 [CLI-50]
+        else this.noToken();
         break;
       case "Unimplemented":
         this.sess.fatal = true;

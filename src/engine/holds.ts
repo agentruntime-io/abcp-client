@@ -25,8 +25,7 @@ export type HoldKind =
   | "CONFLICT_WAIT"
   | "EPOCH_RESOLUTION"
   | "NO_TOKEN"
-  | "SUBJECT_REVOKED"
-  | "ACCESS_REVOKED";
+  | "SUBJECT_REVOKED";
 
 export type HoldScope = "lane" | "keyspace" | "app" | "action";
 

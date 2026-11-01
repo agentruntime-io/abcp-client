@@ -119,7 +119,8 @@ function viewBelow(st: ReplicaState, o: Overlay, top: Topology, key: string): Be
   }
   if (isHiddenBy(o, top, key)) return { present: false, value: new Uint8Array(0), isNull: false, touched: true, counter: null, encoding: "" };
   const row = st.key(key);
-  const touched = c !== undefined;
+  // an EARLIER pending action changed the key: `predict` has put the action that asks into the cell already (`pending`), which is no earlier one
+  const touched = c !== undefined && c.pending.length > 1;
   if (row === undefined) return { present: false, value: new Uint8Array(0), isNull: false, touched, counter: null, encoding: "" };
   return { present: true, value: row.value, isNull: row.state === StateNull, touched, counter: null, encoding: row.encoding };
 }

@@ -295,3 +295,18 @@ describe("14 [CLI-20] prediction is total", () => {
     expect(w.engine.internalErrors).toEqual([]);
   });
 });
+
+describe("14 [CLI-11] cas: an expectation by version (the default of the `cas` builder) is read from the confirmed state, and holds against the view below it", () => {
+  it("a pending CAS whose version is the confirmed one is predicted; one behind another pending action on the key is not, since that action's version does not exist yet", async () => {
+    const r = await rig();
+    r.server.write(KS, [kc("notes/n1", "set", "base")]);
+    await r.engine.settle();
+    await goOffline(r);
+    const first = await r.engine.submit({ keyspaceId: KS, opType: "CasSet", changes: [cas("notes/n1", "first")] }); // version 1: the confirmed one
+    expect(text(r.engine.view(KS).get("notes/n1")?.value)).toBe('"first"');
+    expect(r.engine.view(KS).get("notes/n1")?.predicted).toBe(true);
+    const second = await r.engine.submit({ keyspaceId: KS, opType: "CasSet", changes: [cas("notes/n1", "second")] }); // version 1 again: it depends on the first, and cannot hold behind it
+    expect(text(r.engine.view(KS).get("notes/n1")?.value)).toBe('"first"');
+    expect(r.engine.view(KS).get("notes/n1")?.pending).toEqual([first.mutationId, second.mutationId]);
+  });
+});

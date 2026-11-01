@@ -7,9 +7,17 @@
 // transaction) and [CLI-53] (the journal entry is written in the transaction that removes the retired action) need. An
 // IndexedDB or SQLite implementation maps `commit` to one transaction; `MemoryStorage` is the one for now.
 //
-// TODO(C3, 14 [CLI-59], [CLI-74]): one storage per principal and per server origin and app; the engine holds one.
+// One `OutboxStorage` is the storage of one **partition** (14 [CLI-59], [CLI-74]): the outbox, dead-letter store, journal,
+// export-hook entries, drafts and confirmed replica of one principal (or, in shared-device mode, one device) of one app on one
+// server origin. A `StorageProvider` (tabs.ts) opens it by its `PartitionKey`; every row of it is keyed by `keyspace_id` or
+// `mutation_id` inside the partition, so apps, servers and principals never share local data.
+//
+// The **persisted replica** (14 [CLI-2], §14.10) is kept per keyspace as the pages of the load that began it, exactly as the server
+// served them, and the records that the engine applied since: a restart installs the pages and folds the records again by the same
+// fold, so that the restored state is the state that the server's fold gives, whatever a Yjs library would encode (a client never
+// builds a CRDT base, 05 [STATE-74]).
 
-import type { Reject } from "../gen/abpc/v2/types_pb.js";
+import type { KeyEntry, Record as RecordMessage, Reject, SuccessorRule } from "../gen/abpc/v2/types_pb.js";
 import type { LaneName } from "./manifests.js";
 
 /** The author of an entry (14 [CLI-59]): the principal's issuer, subject and device. */
@@ -172,10 +180,53 @@ export interface RejectionRecord {
 export interface DraftEntry {
   keyspaceId: string;
   key: string;
+  /** The author of the draft (14 [CLI-59]). */
+  author?: Author;
   /** Yjs updates: the pending updates of the key that the reset ended, and the unsent edits. */
   updates: Uint8Array[];
   reason: string;
   atMs: number;
+}
+
+/**
+ * What a persisted replica keeps of a keyspace besides its keys (14 [CLI-1], [CLI-3], [CLI-71]): the cursor and epoch, the record hash
+ * for a verifiable resume (09 [READ-17]), the kind, lifecycle and successors, the interest, and the time of the last successful sync
+ * (14 [CLI-56]).
+ */
+export interface ReplicaHead {
+  logEpoch: number;
+  /** The confirmed cursor: the seq of the last record applied, or of the last delivery watermark (14 [CLI-3]). */
+  seq: bigint;
+  /** The delivery watermark from which the keyspace resumes (09 [READ-45]). */
+  watermark: bigint;
+  /** The `record_hash` of the last record applied, with its seq: the `after_record_hash` of the resume (09 [READ-17]). */
+  lastRecordHash?: Uint8Array;
+  lastRecordSeq: bigint;
+  manifestVersion: number;
+  kind: string;
+  /** A `KeyspaceLifecycle` value. */
+  lifecycle: number;
+  successors: SuccessorRule[];
+  /** The interest prefixes (14 [CLI-71]); empty is the whole keyspace. */
+  interest: string[];
+  /** The estimate of the server time of the last successful sync of the keyspace, in ms (14 [CLI-55], [CLI-56]). */
+  lastSyncMs: number;
+}
+
+/** The load that began a persisted replica: its pages as the server served them (09 §9.2). */
+export interface ReplicaBase {
+  manifestVersion: number;
+  logEpoch: number;
+  checkpointSeq: bigint;
+  entries: KeyEntry[];
+}
+
+/** The persisted replica of one keyspace (14 [CLI-2]): the pages of the load that began it, and the records applied since, in seq order. */
+export interface ReplicaImage {
+  keyspaceId: string;
+  head: ReplicaHead;
+  base: ReplicaBase;
+  tail: RecordMessage[];
 }
 
 export type StorageOp =
@@ -191,7 +242,20 @@ export type StorageOp =
   | { op: "ackRejection"; mutationId: string }
   | { op: "putDraft"; entry: DraftEntry }
   | { op: "deleteDraft"; keyspaceId: string; key: string }
-  | { op: "setMeta"; key: string; value: string | number | bigint };
+  | { op: "setMeta"; key: string; value: string | number | bigint }
+  // -- the persisted replica (14 [CLI-2], [CLI-74]) --
+  /** A load installed confirmed state: the image of the keyspace is the load's pages, with no tail. */
+  | { op: "replicaBegin"; keyspaceId: string; head: ReplicaHead; base: ReplicaBase }
+  /** Records were applied: they join the tail, and the head moves with them. */
+  | { op: "replicaAppend"; keyspaceId: string; head: ReplicaHead; records: RecordMessage[] }
+  /** Only the head moved (a delivery watermark, the time of a sync). */
+  | { op: "replicaHead"; keyspaceId: string; head: ReplicaHead }
+  /** A widening load (14 [CLI-72]) added entries for new interest prefixes to the pages. */
+  | { op: "replicaExtend"; keyspaceId: string; head: ReplicaHead; entries: KeyEntry[] }
+  /** Purges the replica of the keyspace (14 [CLI-66], [CLI-77]). */
+  | { op: "deleteReplica"; keyspaceId: string }
+  /** Removes everything of the partition (14 [CLI-65]: a sign-out in personal mode, a discard of a locked partition). */
+  | { op: "purgeAll" };
 
 export interface StoredState {
   entries: OutboxEntry[];
@@ -200,15 +264,28 @@ export interface StoredState {
   exports: ExportEntry[];
   rejections: RejectionRecord[];
   drafts: DraftEntry[];
+  replicas: ReplicaImage[];
   meta: Record<string, string | number | bigint>;
 }
 
 /** The names of the stores that a bound can fill (14 [CLI-84]). */
 export type StoreName = "outbox" | "deadLetters" | "journal" | "exports";
 
+/**
+ * The storage mode of the sync status (14 [CLI-21], [CLI-75]): `persisted` survives the process and the platform promised to keep it,
+ * `best-effort` survives the process but the platform may evict it (best-effort browser storage has no durability guarantee), and
+ * `memory` does not survive the process.
+ */
+export type StorageMode = "memory" | "best-effort" | "persisted";
+
 export interface OutboxStorage {
-  /** `durable` for a store that survives the process; `memory` is reported in the sync status (14 [CLI-21]). */
-  readonly mode: "memory" | "durable";
+  /** The storage mode, reported in the sync status (14 [CLI-21], [CLI-75]). It can change: a request for persistence can be granted. */
+  readonly mode: StorageMode;
+  /**
+   * Asks the platform to keep the storage (14 [CLI-75]: `navigator.storage.persist()` in a browser). Resolves whether it is kept now;
+   * the `mode` then says `persisted`. A platform with no such request leaves this out.
+   */
+  requestPersistence?(): Promise<boolean>;
   /** Everything stored, read once at start (14 [CLI-8]). */
   load(): Promise<StoredState>;
   /**

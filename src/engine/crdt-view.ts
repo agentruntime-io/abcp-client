@@ -507,6 +507,17 @@ export class CrdtStore {
     }
   }
 
+  /** Makes `doc` the confirmed document of a key that no view document is open on yet (a widening load, 14 [CLI-72]). */
+  setConfirmed(key: string, doc: Y.Doc): void {
+    const k = this.ensure(key);
+    if (k.view !== null) {
+      doc.destroy();
+      return;
+    }
+    k.confirmed.destroy();
+    k.confirmed = doc;
+  }
+
   /** Drops the documents of every key that the state no longer holds as a CRDT key that has a value (a delete, a subtree deletion, the redacted state). */
   reconcile(st: ReplicaState): string[] {
     const dropped: string[] = [];

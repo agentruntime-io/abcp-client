@@ -74,6 +74,12 @@ export abstract class ReactionLayer extends ReplicaLayer {
   /** The manifest version in force for the keyspace, as `LoadStateResponse.manifest_version` names it (14 Table 14.1, `UNKNOWN_OP_TYPE`). */
   protected abstract manifestVersionInForce(f: Follow): Promise<number>;
   protected abstract kick(f?: Follow): void;
+  /** The subject is revoked (`Closing{SUBJECT_REVOKED}`, or the `Unauthenticated` detail): purge and quarantine (14 [CLI-79], [CLI-50]). */
+  protected abstract onSubjectRevoked(): Promise<void>;
+  /** A call failed with the revocation detail: the subject is revoked, whatever the call was (14 [CLI-50]). */
+  protected abstract noteRevoked(error: unknown): boolean;
+  /** The app gave a new token while a session is live: the session is told in band (14 [CLI-68]). */
+  protected abstract afterTokenRefreshed(): void;
 
   // ---------------------------------------------------------------------------------------------------------------------
   // Persisting and scheduling
@@ -197,7 +203,8 @@ export abstract class ReactionLayer extends ReplicaLayer {
         let resp;
         try {
           resp = await this.transport.getMutationResult({ $typeName: "abpc.v2.GetMutationResultRequest", keyspaceId: e.keyspaceId, mutationId: e.mutationId });
-        } catch {
+        } catch (err) {
+          this.noteRevoked(err); // 14 [CLI-50]: the detail of a revoked subject, on whatever call it comes
           await this.run(() => {
             if (this.entries.has(e.mutationId)) this.startPoll(e, undefined);
           });
@@ -513,7 +520,7 @@ export abstract class ReactionLayer extends ReplicaLayer {
   /** Arms the next probe of a hold: a resend, a poll, a re-add, with the hold backoff ([CLI-45]). */
   protected armProbe(h: Hold): void {
     this.probeTimers.get(h.key)?.();
-    if (h.kind === "UPGRADE_REQUIRED" || h.kind === "CONFLICT_WAIT" || h.kind === "ACCESS_REVOKED" || h.kind === "CLIENT_TOO_OLD" || h.kind === "SUBJECT_REVOKED") {
+    if (h.kind === "UPGRADE_REQUIRED" || h.kind === "CONFLICT_WAIT" || h.kind === "CLIENT_TOO_OLD") {
       this.probeTimers.delete(h.key);
       return; // nothing is sent; the hold clears when the SDK is upgraded, or ends at its bound
     }
@@ -564,12 +571,15 @@ export abstract class ReactionLayer extends ReplicaLayer {
         }
         break;
       case "NO_TOKEN":
+      case "SUBJECT_REVOKED":
+        // a revoked subject resumes only with a new token (09 [READ-60]): the app is asked for one with the hold backoff, as for NO_TOKEN
         this.advanceProbe(h);
         this.detach(
           (async () => {
             const ok = await this.refreshToken();
             await this.run(() => {
-              if (ok) this.stopHold("NO_TOKEN");
+              if (ok) this.stopHold("NO_TOKEN"); // a revoked subject's hold ends with the `Subscribed` that a new token gets
+              if (ok) this.afterTokenRefreshed();
               this.reconnectNow();
             });
           })(),

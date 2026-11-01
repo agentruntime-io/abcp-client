@@ -6,6 +6,7 @@ import { CasExpectSchema, ChangeKind, KeyChangeSchema, PreconditionSchema, type 
 import { Lane } from "../gen/abpc/v2/types_pb.js";
 import { MutationSchema, type Mutation } from "../gen/abpc/v2/sync_pb.js";
 import { isReservedKey, type Rule } from "../rules/fold/index.js";
+import { checkJsonV1Bytes } from "./changes.js";
 import { LocalRefusal } from "./errors.js";
 import type { EngineManifest, OpTypeInfo } from "./manifests.js";
 import type { ActionInput, ChangeInput, PreconditionInput } from "./types.js";
@@ -134,6 +135,16 @@ export function checkAction(m: Mutation, manifest: EngineManifest, op: OpTypeInf
     seen.add(c.key);
     if (c.kind === ChangeKind.UNSPECIFIED) return `change of key "${c.key}" has no kind`;
     if (c.value.length > limits.maxValueBytes || c.update.length > limits.maxValueBytes) return `the value of key "${c.key}" is larger than max_value_bytes`;
+    // 14 [CLI-22], 05 [STATE-7]: a json/v1 value is valid json/v1 in the RFC 8785 canonical form, which the server requires (`not-canonical`);
+    // the app's own bytes are checked as the writer of `changes.ts` checks its own
+    if ((c.kind === ChangeKind.SET || c.kind === ChangeKind.CAS || (c.kind === ChangeKind.OVERRIDE && c.update.length === 0)) && !c.isNull && c.encoding === "json/v1") {
+      const why = checkJsonV1Bytes(c.value);
+      if (why !== undefined) return `the value of key "${c.key}" is not a valid json/v1 value (14 [CLI-22]): ${why}`;
+    }
+    if (c.expected?.expect.case === "value") {
+      const why = checkJsonV1Bytes(c.expected.expect.value);
+      if (why !== undefined) return `the expected value of key "${c.key}" is not a valid json/v1 value (14 [CLI-22]): ${why}`;
+    }
     // SPEC-QUESTION: 07 Table 7-2 item 3 and [MUT-18], which the Go server flags (SPEC-QUESTIONS Q15.1, Q15.2): the form of an `OVERRIDE`
     // of a reserved key (is it judged as a key that matches no template, which needs `encoding`, or excepted and left to sub-step 4?),
     // and which code a mixed or reason-less override action gets. This engine authors no override-only action (12 §12.8 is an admin

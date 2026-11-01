@@ -12,12 +12,12 @@
 import { type RecordsFrame, type HeartbeatFrame, type LoadStateResponse, type LaneWatermark } from "../gen/abpc/v2/sync_pb.js";
 import { Code, ErrorClass, Lane, RecordKind, ChangeKind, DecisionStatus, type KeyChange, type KeyEntry, type Record as RecordMessage, type Reject, type SuccessorRule, KeyspaceLifecycle } from "../gen/abpc/v2/types_pb.js";
 import { makeReject, sameBytes } from "./endings.js";
-import { applyRecord, FoldError, installEntry, ReplicaState, StateValue } from "../rules/fold/index.js";
+import { FoldError, installEntry, ReplicaState, StateValue, type Anomaly } from "../rules/fold/index.js";
 import { matchSuccessor } from "./successors.js";
 import { BoundedSet } from "./bounded.js";
 import { ProtocolViolation } from "./errors.js";
-import { EndingLayer } from "./endings.js";
-import { appliedIndexes, planCrdt, type CrdtPlanItem } from "./crdt-view.js";
+import { ReplicaStoreLayer } from "./replica-store.js";
+import { appliedIndexes, type CrdtPlanItem } from "./crdt-view.js";
 import type { Follow } from "./follow.js";
 import { canDecode } from "./overlay.js";
 import type { OutboxEntry, StoredOutcome, Verdict } from "./storage.js";
@@ -32,7 +32,7 @@ export interface LoadOutcome {
   previousEpoch: number;
 }
 
-export abstract class ReplicaLayer extends EndingLayer {
+export abstract class ReplicaLayer extends ReplicaStoreLayer {
   /** The mutation ids for which `overwritten` was emitted, so that a record delivered again emits none (14 [CLI-40]). */
   protected readonly overwrittenSeen = new BoundedSet<string>(1024);
   /** The pending actions whose REJECTED DECISION a frame carried: their final rejection is handled after the frame is applied. */
@@ -95,8 +95,11 @@ export abstract class ReplicaLayer extends EndingLayer {
     f.lifecycle = first.lifecycle === KeyspaceLifecycle.UNSPECIFIED ? KeyspaceLifecycle.ACTIVE : first.lifecycle;
     f.successors = [...first.successors];
     if (first.resumed) {
-      // 09 [READ-17]: the client resumes the tail from its cursor
-      f.watermark = f.seq;
+      // 09 [READ-17]: the client resumes the tail from its cursor: from the watermark that it asked about (the cursor, but after a widening
+      // that re-added the keyspace below it, 14 [CLI-72])
+      f.watermark = first.checkpointSeq;
+      f.needsLoad = undefined;
+      f.lastSyncMs = this.serverNow();
       this.noteWatermarks(first.laneWatermarks);
       f.invalidate();
       return { replaced: false, epochChanged: false, previousEpoch };
@@ -128,6 +131,10 @@ export abstract class ReplicaLayer extends EndingLayer {
 
     f.state = st;
     f.loaded = true;
+    f.purged = false;
+    f.outside.clear(); // the versions of keys outside the interest that were loaded belong to the state that was replaced
+    f.revoked = false;
+    f.lastSyncMs = this.serverNow();
     f.watermark = first.checkpointSeq;
     f.lastRecordHash = undefined;
     f.lastRecordSeq = 0n;
@@ -229,16 +236,24 @@ export abstract class ReplicaLayer extends EndingLayer {
     }
     f.resuming = false;
     this.capturePredictions(f);
+    const applied: RecordMessage[] = [];
     for (const rec of frame.records) {
       if (rec.logEpoch !== f.logEpoch) {
         this.onEpochMismatch(f);
         return;
       }
-      const ok = await this.applyOne(f, rec);
-      if (!ok) return;
+      const ok = await this.applyOne(f, rec, applied);
+      if (!ok) {
+        await this.persistRecords(f, applied); // the records before the one that stopped are applied: they are persisted as they are
+        return;
+      }
     }
     if (frame.cursor > f.watermark) f.watermark = frame.cursor;
     if (frame.cursor > f.state.seq) f.state.setCursor(frame.cursor, f.logEpoch, f.state.manifestVersion);
+    f.lastSyncMs = this.serverNow();
+    // 14 [CLI-2]: the records join the persisted replica before the actions that they retire leave the outbox, so that a restart never
+    // finds an action retired whose record it has not got
+    await this.persistRecords(f, applied);
     await this.afterCursorMoved(f);
     const rejects = this.rejectedByRecord;
     this.rejectedByRecord = [];
@@ -249,13 +264,12 @@ export abstract class ReplicaLayer extends EndingLayer {
   }
 
   /** Applies one record; returns false when the keyspace stopped. */
-  private async applyOne(f: Follow, rec: RecordMessage): Promise<boolean> {
+  private async applyOne(f: Follow, rec: RecordMessage, applied: RecordMessage[]): Promise<boolean> {
     const st = f.state;
-    // 09 [READ-42]: every record touches the interest; a watermark that passes seqs the client does not hold says they do not
-    if (rec.seq > st.seq + 1n) st.setCursor(rec.seq - 1n, f.logEpoch, st.manifestVersion);
-    const plan: CrdtPlanItem[] = planCrdt(st, this.manifests, rec);
+    let plan: CrdtPlanItem[];
+    let anomalies: Anomaly[];
     try {
-      applyRecord(st, this.manifests, rec, { supported: (feature) => this.features.includes(feature) });
+      ({ plan, anomalies } = this.foldRecord(f, rec));
     } catch (e) {
       if (e instanceof FoldError) {
         if (e.stop) {
@@ -269,9 +283,8 @@ export abstract class ReplicaLayer extends EndingLayer {
       }
       throw e;
     }
-    // the confirmed documents of the CRDT keys that the record changed ([CLI-13])
-    f.crdt.apply(plan);
-    f.crdt.reconcile(st);
+    applied.push(rec);
+    if (anomalies.length > 0) this.noteAnomalies(f, rec.seq, anomalies);
     if (rec.recordHash.length > 0) {
       f.lastRecordHash = rec.recordHash;
       f.lastRecordSeq = rec.seq;
@@ -279,6 +292,16 @@ export abstract class ReplicaLayer extends EndingLayer {
     if (rec.serverTime !== undefined) this.observeServerTime(Number(rec.serverTime.seconds) * 1000 + Math.floor(rec.serverTime.nanos / 1e6));
     this.recordBookkeeping(f, rec, plan);
     return true;
+  }
+
+  /**
+   * The changes that a record carried and that their kind does not define (06 [LOG-41]) are counted per keyspace and reported to the app
+   * (02 [ARC-46]): the engine handles them as 14 [CLI-5] says, with `skipped`, and they count among the skipped changes of the sync status.
+   */
+  private noteAnomalies(f: Follow, seq: bigint, anomalies: readonly Anomaly[]): void {
+    f.anomalies += anomalies.length;
+    this.skippedChanges += anomalies.length;
+    this.emit({ type: "skipped", keyspaceId: f.id, seq, keys: anomalies.map((a) => a.key), cause: "ANOMALY", anomalies: anomalies.map((a) => ({ index: a.index, key: a.key, rule: a.rule, detail: a.detail })) });
   }
 
   /** The events and the matching of a record that the fold applied: `skipped`, `overwritten`, the pending action that it carries. */
@@ -391,6 +414,7 @@ export abstract class ReplicaLayer extends EndingLayer {
   protected retiresOnStop(f: Follow, e: OutboxEntry): boolean | undefined {
     switch (f.stopped) {
       case "ACCESS_REVOKED":
+      case "SUBJECT_REVOKED":
       case "GRANT_CHANGED":
       case "ARCHIVED":
       case "DELETED":
@@ -445,13 +469,15 @@ export abstract class ReplicaLayer extends EndingLayer {
     for (const c of hb.cursors) {
       listed.add(c.keyspaceId);
       const f = this.follows.get(c.keyspaceId);
-      if (f === undefined || !f.loaded || !f.onSession || f.stopped !== undefined || f.frozen !== undefined) continue;
+      if (f === undefined || !f.loaded || !f.onSession || f.stopped !== undefined || f.frozen !== undefined || f.resuming) continue; // a resuming keyspace chains from its own cursor
       if (c.logEpoch !== f.logEpoch) continue;
+      f.lastSyncMs = this.serverNow();
       if (c.cursorSeq > f.watermark) f.watermark = c.cursorSeq;
       if (c.cursorSeq > f.state.seq) {
         f.state.setCursor(c.cursorSeq, f.logEpoch, f.state.manifestVersion);
+        await this.persistHead(f, 30_000, true);
         await this.afterCursorMoved(f);
-      }
+      } else await this.persistHead(f);
     }
     // 09 [READ-54]: a followed keyspace that a heartbeat does not list is removed from the session
     for (const f of this.follows.values()) {

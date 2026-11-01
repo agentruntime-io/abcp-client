@@ -33,18 +33,7 @@ describe("14 [CLI-79] Closing", () => {
     expect(w.engine.status().connection).toBe("offline");
   });
 
-  it("SUBJECT_REVOKED: the client sends nothing and keeps every outbox entry (TODO: purge and quarantine, 14 [CLI-66])", async () => {
-    const r = await rig();
-    const a = await r.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/a", 1)] });
-    await r.engine.settle();
-    r.server.closeSessions(CloseReason.SUBJECT_REVOKED, "PermissionDenied");
-    await r.engine.settle();
-    const b = await r.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/b", 1)] });
-    await tick(r, 600_000);
-    expect(sentIds(r)).toEqual([a.mutationId]);
-    expect(r.engine.outbox().map((e) => e.mutationId)).toEqual([b.mutationId]);
-    expect(r.engine.status().holds).toEqual([expect.objectContaining({ scope: "app", code: "SUBJECT_REVOKED" })]);
-  });
+  // SUBJECT_REVOKED purges and quarantines (14 [CLI-79], [CLI-66]): test/engine-revocation.test.ts
 
   it("UNSPECIFIED, or a reason that the client does not know, is a dead session: resumed with backoff, every outbox entry kept", async () => {
     const r = await rig();
@@ -142,7 +131,7 @@ describe("14 [CLI-80] and 09 §9.6: the session and the drop reasons", () => {
     await goOffline(r);
     const a = await r.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/q", 1)] });
     r.server.write(KS, [kc("settings/c", "set", 1)]);
-    r.server.prune(KS, 3n); // the cursor (2) is below the prune floor
+    r.server.prune(KS, 3n, { judgeHorizon: false }); // the cursor (2) is below the prune floor (the records are young: the horizon is not what this test is about)
     await goOnline(r);
     await tick(r, 3000);
     const load = r.server.calls.filter((c) => c.method === "loadState").at(-1)?.request as { cursor: { afterSeq: bigint } };
@@ -166,9 +155,8 @@ describe("14 [CLI-80] and 09 §9.6: the session and the drop reasons", () => {
     r.server.write(KS, [kc("settings/later", "set", 1)]);
     await r.engine.settle();
     expect(r.engine.confirmed(KS).has("settings/later")).toBe(false); // no longer followed
-    const b = await r.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/b", 1)] });
-    await r.engine.settle();
-    expect(sentIds(r)).toContain(b.mutationId); // the outbox stays; it is sent, and the server answers it (PERMISSION_DENIED when the grant is gone)
+    // 14 [CLI-69]: nothing is authored into a keyspace that the engine no longer follows (the entries that were queued stay: test/engine-revocation.test.ts)
+    await expect(r.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/b", 1)] })).rejects.toMatchObject({ code: "NOT_FOLLOWED" });
   });
 
   it("NOT_FOUND: the queued actions are held as for KEYSPACE_NOT_FOUND, and the keyspace is added again with the hold backoff", async () => {

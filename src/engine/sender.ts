@@ -46,6 +46,11 @@ export abstract class SenderLayer extends ReactionLayer {
       // 14 [CLI-69]: an action is authored only into a keyspace that the engine follows
       if (f === undefined) throw new LocalRefusal("NOT_FOLLOWED", `the keyspace ${input.keyspaceId} is not followed`);
       if (!f.loaded) throw new LocalRefusal("NOT_FOLLOWED", `the keyspace ${input.keyspaceId} is not loaded yet`);
+      // 14 [CLI-69]: no action is authored into a keyspace that the engine cannot read: one that it no longer follows because of a revocation, a
+      // change of grants or a deletion, or whose local copy was purged
+      if (f.purged || f.stopped === "ACCESS_REVOKED" || f.stopped === "SUBJECT_REVOKED" || f.stopped === "GRANT_CHANGED" || f.stopped === "DELETED") {
+        throw new LocalRefusal("NOT_FOLLOWED", `the keyspace ${input.keyspaceId} is not followed (${f.stopped ?? "purged"})`);
+      }
       const version = f.state.manifestVersion;
       const manifest = this.manifests.get(version);
       if (manifest === undefined) throw new LocalRefusal("INVALID", `the manifest version ${version} is not loaded`);
@@ -62,7 +67,8 @@ export abstract class SenderLayer extends ReactionLayer {
         loaded: f.loaded,
         seq: f.state.seq,
         logEpoch: f.state.logEpoch,
-        versionOf: (key: string): bigint => f.state.effectiveVersion(top, key), // 14 [CLI-17]: tombstones included
+        // 14 [CLI-17]: tombstones included; 14 [CLI-73]: a key outside the interest that the app loaded has the version that the load showed
+        versionOf: (key: string): bigint => f.outside.get(key) ?? f.state.effectiveVersion(top, key),
         manifestVersion: version,
       };
       const m = buildMutation(input, id, op, facts, this.clock.now());
@@ -497,8 +503,18 @@ export abstract class SenderLayer extends ReactionLayer {
     switch (status) {
       case "Unauthenticated": {
         if (detail?.reject?.details["cause"] === "SUBJECT_REVOKED") {
-          // TODO(14 [CLI-66], [CLI-79], R/C3 §14.9): purge and quarantine as for Closing{SUBJECT_REVOKED}; here the client only stops
-          this.holdApp("SUBJECT_REVOKED", "SUBJECT_REVOKED");
+          // 14 [CLI-50]: the client MUST NOT resend, and purges and quarantines as for `Closing{SUBJECT_REVOKED}` ([CLI-79]). The request was
+          // refused by authentication before it was read, so an action that this was the first send of was never processed: it counts as
+          // never sent, and is quarantined as an action that was never sent is
+          for (const e of live) {
+            if (e.outcome === undefined && e.lastResult === undefined && e.attempts === 0 && !e.registered) {
+              e.everSent = false;
+              e.sentInEpoch = 0;
+              this.markDirty(e);
+            }
+          }
+          await this.flushDirty();
+          await this.onSubjectRevoked();
           return;
         }
         // 14 [CLI-50]: refresh the token, then resend once; a second Unauthenticated for the request stops it (the hold NO_TOKEN)
