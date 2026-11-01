@@ -189,14 +189,37 @@ describe("14 [CLI-13] a confirmed document and a view document", () => {
 });
 
 describe("14 [CLI-13] no insert, delete or format bound falls between the two code units of a surrogate pair", () => {
-  it("moves the bound to the code point boundary", () => {
-    const s = "a😀b"; // "a", the pair at 1 and 2, "b"
-    expect(snapToCodePoint(s, 2, true)).toBe(1);
-    expect(snapToCodePoint(s, 2, false)).toBe(3);
-    expect(snapToCodePoint(s, 1, true)).toBe(1);
-    expect(snapToCodePoint(s, 3, false)).toBe(3);
-    expect(snapToCodePoint(s, 0, true)).toBe(0);
-    expect(snapToCodePoint(s, s.length, false)).toBe(s.length);
+  it("moves every bound to the boundary before the pair (draft 14: the start of a delete, its end and the position of an insert alike)", () => {
+    const s = "a\u{1F600}b"; // "a", the pair at 1 and 2, "b"
+    expect(snapToCodePoint(s, 2)).toBe(1); // between the two units: before the pair
+    expect(snapToCodePoint(s, 1)).toBe(1);
+    expect(snapToCodePoint(s, 3)).toBe(3);
+    expect(snapToCodePoint(s, 0)).toBe(0);
+    expect(snapToCodePoint(s, s.length)).toBe(s.length);
+    expect(snapToCodePoint("\ude00x", 1)).toBe(1); // a lone low unit is no pair
+    expect(snapToCodePoint("\ud83dx", 1)).toBe(1); // a lone high unit is no pair
+  });
+
+  it("a re-applied edit that starts inside a pair replaces the whole pair and keeps it whole: the inserted text begins with the unit that the start gave up", async () => {
+    const r = await rig();
+    writeRemote(r, remoteEdit(r, (t) => t.insert(0, "a\u{1F600}b")));
+    await r.engine.settle();
+    const h = r.engine.crdt(KS, KEY);
+    r.server.inject("mutate", { kind: "result", recorded: true, result: (m) => rejectResult(m, mk(Code.SCHEMA_INVALID)) });
+    h.doc.getText("text").insert(4, "Z"); // after the "b"; rejected, so the view is rebuilt and the edits that are in no action yet are re-applied
+    await h.flush("DocEdit");
+    // the user's unsent edit replaces the character U+1F600 by U+1F601 (Yjs never splits the pair itself): the two share their high unit, so the
+    // difference of the two texts, which counts UTF-16 units, starts at 2, inside the pair
+    h.doc.getText("text").delete(1, 2);
+    h.doc.getText("text").insert(1, "\u{1F601}");
+    await r.engine.settle();
+    const t = textOf(h.doc);
+    for (let i = 0; i < t.length; i++) {
+      const c = t.charCodeAt(i);
+      if (c >= 0xd800 && c <= 0xdbff) expect(t.charCodeAt(i + 1) >= 0xdc00 && t.charCodeAt(i + 1) <= 0xdfff).toBe(true);
+      if (c >= 0xdc00 && c <= 0xdfff) expect(t.charCodeAt(i - 1) >= 0xd800 && t.charCodeAt(i - 1) <= 0xdbff).toBe(true);
+    }
+    expect(t).toBe("a\u{1F601}b"); // the edit was re-applied, whole
   });
 
   it("the re-applied diff of a rebuild never splits a pair", async () => {

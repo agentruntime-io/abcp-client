@@ -498,6 +498,7 @@ export class Engine extends TabLayer {
       storageMode: this.storage.mode,
       fullStores: rt?.fullStores ?? this.storage.full(),
       connection: this.role === "follower" ? (rt?.connection ?? "offline") : this.connection(),
+      subscribeRetry: this.role === "follower" ? rt?.subscribeRetry : this.subscribeRetry(),
       suspended: rt?.suspended ?? this.holds.all().some((h) => h.kind === "APP_SUSPENDED"),
       holds: rt?.holds ?? this.holds.info(),
       pendingCalls: this.callsWaiting(),

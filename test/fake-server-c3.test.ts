@@ -266,3 +266,109 @@ describe("07 [MUT-84], [MUT-89] the offline horizon", () => {
     expect(ok.results[0]?.outcome.case).toBe("appended");
   });
 });
+
+describe("draft 14: the answers that the text changed (07 [MUT-7], 09 [READ-4], [READ-22], [READ-65], 03 [ID-40])", () => {
+  const CLIENT = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  const mutation = (ks: string, lane: Lane, seq: number, key: string, n: number): ReturnType<typeof create<typeof MutationSchema>> =>
+    create(MutationSchema, {
+      mutationId: `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`,
+      keyspaceId: ks,
+      opType: lane === Lane.GATED ? "Approve" : "Set",
+      lane,
+      clientId: CLIENT,
+      clientSeq: BigInt(seq),
+      changes: [create(KeyChangeSchema, { key, kind: ChangeKind.SET, value: jsonBytes(1), encoding: "json/v1" })],
+    });
+
+  it("07 [MUT-7]: the lane watermarks of a `Mutate` answer, of a load and of a heartbeat are in increasing order of (keyspace_id, lane), the ids compared in bytes, the lane by its enum number", async () => {
+    const { server, ana } = setup();
+    // the request names ks2 before ks1, and the GATED lane before the SEQUENCED one
+    const resp = await ana.mutate(
+      create(MutateRequestSchema, {
+        mutations: [mutation("ks2", Lane.GATED, 1, "settings/a", 1), mutation("ks2", Lane.SEQUENCED, 1, "settings/b", 2), mutation(KS, Lane.GATED, 1, "settings/c", 3), mutation(KS, Lane.SEQUENCED, 1, "settings/d", 4)],
+      }),
+    );
+    expect(resp.watermarks.map((w) => `${w.keyspaceId}/${w.lane}`)).toEqual([`ks1/${Lane.SEQUENCED}`, `ks1/${Lane.GATED}`, `ks2/${Lane.SEQUENCED}`, `ks2/${Lane.GATED}`]);
+    const load = await ana.loadState(create(LoadStateRequestSchema, { cursor: create(KeyspaceCursorSchema, { keyspaceId: KS }), clientId: CLIENT }));
+    expect(load.laneWatermarks.map((w) => w.lane)).toEqual([Lane.SEQUENCED, Lane.GATED]);
+    const ac = new AbortController();
+    const frames: SubscribeResponse[] = [];
+    void (async () => {
+      try {
+        for await (const f of ana.subscribe(create(SubscribeRequestSchema, { keyspaces: ["ks2", KS].map((id) => create(KeyspaceCursorSchema, { keyspaceId: id, logEpoch: 1 })), clientId: CLIENT }), { signal: ac.signal })) frames.push(f);
+      } catch {
+        // the abort ends the stream
+      }
+    })();
+    await flush();
+    await flush();
+    server.heartbeat();
+    await flush();
+    const hb = frames.find((f) => f.frame.case === "heartbeat");
+    expect(hb?.frame.case === "heartbeat" ? hb.frame.value.laneWatermarks.map((w) => `${w.keyspaceId}/${w.lane}`) : []).toEqual([`ks1/${Lane.SEQUENCED}`, `ks1/${Lane.GATED}`, `ks2/${Lane.SEQUENCED}`, `ks2/${Lane.GATED}`]);
+    ac.abort();
+  });
+
+  it("09 [READ-65], 03 [ID-40]: the epoch of a cursor is judged only when after_seq > 0, and a cursor epoch of 0 matches no epoch", async () => {
+    const { server, ana } = setup();
+    server.write(KS, [kc("settings/x", "set", 1)]);
+    const fresh = open(ana, [{ id: KS, after: 0n, epoch: 0 }]);
+    await flush();
+    expect(controls(fresh.frames).filter((c) => c.startsWith("added:") || c.startsWith("dropped:"))).toEqual(["added:ks1::0"]); // after_seq = 0: the epoch is not judged
+    fresh.abort();
+    const resumed = open(ana, [{ id: KS, after: 1n, epoch: 0 }]);
+    await flush();
+    expect(controls(resumed.frames).filter((c) => c.startsWith("added:") || c.startsWith("dropped:"))).toEqual([`dropped:ks1:${8}`]); // EPOCH_CHANGED
+    resumed.abort();
+  });
+
+  it("09 [READ-22]: a `KeyspaceAdded` echoes the prefixes as sent, a repeated one included, in the order sent", async () => {
+    const { ana } = setup();
+    const a = open(ana, [{ id: KS, interest: ["settings", "issues", "settings"] }]);
+    await flush();
+    expect(controls(a.frames).find((c) => c.startsWith("added:"))).toContain("added:ks1:settings,issues,settings");
+    a.abort();
+  });
+
+  it("09 [READ-4], [READ-62], [READ-35]: the identity check of a client_id comes before the sessions cap, which comes last; a call that the cap refuses binds nothing", async () => {
+    const clock = new ManualClock();
+    const server = new FakeServer({ manifests: new StaticManifests(MANIFEST), clock, maxSessions: 1 });
+    server.createKeyspaceNow(KS);
+    const ana = server.transport(server.principal("ana"));
+    const bob = server.transport(server.principal("bob"));
+    const [C1, C2, C3] = ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333"];
+    const subscribe = (t: FakeTransport, clientId: string): { frames: SubscribeResponse[]; end: Promise<unknown>; abort: () => void } => {
+      const ac = new AbortController();
+      const frames: SubscribeResponse[] = [];
+      const end = (async (): Promise<unknown> => {
+        try {
+          for await (const f of t.subscribe(create(SubscribeRequestSchema, { keyspaces: [create(KeyspaceCursorSchema, { keyspaceId: KS, logEpoch: 1 })], clientId }), { signal: ac.signal })) frames.push(f);
+          return "clean";
+        } catch (e) {
+          return e;
+        }
+      })();
+      return { frames, end, abort: () => ac.abort() };
+    };
+    const a1 = subscribe(ana, C1); // ana's one session: C1 is bound to ana
+    const b1 = subscribe(bob, C2); // bob's one session: C2 is bound to bob
+    await flush();
+    await flush();
+    // bob names C1, bound to ana, and is at the cap too: the identity check is the first that fails
+    const mismatch = await subscribe(bob, C1).end;
+    expect(mismatch).toBeInstanceOf(RpcError);
+    expect(mismatch).toMatchObject({ status: "PermissionDenied", reject: { code: Code.ACTOR_MISMATCH } });
+    // bob names a new client_id and is at the cap: the sessions cap refuses, and binds nothing
+    const capped = await subscribe(bob, C3).end;
+    expect(capped).toMatchObject({ status: "ResourceExhausted", reject: { code: Code.QUOTA_EXCEEDED } });
+    a1.abort();
+    b1.abort();
+    await flush();
+    await flush();
+    const a2 = subscribe(ana, C3); // C3 is not bound to bob: ana binds it
+    await flush();
+    await flush();
+    expect(a2.frames.some((f) => f.frame.case === "control" && f.frame.value.control.case === "subscribed")).toBe(true);
+    a2.abort();
+  });
+});

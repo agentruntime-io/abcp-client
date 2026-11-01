@@ -19,7 +19,7 @@ import { codeName } from "./codes.js";
 import { dependsOn, encodeContent, keysWritten, stamped, type DepView } from "./entry.js";
 import { makeReject } from "./endings.js";
 import { newUuid } from "./ids.js";
-import { LocalRefusal, ProtocolViolation, RpcError, StorageError } from "./errors.js";
+import { LocalRefusal, ProtocolViolation, RpcError, StorageError, storageCauseOf } from "./errors.js";
 import type { Follow } from "./follow.js";
 import type { Hold } from "./holds.js";
 import { ReactionLayer } from "./reactions.js";
@@ -135,7 +135,7 @@ export abstract class SenderLayer extends ReactionLayer {
       try {
         await this.tx([this.putOp(entry), { op: "setMeta", key: "nextOrdinal", value: this.nextOrdinal + 1 }]);
       } catch (e) {
-        throw new LocalRefusal("STORAGE", e instanceof Error ? e.message : String(e));
+        throw new LocalRefusal("STORAGE", e instanceof Error ? e.message : String(e), storageCauseOf(e));
       }
       this.nextOrdinal++;
       this.entries.set(id, entry);
@@ -254,13 +254,11 @@ export abstract class SenderLayer extends ReactionLayer {
         }
       }
       // slots are assigned in this order, so that they are contiguous ([CLI-27])
-      // SPEC-QUESTION (ruled, Q42.1: the text decides reading A; round 16 words [CLI-63] to say so): 14 [CLI-63] says that a re-stamp gives "fresh `client_seq` values from 1 ([CLI-27]), in authoring order", and
-      // [CLI-33] that "a client MUST send an action that has no unresolved dependency without waiting for unrelated actions".
-      // Reading A (taken): the slots go in authoring order among the actions that can be sent now; an action that waits for a dependency
-      // takes its slot when it is first sent ([CLI-27]), after unrelated later actions, so it never holds them up. Reading B: every
-      // pending SEQUENCED action is stamped in authoring order at once; an unrelated later action then has a slot above the one of an
-      // earlier action that waits for its dependency, is answered OUT_OF_ORDER, and waits for that action: [CLI-33] broken. The two
-      // differ only when an earlier action is blocked and a later one is not.
+      // 14 [CLI-63] (draft 14, Q42.1): "an action never sent takes its first slot when it is first sent ([CLI-27])", and a re-stamp, which gives the actions
+      // that were sent "fresh `client_seq` values from 1, in authoring order", touches only those (`reidentify`). So the slots of the actions that can be
+      // sent now go in authoring order, and an action that waits for a dependency takes its slot when it is first sent, after unrelated later actions:
+      // [CLI-33], "a client MUST send an action that has no unresolved dependency without waiting for unrelated actions", is met, and no later action
+      // holds a slot above that of an earlier one that waits and is answered OUT_OF_ORDER.
       for (const e of batch) {
         if (!(e.clientId === this.clientId && e.clientSeq > 0 && lane.assigned.get(e.clientSeq) === e.mutationId)) e.clientSeq = lane.allocate(e.mutationId, e.ordinal);
         e.clientId = this.clientId;
@@ -286,7 +284,7 @@ export abstract class SenderLayer extends ReactionLayer {
         else if (s.outcome === undefined) waits = true; // an earlier SEQUENCED action with no slot yet gives none to name ([CLI-32])
       }
       if (waits) continue;
-      // SPEC-QUESTION (ruled, Q42.3): 14 [CLI-32] gives `after_client_seq` as "the highest `client_seq` the current client instance assigned to
+      // Q42.3 (ruled by the coordinator: the text decides): 14 [CLI-32] gives `after_client_seq` as "the highest `client_seq` the current client instance assigned to
       // an earlier SEQUENCED action of the same keyspace". Reading A: the earlier SEQUENCED actions that are still in the outbox, which is
       // what the rest of [CLI-32] speaks of ("until that action has left the outbox without one"); an action that retired holds a slot at
       // or below the watermark, so naming it adds no wait. Reading B: the highest slot of any earlier SEQUENCED action of this client

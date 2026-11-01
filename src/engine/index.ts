@@ -4,7 +4,7 @@
 export { Engine, CrdtHandle, type KeyspaceInfo, type SignOutOptions, type SignOutResult } from "./engine.js";
 export type { EngineConfig } from "./core.js";
 export * from "./types.js";
-export { LocalRefusal, ProtocolViolation, RpcError, StorageError, type LocalRefusalCode, type RpcStatus } from "./errors.js";
+export { LocalRefusal, ProtocolViolation, RpcError, StorageError, storageCauseOf, type LocalRefusalCode, type RpcStatus, type StorageCause } from "./errors.js";
 export { type Clock, type Random, systemClock, systemRandom } from "./clock.js";
 export type { Transport, CallOptions } from "./transport.js";
 export { BytesTransport, decodeMessage, encodeMessage, type RawCaller } from "./wire.js";

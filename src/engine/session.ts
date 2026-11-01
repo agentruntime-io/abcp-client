@@ -80,7 +80,11 @@ export abstract class SessionLayer extends SenderLayer {
     reconnectAfter: number | undefined;
     attempts: number;
     fatal: boolean;
-  } = { state: "idle", id: "", abort: undefined, hbMs: 15_000, watchdog: undefined, startedMono: 0, closing: undefined, reconnectAfter: undefined, attempts: 0, fatal: false };
+    /** The monotonic time of the session's `Subscribed` frame: a session is live from it (09 [READ-35]); undefined until it comes. */
+    liveSince: number | undefined;
+    /** The reason of the `Retry` that the last `Subscribe` got and that the client retries on (14 [CLI-41], [CLI-44]); undefined when none. */
+    retrying: string | undefined;
+  } = { state: "idle", id: "", abort: undefined, hbMs: 15_000, watchdog: undefined, startedMono: 0, closing: undefined, reconnectAfter: undefined, attempts: 0, fatal: false, liveSince: undefined, retrying: undefined };
   private wakeSleep: (() => void) | undefined;
   private readonly epochFlows = new Set<string>();
   private readonly loadWaits = new Map<string, Promise<void>>();
@@ -96,7 +100,7 @@ export abstract class SessionLayer extends SenderLayer {
     this.epochFlows.clear();
     this.loadWaits.clear();
     this.sess.watchdog?.();
-    this.sess = { state: "idle", id: "", abort: undefined, hbMs: this.sess.hbMs, watchdog: undefined, startedMono: 0, closing: undefined, reconnectAfter: undefined, attempts: 0, fatal: false };
+    this.sess = { state: "idle", id: "", abort: undefined, hbMs: this.sess.hbMs, watchdog: undefined, startedMono: 0, closing: undefined, reconnectAfter: undefined, attempts: 0, fatal: false, liveSince: undefined, retrying: undefined };
   }
 
   protected sessionId(): string {
@@ -134,6 +138,11 @@ export abstract class SessionLayer extends SenderLayer {
   protected abstract widenKeyspace(f: Follow): Promise<void>;
   /** The token is refreshed in band before it expires (14 [CLI-68]). */
   protected abstract armTokenRefresh(): void;
+
+  /** The `Retry` reason of a `Subscribe` that the client is retrying (14 [CLI-44]: `KEYSPACE_SEEDING`), for the sync status (14 [CLI-41]). */
+  subscribeRetry(): string | undefined {
+    return this.sess.retrying;
+  }
 
   /** The state of the connection for the sync status. */
   connection(): "live" | "connecting" | "offline" | "stopped" {
@@ -199,7 +208,6 @@ export abstract class SessionLayer extends SenderLayer {
 
   private async sessionLoop(): Promise<void> {
     while (this.running && !this.stopped && !this.sess.fatal) {
-      const started = this.clock.mono();
       let end: SessionEnd;
       try {
         end = await this.runSession();
@@ -207,7 +215,9 @@ export abstract class SessionLayer extends SenderLayer {
         end = { kind: "error", error };
       }
       if (!this.running || this.stopped) return;
-      const lived = this.clock.mono() - started;
+      // 09 [READ-57]: "n returns to 0 when a session has delivered its `Subscribed` frame and lived for at least 60 s": a session that never
+      // delivered it lived for no time, however long it took to connect; a session is live from its `Subscribed` frame (09 [READ-35])
+      const lived = this.sess.liveSince === undefined ? -1 : this.clock.mono() - this.sess.liveSince;
       await this.run(() => this.onSessionEnded(end, lived));
       if (this.sess.fatal || !this.running) return;
       const appHold = this.hasAppHold();
@@ -259,6 +269,7 @@ export abstract class SessionLayer extends SenderLayer {
     this.onRuntimeChanged();
     s.closing = undefined;
     s.reconnectAfter = undefined;
+    s.liveSince = undefined;
     s.startedMono = this.clock.mono();
     const req = create(SubscribeRequestSchema, { keyspaces: cursors, supportedFeatures: [...this.features], clientId: this.clientId });
     for (const f of follows) {
@@ -350,6 +361,8 @@ export abstract class SessionLayer extends SenderLayer {
     const s = this.sess;
     if (livedMs >= SESSION_LIVE_RESET_MS) s.attempts = 0;
     else s.attempts++;
+    s.liveSince = undefined;
+    s.retrying = undefined; // set again below when this end is the `Retry{KEYSPACE_SEEDING}` of a `Subscribe` (14 [CLI-44])
     for (const f of this.followList()) {
       // 14 [CLI-56]: the time since the last successful sync of a keyspace counts from the end of the session that carried it
       if (f.onSession) {
@@ -399,7 +412,10 @@ export abstract class SessionLayer extends SenderLayer {
         if (error.retry?.reason === 6 /* AUTHORIZER_UNAVAILABLE */) this.holdApp("AUTHORIZER_UNAVAILABLE", "AUTHORIZER_UNAVAILABLE");
         else if (error.retry?.reason === RetryReason.KEYSPACE_SEEDING) {
           // 14 [CLI-44]: a `Subscribe` that names a successor that is not seeded yet is refused as a whole; the client sends the whole
-          // `Subscribe` again, unchanged, with the backoff of [CLI-43]; a `Retry` has no age bound of its own, and no hold
+          // `Subscribe` again, unchanged, with the backoff of [CLI-43], and shows the retry in its sync status ([CLI-41]); a `Retry` has no age
+          // bound of its own, and no hold
+          this.sess.retrying = "KEYSPACE_SEEDING";
+          this.onRuntimeChanged();
           this.sess.reconnectAfter = Math.max(clampAfter(error.retry.afterMs), fullJitter(Math.max(0, this.sess.attempts - 1), CLIENT_BACKOFF, this.random));
         }
         break;
@@ -450,6 +466,8 @@ export abstract class SessionLayer extends SenderLayer {
       case "subscribed": {
         const s = this.sess;
         s.state = "live";
+        s.liveSince = this.clock.mono();
+        s.retrying = undefined;
         this.onRuntimeChanged();
         s.id = body.value.sessionId;
         s.hbMs = body.value.heartbeatIntervalMs > 0 ? body.value.heartbeatIntervalMs : 15_000;

@@ -33,7 +33,7 @@
 // store already holds is answered with it, authored once. `NO_FLUSHER` is for an engine that is stopping, and for one with no tab host.
 
 import { KeyspaceLifecycle } from "../gen/abpc/v2/types_pb.js";
-import { LocalRefusal, type LocalRefusalCode } from "./errors.js";
+import { LocalRefusal, type LocalRefusalCode, type StorageCause } from "./errors.js";
 import type { EngineConfig } from "./core.js";
 import { Follow } from "./follow.js";
 import { RevocationLayer } from "./revocation.js";
@@ -54,6 +54,7 @@ const HANDOFF_VALID_MS = 10_000;
 /** The flusher's runtime, which a follower mirrors: what the sync status reports besides the durable stores. */
 export interface RuntimeSnapshot {
   connection: "live" | "connecting" | "offline" | "stopped";
+  subscribeRetry?: string | undefined;
   holds: HoldInfo[];
   suspended: boolean;
   fullStores: string[];
@@ -78,7 +79,7 @@ type TabMessage =
   | { t: "event"; from: string; event: EngineEvent }
   | { t: "cmd"; from: string; id: number; name: string; args: unknown[] }
   | { t: "reply"; from: string; to: string; id: number; ok: true; value: unknown }
-  | { t: "reply"; from: string; to: string; id: number; ok: false; error: { name: string; code?: string; detail: string; message: string } };
+  | { t: "reply"; from: string; to: string; id: number; ok: false; error: { name: string; code?: string; cause?: string; detail: string; message: string } };
 
 interface Wait {
   name: string;
@@ -324,7 +325,7 @@ export abstract class TabLayer extends RevocationLayer {
           const done = (): void => w.resolve(value);
           if (this.role === "follower") this.detach(this.run(() => (this.role === "follower" ? this.refreshMirrors() : undefined)).then(done, done));
           else done();
-        } else w.reject(m.error.name === "LocalRefusal" ? new LocalRefusal(m.error.code as LocalRefusalCode, m.error.detail) : new Error(m.error.message));
+        } else w.reject(m.error.name === "LocalRefusal" ? new LocalRefusal(m.error.code as LocalRefusalCode, m.error.detail, m.error.cause as StorageCause | undefined) : new Error(m.error.message));
         return;
       }
     }
@@ -359,6 +360,7 @@ export abstract class TabLayer extends RevocationLayer {
     }
     return {
       connection: this.connection(),
+      subscribeRetry: this.subscribeRetry(),
       holds: this.holds.info(),
       suspended: this.holds.all().some((h) => h.kind === "APP_SUSPENDED"),
       fullStores: this.storage.full(),
@@ -410,7 +412,7 @@ export abstract class TabLayer extends RevocationLayer {
       fn(m.args).then(
         (value) => reply({ ok: true, value }),
         (e: unknown) => {
-          if (e instanceof LocalRefusal) reply({ ok: false, error: { name: "LocalRefusal", code: e.code, detail: e.message.replace(/^refused locally \([A-Z_]+\): /, ""), message: e.message } });
+          if (e instanceof LocalRefusal) reply({ ok: false, error: { name: "LocalRefusal", code: e.code, ...(e.cause !== undefined ? { cause: e.cause } : {}), detail: e.message.replace(/^refused locally \([A-Z_, ]+\): /, ""), message: e.message } });
           else reply({ ok: false, error: { name: "Error", detail: String(e), message: e instanceof Error ? e.message : String(e) } });
         },
       ),

@@ -24,6 +24,7 @@ import { encodeContent } from "./entry.js";
 import { makeReject } from "./endings.js";
 import type { Follow } from "./follow.js";
 import type { Hold, HoldKind } from "./holds.js";
+import type { LaneName } from "./manifests.js";
 import { ReplicaLayer } from "./replica.js";
 import { matchSuccessor } from "./successors.js";
 import { draftKey, type OutboxEntry } from "./storage.js";
@@ -276,15 +277,11 @@ export abstract class ReactionLayer extends ReplicaLayer {
     const known = isKnownClass(reject.errorClass);
     const reaction = reactionOf(reject.errorClass);
 
-    // SPEC-QUESTION (ruled, Q42.2): 15 [COMPAT-39] says that a reject whose class is unknown or UNSPECIFIED "MUST be handled as HOLD", and
-    // 14 [CLI-7] and [CLI-34] that a REJECTED decision is a final rejection. They meet in a `Decided{REJECTED}` whose reject has a class that
-    // this client does not know. Reading A: the hold rule is the more specific one, the lane is held and the action resent with the hold
-    // backoff, and at its bound it is reported as outcome unknown. Reading B: the decision is final, so the action ends at once as rejected,
-    // to the dead-letter store, whatever the class; a resend of a decided intent can only get the same stored decision again, so reading A
-    // reports a rejection that the server has made as an outcome that is unknown, and holds a lane that no resend can clear. Ruled by the
-    // coordinator (until spec round 16 writes it into 15 [COMPAT-39]): reading B. A `Decided{REJECTED}` is final whatever its reject's
-    // class (14 [CLI-34]); when the class is unknown or UNSPECIFIED it is handled as DEAD_LETTER (14 [CLI-46]), and the dead-letter entry
-    // carries the reject with its class, which is how the app is told. The hold applies to a `Reject` result only.
+    // 15 [COMPAT-39] (draft 14, Q42.2): "A `REJECTED` decision is final (14 [CLI-7], [CLI-34], [CLI-38]): a reject that a `REJECTED` decision
+    // carries, whose class is unknown or `ERROR_CLASS_UNSPECIFIED`, MUST be handled as `DEAD_LETTER`, and reported to the app"; a reject of any
+    // other kind whose class is unknown or UNSPECIFIED is a HOLD, "the hold applies only where no final decision exists". A resend of a decided
+    // intent can only get the same stored decision again, so a hold would be a lane that no resend can clear. The dead-letter entry carries the
+    // reject with its class, which is how the app is told; the dependents fail as for any final rejection (14 [CLI-34]).
     if (decided && !known) {
       await this.endAction(e, { sink: "deadLetter", reject, reason: codeName(reject.code), dependents: "fail" });
       return;
@@ -421,31 +418,47 @@ export abstract class ReactionLayer extends ReplicaLayer {
   }
 
   /**
-   * A.7 "stop and report", for a `Mutate` call that failed with a status that has a row of its own and no ABPC detail: `PermissionDenied`
-   * after the one refresh, `NotFound`, `AlreadyExists`, `FailedPrecondition`. The action is kept, never dropped unseen (02 [ARC-50]),
-   * and the lane stops: it is held as 14 Table 14.1 holds a lane for a code that the client does not know, with the status as the hold's
-   * code, which `held` and the sync status report. The head of the lane is resent with the hold backoff, which ends the hold when a
-   * resend gets a result, and the default bound ends the actions (14 [CLI-45]).
+   * A `Mutate` call that fails as a whole with `NotFound`, `AlreadyExists`, `FailedPrecondition`, or `PermissionDenied` after the one
+   * refresh of the token, and with no ABPC error detail: the "stop and report" of A.7, which 14 [CLI-50] and the row of Table 14.1 for
+   * it make a lane hold, on each lane that the request carried. The client resends the lane's head action, unchanged, with the hold
+   * backoff (a resend that gets another result clears the hold), and emits `protocol-error` for the status once, when the hold starts,
+   * with the RPC status and the lanes of the request; the `held` event and the sync status name the hold `PROTOCOL_ERROR` (A.11). The
+   * outcome of the request's actions stays unknown ([CLI-24]): they are kept, never dropped unseen (02 [ARC-50]), and the default bound
+   * ends them as for every hold (an action that was ever sent is reported as outcome unknown, one that was never sent is dead-lettered
+   * with the reason `PROTOCOL_ERROR`, [CLI-45]).
    *
-   * SPEC-QUESTION (Q42.5: the recommended reading stands until round 16 writes a Table 14.1 row): A.7 says "stop and report" and gives no Table 14.1 row for these statuses on a `Mutate` call. Reading A (taken): the
-   * lane hold above, which reports, keeps the action, never loops (the hold backoff) and ends at the default bound as every hold does.
-   * Reading B: the client stops sending for good, or dead-letters the action at once with the status as its reason. Reading B loses an
-   * action to a status that a proxy or a deployment mistake can send, and has no way to resume; reading A needs no rule that the text lacks.
+   * SPEC-QUESTION (14 Table 14.1, the row for a whole-call `Mutate` failure): the row's scope is "each lane that the request carried", and its
+   * "While held" column says the client "emits `protocol-error` for the status once, when the hold starts"; §14.5 gives the event "the RPC status
+   * and the lanes of the request". Reading A (taken): one event for the call, naming the status and every lane of the request, emitted when at
+   * least one of those holds starts (a request that carries two lanes is reported once). Reading B: one event for each lane whose hold starts.
+   * The row also says "the lane's head action": a GATED lane has no order, so the head is the first of the request's actions in that lane.
    */
   protected stopAndReport(entries: readonly OutboxEntry[], status: string): void {
     const lanes = new Set<string>();
+    const started: { keyspaceId: string; lane: LaneName }[] = [];
+    const all: { keyspaceId: string; lane: LaneName }[] = [];
     for (const e of entries) {
       e.lastResult = { kind: "rpc", what: status, atMs: this.serverNow() };
       this.markDirty(e);
       const key = `${e.keyspaceId}|${e.lane}`;
       if (lanes.has(key)) continue;
       lanes.add(key);
-      const held = this.holds.has("UNKNOWN_HOLD", e.keyspaceId, e.lane);
-      const h = this.startHold({ kind: "UNKNOWN_HOLD", scope: "lane", keyspaceId: e.keyspaceId, lane: e.lane, code: status, probeId: e.mutationId });
+      all.push({ keyspaceId: e.keyspaceId, lane: e.lane });
+      const held = this.holds.has("MUTATE_FAILURE", e.keyspaceId, e.lane);
+      const h = this.startHold({ kind: "MUTATE_FAILURE", scope: "lane", keyspaceId: e.keyspaceId, lane: e.lane, code: "PROTOCOL_ERROR", probeId: e.mutationId });
       this.armProbe(h);
-      // 14 [CLI-50]: "the client holds the lane as Table 14.1 says, within the bound of that row, and reports it with `protocol-error`": once for each hold
-      if (!held) this.emit({ type: "protocol-error", what: "Mutate", detail: `${status} with no ABPC detail: the ${e.lane} lane of the keyspace is held (A.7, 14 [CLI-50])`, keyspaces: [e.keyspaceId] });
+      if (!held) started.push({ keyspaceId: e.keyspaceId, lane: e.lane });
     }
+    if (started.length === 0) return; // the hold is in force already: its start was reported
+    const keyspaces = [...new Set(all.map((l) => l.keyspaceId))];
+    this.emit({
+      type: "protocol-error",
+      what: "Mutate",
+      detail: `${status} with no ABPC detail: the lanes of the request are held (A.7, 14 [CLI-50], Table 14.1)`,
+      keyspaces,
+      status,
+      lanes: all,
+    });
   }
 
   /** The reaction to a `HOLD` result: keep the action, stop the scope, tell the app, and clear as the table says. */
@@ -562,9 +575,12 @@ export abstract class ReactionLayer extends ReplicaLayer {
     const f = h.keyspaceId !== undefined ? this.follows.get(h.keyspaceId) : undefined;
     switch (h.kind) {
       case "KEYSPACE_NOT_FOUND":
-        // C5: a keyspace that a session dropped with NOT_FOUND (a server that lost it, a restart of an in-memory server) is not on the session, and
-        // `pumpKeyspace` sends nothing to it: its actions cannot be the probe. The probe is then the re-add, whether or not the outbox holds
-        // actions, and they are sent once the add succeeds (14 Table 14.1: "The keyspace exists: ... an add succeeds").
+        // SPEC-QUESTION (Q61, open): Table 14.1's row for `KEYSPACE_NOT_FOUND` has the client resend the action with the hold backoff, and a client that
+        // holds no action re-add the keyspace (09 [READ-65]). A keyspace that a session dropped with NOT_FOUND (a server that lost it, a restart of an
+        // in-memory server) is not on the session, and `pumpKeyspace` sends nothing to it: its actions cannot be the probe, and nothing would re-add it.
+        // Reading A (taken): the probe is the re-add, whether or not the outbox holds actions, and they are sent once the add succeeds (the row's
+        // "Clears when": "The keyspace exists: ... an add succeeds"). Reading B: the resend of the head is the whole probe, and the action stays
+        // held until its bound ends it.
         if (f !== undefined && (this.entriesOf(f.id).length === 0 || f.stopped === "NOT_FOUND")) {
           this.advanceProbe(h);
           this.readdKeyspace(f);
@@ -573,6 +589,7 @@ export abstract class ReactionLayer extends ReplicaLayer {
       case "UNKNOWN_OP_TYPE":
       case "UNSUPPORTED_FEATURE":
       case "UNKNOWN_HOLD":
+      case "MUTATE_FAILURE":
         this.schedulePump(); // the lane's head is resent, unchanged
         break;
       case "HISTORY_DIVERGED":
@@ -637,7 +654,7 @@ export abstract class ReactionLayer extends ReplicaLayer {
   /** A result that is not the hold's own ends it (14 Table 14.1, "clears when"): a resend that gets another result. */
   protected clearProbeHolds(e: OutboxEntry, keep: HoldKind | undefined): void {
     for (const h of this.holds.all()) {
-      if (h.kind !== "UNSUPPORTED_FEATURE" && h.kind !== "UNKNOWN_HOLD" && h.kind !== "KEYSPACE_NOT_FOUND" && h.kind !== "UNKNOWN_OP_TYPE") continue;
+      if (h.kind !== "UNSUPPORTED_FEATURE" && h.kind !== "UNKNOWN_HOLD" && h.kind !== "MUTATE_FAILURE" && h.kind !== "KEYSPACE_NOT_FOUND" && h.kind !== "UNKNOWN_OP_TYPE") continue;
       if (h.keyspaceId !== e.keyspaceId || h.kind === keep) continue;
       if (h.scope === "lane" && h.lane !== e.lane) continue;
       this.stopHold(h.kind, h.keyspaceId, h.lane, h.mutationId);
@@ -706,9 +723,12 @@ export abstract class ReactionLayer extends ReplicaLayer {
   // Identity (14 [CLI-63], [CLI-64])
 
   /**
-   * Starts a new `client_id` and re-stamps (14 [CLI-63]): every action without a definitive result loses its stamping, and takes a
-   * fresh `client_seq` from 1 when it is next sent, in authoring order; the lane state starts over. Mutation ids and content never
-   * change ([CLI-23]). A live session is rebound to the new id ([CLI-78]).
+   * Starts a new `client_id` and re-stamps (14 [CLI-63]): every SEQUENCED action that was sent and has no definitive result takes a fresh
+   * `client_seq` from 1, in authoring order, before anything is sent under the new `client_id`; an action that was never sent takes its first slot when it
+   * is first sent ([CLI-27]), and a GATED action without a definitive result takes one, with a recomputed `after_client_seq`, when it is next sent.
+   * The lane state starts over. Mutation ids and content never change ([CLI-23]). A live session is rebound to the new id ([CLI-78]).
+   *
+   * An action whose request is in flight, or whose intent is being polled, answers under the old `client_id`: it is re-stamped when it is next sent.
    */
   protected reidentify(_why: string): void {
     this.clientId = this.mintClientId();
@@ -716,6 +736,7 @@ export abstract class ReactionLayer extends ReplicaLayer {
       f.lanes.SEQUENCED.reset();
       f.lanes.GATED.reset();
     }
+    const restamp: OutboxEntry[] = [];
     for (const e of this.entries.values()) {
       if (e.outcome !== undefined) continue;
       e.clientId = "";
@@ -724,6 +745,16 @@ export abstract class ReactionLayer extends ReplicaLayer {
       this.markDirty(e);
       const rt = this.rt(e.mutationId);
       if (!rt.inflight) rt.nextAttemptAt = 0;
+      if (e.lane === "SEQUENCED" && e.everSent && !rt.inflight && !rt.polling && !this.ending.has(e.mutationId) && e.stuck === undefined) restamp.push(e);
+    }
+    // [CLI-63]: "in authoring order", whatever the order in which the actions could be sent: an action that waits for its retry or its hold keeps
+    // its place before the later ones, which then wait for it, as the lane is processed in `client_seq` order (07 §7.4)
+    restamp.sort((a, b) => a.ordinal - b.ordinal);
+    for (const e of restamp) {
+      const f = this.follows.get(e.keyspaceId);
+      if (f === undefined) continue;
+      e.clientSeq = f.lanes.SEQUENCED.allocate(e.mutationId, e.ordinal);
+      e.clientId = this.clientId;
     }
     this.rebindSession();
     this.schedulePump();

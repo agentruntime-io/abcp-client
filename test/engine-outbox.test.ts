@@ -306,6 +306,31 @@ describe("14 [CLI-84] local storage bounds", () => {
     expect(r.engine.status().fullStores).toContain("outbox");
   });
 
+  it("14 [CLI-21] (draft 14): a refused commit is a typed local error that names its cause: a full outbox, an exhausted quota, an abort of the transaction", async () => {
+    // a full outbox ([CLI-84])
+    const full = await rig({ storage: new MemoryStorage({ maxOutbox: 1 }) });
+    await goOffline(full);
+    await full.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/a", 1)] });
+    const e1 = await full.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/b", 1)] }).catch((e: unknown) => e);
+    expect(e1).toBeInstanceOf(LocalRefusal);
+    expect(e1).toMatchObject({ name: "LocalRefusal", code: "STORAGE", cause: "OUTBOX_FULL" });
+    // a quota error of the platform (IndexedDB's QuotaExceededError), and any other abort of the transaction
+    const q = await rig();
+    await goOffline(q);
+    const quota = Object.assign(new Error("the quota is exceeded"), { name: "QuotaExceededError" });
+    q.storage.commit = () => Promise.reject(quota);
+    const e2 = await q.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/a", 1)] }).catch((e: unknown) => e);
+    expect(e2).toMatchObject({ name: "LocalRefusal", code: "STORAGE", cause: "QUOTA" });
+    const a = await rig();
+    await goOffline(a);
+    a.storage.failNext = 1;
+    const e3 = await a.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/a", 1)] }).catch((e: unknown) => e);
+    expect(e3).toMatchObject({ name: "LocalRefusal", code: "STORAGE", cause: "ABORT" });
+    // an error of the client, not a result of the server: nothing of it is a Reject
+    expect(e3).not.toHaveProperty("reject");
+    expect(a.engine.outbox()).toHaveLength(0);
+  });
+
   it("a full dead-letter store keeps the entry in the outbox, final and never sent again, until the app acknowledges entries", async () => {
     const storage = new MemoryStorage({ maxDeadLetters: 1 });
     const r = await rig({ storage });

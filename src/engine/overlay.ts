@@ -204,7 +204,7 @@ function predict(st: ReplicaState, o: Overlay, ctx: PredictContext, mutationId: 
     // 14 [CLI-20]: data that the server accepted never makes prediction throw. A value that is not a counter: the change has no predicted
     // effect, and the key is shown as pending.
     //
-    // SPEC-QUESTION (ruled, Q42.4): 14 [CLI-12] says that "the view of a counter is its confirmed value plus the deltas of every pending
+    // Q42.4 (ruled by the coordinator: the text decides): 14 [CLI-12] says that "the view of a counter is its confirmed value plus the deltas of every pending
     // `INCR`", and 05 [STATE-28] that the server rejects an INCR whose result leaves the template's range with RANGE_EXCEEDED and applies none
     // of its changes. Reading A: an INCR that would leave the range is no part of the predicted counter (its key is shown as pending), as a CAS
     // whose expectation fails has no predicted effect ([CLI-11]); the view never shows a value that the server will refuse. Reading B: the

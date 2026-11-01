@@ -398,6 +398,11 @@ const rejectedResult = (id: string, r: Reject, duplicate = false): MutationResul
 const retryResult = (id: string, reason: RetryReason, afterMs = 1000, intentSeq = 0n): MutationResult =>
   resultOf(id, { case: "retry", value: create(RetrySchema, { reason, afterMs }) }, { intentSeq });
 
+/** 07 [MUT-7]: the order of `LaneWatermark`s, by `keyspace_id` compared in bytes and then by `lane` (SEQUENCED, then GATED). */
+function compareWatermarks(a: { keyspaceId: string; lane: number }, b: { keyspaceId: string; lane: number }): number {
+  return compareUtf8(a.keyspaceId, b.keyspaceId) || a.lane - b.lane;
+}
+
 /** Recorded rejects (07 §7.6): class DEAD_LETTER or CONFLICT, not PERMISSION_DENIED, ACTOR_MISMATCH, KEYSPACE_ARCHIVED, KEYSPACE_DELETED. */
 function isRecorded(r: Reject): boolean {
   if (r.errorClass !== ErrorClass.DEAD_LETTER && r.errorClass !== ErrorClass.CONFLICT) return false;
@@ -963,6 +968,8 @@ export class FakeServer {
       cursors.push(create(HeartbeatFrame_CursorSchema, { keyspaceId: ksId, cursorSeq: fs.pushed, headSeq: k.head, logEpoch: fs.epoch }));
       if (s.clientId !== "") wms.push(...this.laneWatermarks(k, s.clientId));
     }
+    // 07 [MUT-7]: in increasing order of (keyspace_id, lane), as in `MutateResponse.watermarks` and `LoadStateResponse.lane_watermarks`
+    wms.sort(compareWatermarks);
     return create(SubscribeResponseSchema, { frame: { case: "heartbeat", value: create(HeartbeatFrameSchema, { cursors, serverTime: timestampFromMs(this.clock.now()), laneWatermarks: wms }) } });
   }
 
@@ -1313,18 +1320,24 @@ export class FakeServer {
 
   private async *stream(principal: Principal, req: SubscribeRequest, o: CallOptions | undefined): AsyncGenerator<SubscribeResponse> {
     await this.prologue("subscribe", req, principal);
-    if (this.maxSessions !== undefined && [...this.sessions].filter((s) => subjectOf(s.principal) === subjectOf(principal)).length >= this.maxSessions) {
-      throw new RpcError("ResourceExhausted", "too many sessions", { reject: mkReject(Code.QUOTA_EXCEEDED, { details: { quota: "max_sessions_per_principal" } }) });
-    }
-    // 09 [READ-32], 14 [CLI-44]: a successor that is not seeded yet refuses the whole call
-    for (const c of req.keyspaces) {
-      if (this.keyspaces.get(c.keyspaceId)?.seeding === true) throw new RpcError("Unavailable", "a successor is not seeded yet", { retry: create(RetrySchema, { reason: RetryReason.KEYSPACE_SEEDING, afterMs: 1000 }) });
-    }
+    // 09 [READ-4], [READ-62] (draft 14): the one order of the checks of a `Subscribe`. After the suspended app (the prologue) and the grants (a keyspace that
+    // the caller may not read is dropped, [READ-32]) comes the identity check of the `client_id`, at the row for ACTOR_MISMATCH; then the rows below it, among them a
+    // successor that is not seeded (the whole call is refused, 14 [CLI-44]); then the other checks of [READ-62] (a keyspace named twice); the sessions cap of
+    // [READ-35] last. The `client_id` is bound only after every check has passed (10 [AUTH-20]).
     if (req.clientId !== "") {
       const bound = this.clients.get(req.clientId);
       if (bound !== undefined && bound !== subjectOf(principal)) throw new RpcError("PermissionDenied", "actor mismatch", { reject: mkReject(Code.ACTOR_MISMATCH) });
-      this.bindClient(req.clientId, subjectOf(principal));
     }
+    for (const c of req.keyspaces) {
+      if (this.keyspaces.get(c.keyspaceId)?.seeding === true) throw new RpcError("Unavailable", "a successor is not seeded yet", { retry: create(RetrySchema, { reason: RetryReason.KEYSPACE_SEEDING, afterMs: 1000 }) });
+    }
+    if (new Set(req.keyspaces.map((c) => c.keyspaceId)).size !== req.keyspaces.length) {
+      throw new RpcError("InvalidArgument", "a keyspace is named twice", { reject: mkReject(Code.INVALID_ENVELOPE) });
+    }
+    if (this.maxSessions !== undefined && [...this.sessions].filter((s) => subjectOf(s.principal) === subjectOf(principal)).length >= this.maxSessions) {
+      throw new RpcError("ResourceExhausted", "too many sessions", { reject: mkReject(Code.QUOTA_EXCEEDED, { details: { quota: "max_sessions_per_principal" } }) });
+    }
+    if (req.clientId !== "") this.bindClient(req.clientId, subjectOf(principal));
     const session = new FakeSession(`session-${this.nextSession++}`, principal, req.clientId);
     this.sessions.add(session);
     const hb = this.heartbeatMs > 0 ? this.heartbeatMs : 15_000;
@@ -1355,7 +1368,9 @@ export class FakeServer {
     if (k.frozen) return drop(5);
     if (k.lifecycle === KeyspaceLifecycle.ARCHIVED) return drop(6, k.successors);
     if (k.lifecycle === KeyspaceLifecycle.SPLIT) return drop(3, k.successors);
-    if (c.logEpoch !== k.epoch) return drop(8);
+    // 09 [READ-65]: `EPOCH_CHANGED` "if `after_seq > 0` and `cursor.log_epoch` differs from the keyspace's `log_epoch`": the epoch of a cursor is judged only then
+    // (03 [ID-40]: in `KeyspaceCursor.log_epoch`, 0 is a value that matches no epoch)
+    if (c.afterSeq > 0n && c.logEpoch !== k.epoch) return drop(8);
     const rec = k.log.find((r) => r.seq === c.afterSeq);
     const hashOk = c.afterRecordHash.length === 0 || (rec !== undefined && toHex(rec.recordHash) === toHex(c.afterRecordHash));
     if (c.afterSeq > k.head || c.afterSeq < k.pruneFloor || !hashOk) return drop(4 /* RESUME_TOO_OLD */);
@@ -1494,6 +1509,8 @@ export class FakeServer {
       }
       wms.push(create(LaneWatermarkSchema, { keyspaceId: m.keyspaceId, lane: m.lane, processedClientSeq: BigInt(processed), clientId: m.clientId, logEpoch: epoch }));
     }
+    // 07 [MUT-7]: in increasing order of (keyspace_id, lane): the ids compared in bytes, then the lane by its enum number
+    wms.sort(compareWatermarks);
     return create(MutateResponseSchema, { results, watermarks: wms });
   }
 

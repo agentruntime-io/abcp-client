@@ -700,6 +700,7 @@ export abstract class EngineCore {
       case "CLIENT_UNKNOWN":
       case "UNSUPPORTED_FEATURE":
       case "UNKNOWN_HOLD":
+      case "MUTATE_FAILURE":
         return "lane";
       case "KEYSPACE_NOT_FOUND":
       case "UPGRADE_REQUIRED":

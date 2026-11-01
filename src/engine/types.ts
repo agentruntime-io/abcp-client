@@ -286,10 +286,14 @@ export interface InterestChangedEvent extends Base {
 
 export interface ProtocolErrorEvent extends Base {
   type: "protocol-error";
-  /** The message's type, or the field of an `AppLimits` that carried a forbidden value. */
+  /** The message's type, or the field of an `AppLimits` that carried a forbidden value; `Mutate` for a whole-call failure (14 §14.5). */
   what: string;
   detail: string;
   keyspaces: string[];
+  /** For a `Mutate` call that failed as a whole with a status that has no ABPC detail and no reaction in A.7 (14 [CLI-50]): the RPC status. */
+  status?: string;
+  /** For such a `Mutate` failure: the lanes of the request, which the client holds (Table 14.1). */
+  lanes?: { keyspaceId: string; lane: LaneName }[];
 }
 
 export type EngineEvent =
@@ -408,6 +412,8 @@ export interface SyncStatus {
   storageMode: StorageMode;
   fullStores: string[];
   connection: "live" | "connecting" | "offline" | "stopped";
+  /** A `Subscribe` that is being retried after `Retry{KEYSPACE_SEEDING}` (14 [CLI-41], [CLI-44]): the reason; undefined when none is. */
+  subscribeRetry: string | undefined;
   suspended: boolean;
   holds: HoldInfo[];
   /** The calls of this tab that wait for the flusher's answer (14 [CLI-61], [CLI-21]): a follower never refuses a call while the flusher may still commit it. */

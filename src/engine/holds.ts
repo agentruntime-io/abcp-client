@@ -21,6 +21,8 @@ export type HoldKind =
   | "SESSION_CAP"
   | "AUTHORIZER_UNAVAILABLE"
   | "UNKNOWN_HOLD"
+  /** The row of Table 14.1 for a `Mutate` call that fails as a whole with a status and no ABPC detail (14 [CLI-50], A.7); its code is `PROTOCOL_ERROR` (A.11). */
+  | "MUTATE_FAILURE"
   | "UNKNOWN_DROP_REASON"
   | "CONFLICT_WAIT"
   | "EPOCH_RESOLUTION"

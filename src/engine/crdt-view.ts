@@ -209,12 +209,12 @@ const isHigh = (u: number): boolean => u >= 0xd800 && u <= 0xdbff;
 const isLow = (u: number): boolean => u >= 0xdc00 && u <= 0xdfff;
 
 /**
- * Moves a bound that falls between the two code units of a surrogate pair to the code point boundary (14 [CLI-13]): `down`
- * moves it before the pair, otherwise after it. No update that the client authors splits a pair, which 05 [STATE-76] makes a
- * no-op for good.
+ * Moves a bound that falls between the two code units of a surrogate pair to the boundary before the pair (14 [CLI-13]): every bound, the start
+ * and the end of a delete and the position of an insert alike, so that no update that the client authors splits a pair, which 05 [STATE-76] makes
+ * a no-op for good.
  */
-export function snapToCodePoint(s: string, i: number, down: boolean): number {
-  if (i > 0 && i < s.length && isHigh(s.charCodeAt(i - 1)) && isLow(s.charCodeAt(i))) return down ? i - 1 : i + 1;
+export function snapToCodePoint(s: string, i: number): number {
+  if (i > 0 && i < s.length && isHigh(s.charCodeAt(i - 1)) && isLow(s.charCodeAt(i))) return i - 1;
   return i;
 }
 
@@ -246,11 +246,22 @@ function reapply(view: Y.Doc, kinds: Map<string, "text" | "map" | "array">, befo
         if (edit.del === 0 && edit.ins === "") continue;
         const rem = diffText(at, ct);
         const m = mapPos(edit, { pos: rem.pos, del: rem.del, insLen: rem.ins.length }, ct.length);
-        // the bounds move to code point boundaries: an insert, and the two ends of a delete
-        const start = snapToCodePoint(ct, m.pos, true);
-        const end = snapToCodePoint(ct, Math.min(ct.length, m.pos + m.del), false);
-        if (end > start) ytext.delete(start, end - start);
-        if (edit.ins !== "") ytext.insert(start, edit.ins);
+        // SPEC-QUESTION (14 [CLI-13]): "it moves the bound to the boundary before the pair" says where a bound goes and not what becomes of the
+        // text that the diff replaced from inside a pair (the user changed the low unit of a pair for another low unit: the two texts share the high unit).
+        // Reading A (taken): the delete begins before the pair, so the inserted text begins with the unit that the start gave up, and the pair is
+        // replaced whole. Reading B: the delete and the insert both begin before the pair and the inserted text is as the diff has it, a lone low unit.
+        //
+        // The bounds move to the boundary before the pair: an insert, and the two ends of a delete. When the start gives up the high
+        // unit of a pair and the delete still reaches the user's range, that unit is in the deleted range now, so the inserted text begins with it:
+        // the pair stays whole
+        const start = snapToCodePoint(ct, m.pos);
+        const end = Math.max(start, snapToCodePoint(ct, Math.min(ct.length, m.pos + m.del)));
+        let ins = edit.ins;
+        if (end > m.pos) {
+          ins = ct.slice(start, m.pos) + ins;
+          ytext.delete(start, end - start);
+        }
+        if (ins !== "") ytext.insert(start, ins);
       } else if (kind === "map") {
         const am = (a as { map: Map<string, unknown> }).map;
         const bm = (b as { map: Map<string, unknown> }).map;

@@ -420,9 +420,9 @@ describe("14 [CLI-27]: slot use is decided by the lane's watermark, never by the
 });
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Reading 4: A.7 "stop and report"
+// A.7 "stop and report" for a whole-call Mutate failure: the lane hold of 14 [CLI-50] and Table 14.1 (draft 14; was Q42.5)
 
-describe("A.7: a Mutate call that fails with a status that has its own row and no ABPC detail", () => {
+describe("14 [CLI-50], Table 14.1, A.7: a Mutate call that fails as a whole with a status and no ABPC detail holds each lane of the request", () => {
   for (const status of ["NotFound", "AlreadyExists", "FailedPrecondition"] as const) {
     it(`${status} with no detail: stop and report (the lane is held and held says so), resend only with the hold backoff, clear on a result`, async () => {
       const r = await rig();
@@ -430,8 +430,8 @@ describe("A.7: a Mutate call that fails with a status that has its own row and n
       r.server.inject("mutate", { kind: "status", status });
       const a = await r.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/a", 1)] });
       await r.engine.settle();
-      expect(r.events.filter((e) => e.type === "held").map((e) => [(e as { state: string }).state, (e as { scope: string }).scope, (e as { code: string }).code])).toEqual([["start", "lane", status]]);
-      expect(r.engine.status().holds).toEqual([expect.objectContaining({ scope: "lane", lane: "SEQUENCED", code: status })]);
+      expect(r.events.filter((e) => e.type === "held").map((e) => [(e as { state: string }).state, (e as { scope: string }).scope, (e as { code: string }).code])).toEqual([["start", "lane", "PROTOCOL_ERROR"]]);
+      expect(r.engine.status().holds).toEqual([expect.objectContaining({ scope: "lane", lane: "SEQUENCED", code: "PROTOCOL_ERROR" })]);
       expect(mutateRequests(r)).toHaveLength(1);
       const b = await r.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/b", 1)] });
       await tick(r, 20_000);
@@ -452,7 +452,7 @@ describe("A.7: a Mutate call that fails with a status that has its own row and n
     await r.engine.settle();
     expect(refreshes).toBe(1);
     expect(mutateRequests(r)).toHaveLength(2); // the one resend after the refresh
-    expect(r.engine.status().holds).toEqual([expect.objectContaining({ scope: "lane", code: "PermissionDenied" })]);
+    expect(r.engine.status().holds).toEqual([expect.objectContaining({ scope: "lane", code: "PROTOCOL_ERROR" })]);
     await tick(r, 40_000);
     expect(kinds(r, a.mutationId)).toEqual(["committed"]);
     expect(refreshes).toBe(1);
@@ -560,9 +560,9 @@ describe("14 [CLI-53]: the journal keeps an action for max_offline after the out
 });
 
 // ---------------------------------------------------------------------------------------------------------------------
-// The readings that have two readings: the choice is pinned
+// The readings that had two readings: the choice is pinned (Q42.1 and Q42.2 are the text of draft 14: 14 [CLI-63], 15 [COMPAT-39])
 
-describe("SPEC-QUESTION readings, as taken", () => {
+describe("readings that had two readings, as taken (Q42.1 is 14 [CLI-63] and Q42.2 is 15 [COMPAT-39] in draft 14)", () => {
   it("14 [CLI-63] with [CLI-33]: a later unrelated action takes slot 1 while an earlier one waits for its dependency, which takes the next slot when it is sent", async () => {
     const r = await rig();
     const d = await r.engine.submit({ keyspaceId: KS, opType: "Approve", changes: [set("settings/g", 1)] }); // pending, undecided
@@ -579,7 +579,7 @@ describe("SPEC-QUESTION readings, as taken", () => {
     expect(kinds(r, a.mutationId).filter((t) => t !== "overwritten")).toEqual(["committed"]);
   });
 
-  it("Q42.2 (ruled) 15 [COMPAT-39] with 14 [CLI-7], [CLI-34]: a REJECTED decision whose reject has a class that the client does not know is final, handled as DEAD_LETTER: no hold, the dependents fail, the class is reported", async () => {
+  it("Q42.2 (draft 14) 15 [COMPAT-39] with 14 [CLI-7], [CLI-34]: a REJECTED decision whose reject has a class that the client does not know is final, handled as DEAD_LETTER: no hold, the dependents fail, the class is reported", async () => {
     for (const cls of [77, ErrorClass.UNSPECIFIED]) {
       const r = await rig();
       const g = await r.engine.submit({ keyspaceId: KS, opType: "Approve", changes: [set("settings/g", 1)] });
@@ -599,7 +599,7 @@ describe("SPEC-QUESTION readings, as taken", () => {
     }
   });
 
-  it("Q42.2 (ruled): the hold is for a `Reject` result only: a `Reject` of an unknown class that is no decision still holds the lane", async () => {
+  it("Q42.2 (draft 14): the hold is for a `Reject` result only: a `Reject` of an unknown class that is no decision still holds the lane", async () => {
     const r = await rig();
     r.random.fixed = 0.999999;
     r.server.inject("mutate", { kind: "result", result: (m) => rejectResult(m, rejectWith(901, 77)) });

@@ -61,7 +61,7 @@ export class ProtocolViolation extends Error {
 
 /** Why a client refused an action locally, before it entered the outbox. */
 export type LocalRefusalCode =
-  /** The local storage transaction failed (14 [CLI-21]), or the outbox is full (14 [CLI-84]). */
+  /** The local storage transaction failed (14 [CLI-21]), or the outbox is full (14 [CLI-84]); `LocalRefusal.cause` names which. */
   | "STORAGE"
   /** The action's keyspace is not one the engine follows (14 [CLI-69]). */
   | "NOT_FOLLOWED"
@@ -76,15 +76,37 @@ export type LocalRefusalCode =
   /** The call is the flusher tab's: a follower tab has no view document of a CRDT key, and does not sign the principal out. */
   | "NOT_FLUSHER";
 
-/** A local refusal of an action: nothing was stored and nothing is shown. */
+/**
+ * Why the local storage transaction of an accepted action failed (14 [CLI-21]): the error "names its cause".
+ * `OUTBOX_FULL`: the outbox is at its bound and the client evicts nothing ([CLI-84]); `QUOTA`: the platform's storage quota is used up; `ABORT`: the
+ * transaction was aborted or failed for another reason.
+ */
+export type StorageCause = "OUTBOX_FULL" | "QUOTA" | "ABORT";
+
+/**
+ * A local refusal of an action: nothing was stored and nothing is shown. It is an error of the client that the app can tell from a result of the
+ * server (`RpcError`, a `Reject`): when the local commit fails (`STORAGE`, 14 [CLI-21]) it names its cause.
+ */
 export class LocalRefusal extends Error {
   readonly code: LocalRefusalCode;
+  /** For `STORAGE`: why the commit failed (14 [CLI-21]). */
+  readonly cause: StorageCause | undefined;
 
-  constructor(code: LocalRefusalCode, detail: string) {
-    super(`refused locally (${code}): ${detail}`);
+  constructor(code: LocalRefusalCode, detail: string, cause?: StorageCause) {
+    super(`refused locally (${code}${cause === undefined ? "" : `, ${cause}`}): ${detail}`);
     this.name = "LocalRefusal";
     this.code = code;
+    this.cause = cause;
   }
+}
+
+/** The cause of a failed storage commit (14 [CLI-21]): a full store, an exhausted quota, or an abort of the transaction. */
+export function storageCauseOf(e: unknown): StorageCause {
+  if (e instanceof Error) {
+    if (e.name === "StoreFull") return "OUTBOX_FULL";
+    if (e.name === "QuotaExceededError" || /quota/i.test(e.message)) return "QUOTA";
+  }
+  return "ABORT";
 }
 
 /** The local storage failed a transaction (14 [CLI-21]): nothing of it was applied. */
