@@ -562,7 +562,10 @@ export abstract class ReactionLayer extends ReplicaLayer {
     const f = h.keyspaceId !== undefined ? this.follows.get(h.keyspaceId) : undefined;
     switch (h.kind) {
       case "KEYSPACE_NOT_FOUND":
-        if (f !== undefined && this.entriesOf(f.id).length === 0) {
+        // C5: a keyspace that a session dropped with NOT_FOUND (a server that lost it, a restart of an in-memory server) is not on the session, and
+        // `pumpKeyspace` sends nothing to it: its actions cannot be the probe. The probe is then the re-add, whether or not the outbox holds
+        // actions, and they are sent once the add succeeds (14 Table 14.1: "The keyspace exists: ... an add succeeds").
+        if (f !== undefined && (this.entriesOf(f.id).length === 0 || f.stopped === "NOT_FOUND")) {
           this.advanceProbe(h);
           this.readdKeyspace(f);
         } else this.schedulePump(); // the head is resent

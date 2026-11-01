@@ -66,8 +66,16 @@ function keyChange(c: ChangeInput, facts: ConfirmedFacts): KeyChange {
     kind: c.kind,
     value: c.value ?? new Uint8Array(0),
     isNull: c.isNull ?? false,
-    // a value change carries its encoding (json/v1 unless the app says otherwise); an INCR and a CRDT update carry none (05 [STATE-20])
-    encoding: c.encoding ?? ((c.kind === ChangeKind.SET || c.kind === ChangeKind.CAS || c.kind === ChangeKind.OVERRIDE) && c.update === undefined ? "json/v1" : ""),
+    // a value change carries its encoding (json/v1 unless the app says otherwise); a CRDT update carries `yjs/v1`, the encoding of a `crdt:yjs/v1`
+    // template (05 [STATE-6]); an INCR carries none. 05 [STATE-20]: `CRDT_UPDATE` requires `update` and `encoding`, which the Go server enforces
+    // (INVALID_ENVELOPE): C2 had it carry none, and only a real server shows it (C5).
+    encoding:
+      c.encoding ??
+      (c.kind === ChangeKind.CRDT_UPDATE || ((c.kind === ChangeKind.SET || c.kind === ChangeKind.CAS || c.kind === ChangeKind.OVERRIDE) && c.update !== undefined)
+        ? "yjs/v1"
+        : c.kind === ChangeKind.SET || c.kind === ChangeKind.CAS || c.kind === ChangeKind.OVERRIDE
+          ? "json/v1"
+          : ""),
     delta: c.delta ?? 0n,
     update: c.update ?? new Uint8Array(0),
     ...(expected !== undefined ? { expected } : {}),

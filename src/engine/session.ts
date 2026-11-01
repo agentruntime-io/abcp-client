@@ -461,7 +461,12 @@ export abstract class SessionLayer extends SenderLayer {
         this.kickWidenings();
         this.schedulePump();
         // the keyspaces added while connecting
-        for (const f of this.followList()) if (f.loaded && !f.onSession && this.subscribable(f)) this.addToSession(f);
+        for (const f of this.followList()) {
+          if (f.loaded && !f.onSession && this.subscribable(f)) this.addToSession(f);
+          // C5: a keyspace that the app added while the session was connecting has had no load: `kick` found no live session, and the loads
+          // of `runSession` were over. On a real network the connect takes a moment, and an app that adds a keyspace at once meets this window.
+          else if (!f.loaded && this.needsLoad(f)) this.kick(f);
+        }
         return;
       }
       case "keyspaceAdded":

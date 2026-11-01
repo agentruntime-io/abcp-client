@@ -21,7 +21,13 @@ export const systemClock: Clock = {
   now: () => Date.now(),
   mono: () => (typeof performance !== "undefined" ? performance.now() : Date.now()),
   setTimer(ms, fn) {
-    const t = setTimeout(fn, ms);
+    // `setTimeout` runs a delay above 2^31-1 ms (24.8 days) after 1 ms, so a long timer (the offline horizon of a year, a hold bound) is set in steps (C5)
+    const MAX = 2 ** 31 - 1;
+    let t: ReturnType<typeof setTimeout>;
+    const arm = (left: number): void => {
+      t = setTimeout(left > MAX ? () => arm(left - MAX) : fn, Math.min(left, MAX));
+    };
+    arm(ms);
     return () => clearTimeout(t);
   },
 };

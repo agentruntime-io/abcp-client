@@ -32,6 +32,11 @@ import type {
 export interface CallOptions {
   /** Aborts the call (and ends a `Subscribe` stream). */
   signal?: AbortSignal;
+  /**
+   * The call's deadline in ms (02 [ARC-60]: `connect-timeout-ms`; the call fails with `DeadlineExceeded` when it passes). The engine sets
+   * none; a transport has a deadline of its own for each kind of call. Added with the real transport (C5).
+   */
+  timeoutMs?: number;
 }
 
 export interface Transport {

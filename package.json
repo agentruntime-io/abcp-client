@@ -14,6 +14,7 @@
   "dependencies": {
     "@bufbuild/protobuf": "2.10.0",
     "@connectrpc/connect": "2.1.0",
+    "@connectrpc/connect-node": "2.1.0",
     "lib0": "0.2.119",
     "yjs": "13.6.33"
   },
