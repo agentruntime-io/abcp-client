@@ -301,7 +301,7 @@ describe("14 [CLI-67] GRANT_CHANGED: stop following; the outbox entries stay and
 });
 
 describe("14 [CLI-68] the token is refreshed in band before it expires; a failed refresh is no revocation", () => {
-  it("the engine asks the app for a new token before the old one expires and tells the session with RefreshSession; the data and the outbox are untouched", async () => {
+  it("10 [AUTH-48]: the engine asks the app for a new token at about 80% of its lifetime and tells the session with RefreshSession; the data and the outbox are untouched", async () => {
     let refreshes = 0;
     let expiry: number | undefined;
     const r = await rig({ cfg: { tokens: { refresh: () => (refreshes++, Promise.resolve(true)), expiresAt: () => expiry } } });
@@ -312,9 +312,11 @@ describe("14 [CLI-68] the token is refreshed in band before it expires; a failed
     expiry = r.clock.now() + 3_600_000 - 2000;
     await r.engine.settle();
     expect(refreshes).toBe(0);
-    await tick(r, 3_600_000 - 2000 - 60_000 - 1000);
+    // 10 [AUTH-48]: at about 80% of the lifetime measured from receipt (the Subscribe, ~2 s ago): 2,880 s, well before the
+    // old 60-s lead
+    await tick(r, 2_880_000 - 2000 - 3000);
     expect(refreshes).toBe(0);
-    await tick(r, 2000); // 60 s before the expiry
+    await tick(r, 6000);
     expect(refreshes).toBe(1);
     const calls = r.server.calls.filter((c) => c.method === "refreshSession");
     expect(calls).toHaveLength(1);

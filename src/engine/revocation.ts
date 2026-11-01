@@ -48,8 +48,11 @@ import type { ExportRecord } from "./types.js";
 /** The app's policy for the local copy of a keyspace that it stops following without a revocation (14 [CLI-67], [CLI-77]). */
 export type CopyPolicy = "keep" | "purge";
 
-/** What the engine does in band with the token: the lead before its expiry at which it is refreshed. 10 [AUTH-50]: the session ends within a 60 s leeway after `exp`. */
+/** The latest a token is refreshed: this long before its expiry. 10 [AUTH-50]: the session ends within a 60 s leeway after `exp`. */
 export const TOKEN_REFRESH_LEAD_MS = 60_000;
+
+/** 10 [AUTH-48]: a client refreshes its token at about 80% of its lifetime, measured on its own clock from receipt. */
+export const TOKEN_REFRESH_FRACTION = 0.8;
 
 /** The least wait between two in-band refreshes of the token. */
 export const TOKEN_REFRESH_MIN_GAP_MS = 5_000;
@@ -62,6 +65,8 @@ export abstract class RevocationLayer extends InterestLayer {
   private readonly purgeHooks = new Set<PurgeHook>();
   private tokenTimer: (() => void) | undefined;
   private tokenExpMs: number | undefined;
+  /** The token whose refresh is armed: its expiry, and when (on the device clock) and with what lifetime it was received. */
+  private tokenArmed: { exp: number; receivedAt: number; lifetime: number } | undefined;
   private revokingSubject: Promise<void> | undefined;
 
   protected resetRuntime(): void {
@@ -69,6 +74,7 @@ export abstract class RevocationLayer extends InterestLayer {
     this.tokenTimer?.();
     this.tokenTimer = undefined;
     this.tokenExpMs = undefined;
+    this.tokenArmed = undefined;
     this.revokingSubject = undefined;
   }
 
@@ -442,8 +448,15 @@ export abstract class RevocationLayer extends InterestLayer {
     const exp = this.tokens?.expiresAt?.() ?? this.tokenExpMs;
     if (exp === undefined || !this.online()) return;
     this.tokenExpMs = exp;
+    // 10 [AUTH-48]: about 80% of the lifetime, measured on the device clock from receipt: a token seen for the first time is
+    // received now, with the lifetime it has left; re-arming for the same token keeps its receipt.
+    if (this.tokenArmed?.exp !== exp) {
+      this.tokenArmed = { exp, receivedAt: this.clock.now(), lifetime: Math.max(0, exp - this.serverNow()) };
+    }
+    const { receivedAt, lifetime } = this.tokenArmed;
+    const due = receivedAt + Math.min(TOKEN_REFRESH_FRACTION * lifetime, lifetime - TOKEN_REFRESH_LEAD_MS);
     // never sooner than `TOKEN_REFRESH_MIN_GAP_MS`: a provider that reports an expiry that is already past, after a refresh, must not make a busy loop
-    this.tokenTimer = this.after(Math.max(TOKEN_REFRESH_MIN_GAP_MS, exp - this.serverNow() - TOKEN_REFRESH_LEAD_MS), () => this.refreshInBand());
+    this.tokenTimer = this.after(Math.max(TOKEN_REFRESH_MIN_GAP_MS, due - this.clock.now()), () => this.refreshInBand());
   }
 
   private refreshInBand(): void {
