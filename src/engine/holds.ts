@@ -81,6 +81,10 @@ export class HoldRegistry {
     return [...this.m.values()];
   }
 
+  clear(): void {
+    this.m.clear();
+  }
+
   /** The holds that stop an action: every app hold, the keyspace's, its lane's, and its own. */
   blocking(e: { keyspaceId: string; lane: LaneName; mutationId: string }): Hold[] {
     const out: Hold[] = [];

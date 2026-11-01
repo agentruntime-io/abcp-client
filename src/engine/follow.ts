@@ -174,6 +174,18 @@ export class Follow {
   purged = false;
   /** `ACCESS_REVOKED` or the revocation of the subject was handled for this keyspace (14 [CLI-66]): its copy is purged and its outbox quarantined, once. */
   revoked = false;
+  /** The purge of the revocation is committed to the storage, with the record that the keyspace is revoked (revocation.ts). */
+  revocationPurged = false;
+  /** The purge and the quarantine of the revocation are both done and recorded: a restart has nothing left of them to do. */
+  revocationDone = false;
+  /** The actions of the keyspace that the revocation left to `GetMutationResult` were asked about (14 [CLI-7]). */
+  revocationAsked = false;
+  /** The failed attempts of the durable part of the revocation, the exponent of the client backoff before the next one. */
+  revocationAttempts = 0;
+  /** The journal entries that the purge removes, as they were when the memory was purged: a retry of the purge removes them from the storage. */
+  purgeJournal: string[] = [];
+  /** The actions that the quarantine took, for the one `quarantined` event of the keyspace. */
+  quarantinedIds: string[] = [];
   /** The changes that records carried and that their kind does not define, counted (02 [ARC-46]). */
   anomalies = 0;
   /** Keys outside the interest that the app loaded to author a change (14 [CLI-73]): the version that the load showed, or 0 for a key that was absent. */

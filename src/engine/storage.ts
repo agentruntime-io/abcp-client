@@ -95,7 +95,7 @@ export interface OutboxEntry {
    * The action reached its end, but the store that it is due in is full (14 [CLI-84]): it stays in the outbox, final and never
    * sent again, until the app acknowledges entries of that store and the move can be made.
    */
-  stuck?: { sink: "deadLetter" | "export" | "journal"; reason: string; reject?: Reject; cause?: string; dependencyOf?: string };
+  stuck?: { sink: "deadLetter" | "export" | "journal"; reason: string; reject?: Reject; cause?: string; dependencyOf?: string; quarantine?: boolean };
 }
 
 /** The keys on which an action's applied result differs from its prediction (14 [CLI-38], [CLI-40]). */
@@ -174,6 +174,8 @@ export interface RejectionRecord {
   reject?: Reject;
   cause?: string;
   atMs: number;
+  /** The author of the action (14 [CLI-59]): on a shared device another principal never sees it. */
+  author?: Author;
 }
 
 /** The text of a CRDT key's pending and unsent edits that a redaction reset took out of the view (14 [CLI-13], [CLI-49]). */
@@ -211,6 +213,8 @@ export interface ReplicaHead {
   interest: string[];
   /** The estimate of the server time of the last successful sync of the keyspace, in ms (14 [CLI-55], [CLI-56]). */
   lastSyncMs: number;
+  /** The principal whose cache this is (14 [CLI-59]): the partition of a shared device holds the caches of the principals that used it, one at a time, and never lends one to another. */
+  author?: Author;
 }
 
 /** The load that began a persisted replica: its pages as the server served them (09 §9.2). */
@@ -241,7 +245,7 @@ export type StorageOp =
   | { op: "putRejection"; entry: RejectionRecord }
   | { op: "ackRejection"; mutationId: string }
   | { op: "putDraft"; entry: DraftEntry }
-  | { op: "deleteDraft"; keyspaceId: string; key: string }
+  | { op: "deleteDraft"; keyspaceId: string; key: string; author?: Author }
   | { op: "setMeta"; key: string; value: string | number | bigint }
   // -- the persisted replica (14 [CLI-2], [CLI-74]) --
   /** A load installed confirmed state: the image of the keyspace is the load's pages, with no tail. */
@@ -266,6 +270,11 @@ export interface StoredState {
   drafts: DraftEntry[];
   replicas: ReplicaImage[];
   meta: Record<string, string | number | bigint>;
+}
+
+/** The key of a draft in a partition: the keyspace, the key and the author, so that two principals of a shared device never overwrite each other's (14 [CLI-59]). */
+export function draftKey(d: { keyspaceId: string; key: string; author?: Author | undefined }): string {
+  return `${d.keyspaceId}\u0000${d.key}\u0000${d.author === undefined ? "" : `${d.author.issuer}|${d.author.sub}`}`;
 }
 
 /** The names of the stores that a bound can fill (14 [CLI-84]). */

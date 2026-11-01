@@ -159,19 +159,24 @@ describe("14 [CLI-61]: the tabs of one engine share one outbox through a single 
     expect(a.engine.rejectionEntries()).toHaveLength(0);
   });
 
-  it("a follower that gets no answer from a flusher refuses the call with the typed local error NO_FLUSHER; nothing was accepted", async () => {
+  it("a follower that gets no answer from a flusher does not refuse the call: the flusher may still commit it (14 [CLI-21]); it waits, and the typed local error NO_FLUSHER is for an engine that stops (tabs-handover suite)", async () => {
     const r = tabsRig();
     const a = await r.open();
     const b = await r.open();
     a.engine.kill(); // the flusher is gone, and the platform has not freed its lock (yet)
+    let state = "pending";
     const p = b.engine.submit(setA("settings/lost", 1));
-    const settled = p.then(
-      () => "accepted",
-      (e: unknown) => (e instanceof LocalRefusal ? e.code : "other"),
+    void p.then(
+      () => (state = "accepted"),
+      (e: unknown) => (state = e instanceof LocalRefusal ? e.code : "other"),
     );
     await r.clock.advance(5000);
-    expect(await settled).toBe("NO_FLUSHER");
+    await settleAll(b.engine);
+    expect(state).toBe("pending");
     expect(b.engine.outbox()).toHaveLength(0);
+    expect(b.engine.status().pendingCalls).toBe(1);
+    await b.engine.stop();
+    expect(state).toBe("NO_FLUSHER");
   });
 
   it("a follower has no view document of a CRDT key: it is the flusher tab's", async () => {
@@ -225,8 +230,8 @@ describe("14 [CLI-61]: the tabs of one engine share one outbox through a single 
     a.tab.setVisible(true);
     a.tab.setVisible(false); // hidden now, with a visible follower
     await settleAll(a.engine, b.engine);
-    expect(a.engine.status().role).toBe("stopped");
-    expect(a.events.at(-1)).toMatchObject({ type: "role", role: "stopped", cause: "HANDED_OVER" });
+    expect(a.engine.status().role).toBe("follower"); // it is a follower of the engine now (V14 MUST-3): its app keeps an engine
+    expect(a.events.filter((e) => e.type === "role").at(-1)).toMatchObject({ role: "follower", cause: "HANDED_OVER" });
     expect(b.engine.status().role).toBe("flusher");
   });
 });

@@ -269,7 +269,7 @@ export interface OfflineHorizonEvent extends Base {
 export interface RoleEvent extends Base {
   type: "role";
   role: "flusher" | "follower" | "stopped";
-  /** `ELECTED`: it holds the flusher lock (at start, or as the next in line after a handover); `STOPPED`: it gave the lock up. */
+  /** `ELECTED`: it holds the flusher lock (at start, or as the tab that a handover chose); `HANDED_OVER`: a hidden flusher gave the role to a visible tab and is a follower now; `STOPPED`: it gave the lock up and left. */
   cause: "ELECTED" | "FOLLOWING" | "STOPPED" | "HANDED_OVER";
   /** For a flusher: its new `client_id` (14 [CLI-63]). */
   clientId?: string;
@@ -410,4 +410,6 @@ export interface SyncStatus {
   connection: "live" | "connecting" | "offline" | "stopped";
   suspended: boolean;
   holds: HoldInfo[];
+  /** The calls of this tab that wait for the flusher's answer (14 [CLI-61], [CLI-21]): a follower never refuses a call while the flusher may still commit it. */
+  pendingCalls: number;
 }

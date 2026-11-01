@@ -22,17 +22,18 @@ import type { LaneName, Manifests, OpTypeInfo } from "./manifests.js";
 import { MemoryStorage } from "./memory-storage.js";
 import { buildOverlay, KeyspaceView, type PendingAction } from "./overlay.js";
 import { FollowMap, ViewFeed, type ViewChangeListener } from "./view-feed.js";
-import type {
-  Author,
-  DeadLetterEntry,
-  DraftEntry,
-  ExportEntry,
-  JournalEntry,
-  OutboxEntry,
-  OutboxStorage,
-  RejectionRecord,
-  StorageOp,
-  StoredState,
+import {
+  draftKey,
+  type Author,
+  type DeadLetterEntry,
+  type DraftEntry,
+  type ExportEntry,
+  type JournalEntry,
+  type OutboxEntry,
+  type OutboxStorage,
+  type RejectionRecord,
+  type StorageOp,
+  type StoredState,
 } from "./storage.js";
 import type { Transport } from "./transport.js";
 import type { StorageProvider, TabHost } from "./tabs.js";
@@ -344,6 +345,16 @@ export abstract class EngineCore {
     for (const c of [...this.timers]) c();
   }
 
+  /**
+   * Forgets the runtime of a flusher that gave the role up (14 [CLI-61]): the next time the tab is the flusher it starts as a tab that was never
+   * one, from the stored state (`becomeFlusher`). The layers that keep runtime state override it and call this one.
+   */
+  protected resetRuntime(): void {
+    this.runtimes.clear();
+    this.decoded.clear();
+    this.holds.clear();
+  }
+
   // ---------------------------------------------------------------------------------------------------------------------
   // Events
 
@@ -469,9 +480,14 @@ export abstract class EngineCore {
   // ---------------------------------------------------------------------------------------------------------------------
   // Storage
 
-  /** Commits the operations as one local transaction (14 [CLI-21]). Rejects, with nothing applied, when the storage cannot. */
+  /**
+   * Commits the operations as one local transaction (14 [CLI-21]). Rejects, with nothing applied, when the storage cannot. A follower tab never
+   * writes the store that the flusher owns (14 [CLI-61], 10 [AUTH-25]): the work of a flusher that was handed over, and that ends after the
+   * lock went, finds its writes refused.
+   */
   protected async tx(ops: readonly StorageOp[]): Promise<void> {
     if (ops.length === 0) return;
+    if (this.role === "follower") throw new StorageError("this tab is not the flusher: it writes nothing (14 [CLI-61])");
     try {
       await this.storage.commit(ops);
       this.touchPersisted();
@@ -503,8 +519,8 @@ export abstract class EngineCore {
     for (const e of s.deadLetters) if (mine(e.author)) this.deadLetters.set(e.mutationId, e);
     for (const e of s.journal) if (mine(e.author)) this.journal.set(e.mutationId, e);
     for (const e of s.exports) if (mine(e.author)) this.exports.set(e.mutationId, e);
-    for (const e of s.rejections) this.rejections.set(e.mutationId, e);
-    for (const e of s.drafts) if (mine(e.author)) this.drafts.set(`${e.keyspaceId}\u0000${e.key}`, e);
+    for (const e of s.rejections) if (mine(e.author)) this.rejections.set(e.mutationId, e);
+    for (const e of s.drafts) if (mine(e.author)) this.drafts.set(draftKey(e), e);
     const ord = s.meta["nextOrdinal"];
     this.nextOrdinal = typeof ord === "number" ? ord : 1;
     for (const e of s.entries) if (e.ordinal >= this.nextOrdinal) this.nextOrdinal = e.ordinal + 1;
@@ -549,6 +565,11 @@ export abstract class EngineCore {
       preconditions: m?.preconditions ?? [],
       content: e.content,
     };
+  }
+
+  /** Whether a store of the partition holds a mutation with this id: the outbox, the journal, the dead-letter store, the export entries, the rejections. */
+  protected knownMutation(id: string): boolean {
+    return this.entries.has(id) || this.journal.has(id) || this.deadLetters.has(id) || this.exports.has(id) || this.rejections.has(id);
   }
 
   /** The runtime state of an entry. */

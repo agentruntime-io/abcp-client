@@ -84,7 +84,13 @@ export interface TabChannel {
 
 /** What a tab gets from its platform. */
 export interface TabHost {
-  /** The id of this tab, for the messages between tabs. */
+  /**
+   * The id of this tab, for the messages between tabs. Where no reliable cross-tab lock exists (`locks.reliable` is false) it also names the
+   * tab's outbox (`PartitionKey.tab`, 14 [CLI-61]): a host MUST give a tab the same id for as long as the tab is the same one, across a reload
+   * (a browser keeps it in `sessionStorage`), or the outbox of the old id belongs to no engine and its actions are never sent or reported. The
+   * engine cannot tell such an outbox from another live tab's, so it never adopts one: `Engine.partitions()` lists them (the keys with a `tab`
+   * other than the engine's own), for the app to flush or discard once the host knows that the tab is gone.
+   */
   readonly tabId: string;
   readonly locks: CrossTabLocks;
   readonly storage: StorageProvider;

@@ -179,7 +179,9 @@ describe("14 [CLI-72]: widening the interest loads the new prefixes first, with 
     await r.engine.settle();
     const t = stateOf(r).tombstone("issues/i1");
     expect(t?.kind).toBe("entity");
-    const follow = (r.engine as unknown as { follows: Map<string, unknown> }).follows.get(KS);
+    const follow = (r.engine as unknown as { follows: Map<string, { interest: string[] }> }).follows.get(KS) as { interest: string[] };
+    // the entries below are the load's for a prefix that the old interest does not cover (the ones of the old interest are the stream's, and are not installed, 09 [READ-28])
+    follow.interest = ["settings/a"];
     // a stale entry for the subtree, at a version at or below the deletion seq, arrives with a load
     const stale: KeyEntry = create(KeyEntrySchema, { key: "issues/i1/title", value: new TextEncoder().encode('"ghost"'), encoding: "json/v1", version: (t?.version as bigint) - 1n });
     (r.engine as unknown as { installWidening(f: unknown, e: KeyEntry[], v: number): void }).installWidening(follow, [stale], 1);

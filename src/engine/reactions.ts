@@ -26,7 +26,7 @@ import type { Follow } from "./follow.js";
 import type { Hold, HoldKind } from "./holds.js";
 import { ReplicaLayer } from "./replica.js";
 import { matchSuccessor } from "./successors.js";
-import type { OutboxEntry } from "./storage.js";
+import { draftKey, type OutboxEntry } from "./storage.js";
 
 /** The row of Table 14.1 that a reject falls under, or undefined for a reject that is no hold. */
 export function holdKindOf(r: Reject): HoldKind | undefined {
@@ -71,6 +71,8 @@ export abstract class ReactionLayer extends ReplicaLayer {
   protected abstract retryEpochResolution(f: Follow): void;
   protected abstract followSuccessors(rules: readonly SuccessorRule[]): void;
   protected abstract pumpAll(): Promise<void>;
+  /** The answer of `GetMutationResult` about an action of a keyspace that a revocation stopped (14 [CLI-7], [CLI-53]); false when it is no answer. */
+  protected abstract answerRevoked(f: Follow, e: OutboxEntry, ans: import("../gen/abpc/v2/sync_pb.js").GetMutationResultResponse): Promise<boolean>;
   /** The manifest version in force for the keyspace, as `LoadStateResponse.manifest_version` names it (14 Table 14.1, `UNKNOWN_OP_TYPE`). */
   protected abstract manifestVersionInForce(f: Follow): Promise<number>;
   protected abstract kick(f?: Follow): void;
@@ -86,6 +88,16 @@ export abstract class ReactionLayer extends ReplicaLayer {
 
   protected markDirty(e: OutboxEntry): void {
     this.dirty.add(e.mutationId);
+  }
+
+  protected resetRuntime(): void {
+    super.resetRuntime();
+    this.dirty.clear();
+    for (const c of this.probeTimers.values()) c();
+    this.probeTimers.clear();
+    this.boundTimer?.();
+    this.boundTimer = undefined;
+    this.pumpQueued = false;
   }
 
   /** Writes the entries that changed during a task, in one transaction. */
@@ -213,7 +225,12 @@ export abstract class ReactionLayer extends ReplicaLayer {
         await this.run(async () => {
           if (!this.entries.has(e.mutationId) || e.outcome !== undefined) return;
           const f = this.follows.get(e.keyspaceId);
-          if (resp.known && resp.result !== undefined) {
+          if (f !== undefined && f.revoked) {
+            // 14 [CLI-7]: the keyspace is not followed: the answer ends the action as 14 [CLI-53] and [CLI-83] say, whatever epoch it was sent in
+            rt.polling = false;
+            if (!(await this.answerRevoked(f, e, resp))) this.startPoll(e, undefined);
+            await this.flushDirty();
+          } else if (resp.known && resp.result !== undefined) {
             rt.polling = false;
             await this.applyResult(e, resp.result, "poll");
             await this.flushDirty();
@@ -345,9 +362,10 @@ export abstract class ReactionLayer extends ReplicaLayer {
         const ops = [];
         for (const c of m.changes) {
           if (c.kind !== ChangeKind.CRDT_UPDATE || c.update.length === 0) continue;
-          const k = `${f.id}\u0000${c.key}`;
+          // 14 [CLI-59]: a draft is tagged with its author's subject, and kept under it
+          const k = draftKey({ keyspaceId: f.id, key: c.key, author: e.author });
           const have = this.drafts.get(k);
-          const draft = { keyspaceId: f.id, key: c.key, updates: [...(have?.updates ?? []), c.update], reason: "DOC_RESET", atMs: this.serverNow() };
+          const draft = { keyspaceId: f.id, key: c.key, author: e.author, updates: [...(have?.updates ?? []), c.update], reason: "DOC_RESET", atMs: this.serverNow() };
           this.drafts.set(k, draft);
           ops.push({ op: "putDraft" as const, entry: draft });
         }
@@ -422,8 +440,11 @@ export abstract class ReactionLayer extends ReplicaLayer {
       const key = `${e.keyspaceId}|${e.lane}`;
       if (lanes.has(key)) continue;
       lanes.add(key);
+      const held = this.holds.has("UNKNOWN_HOLD", e.keyspaceId, e.lane);
       const h = this.startHold({ kind: "UNKNOWN_HOLD", scope: "lane", keyspaceId: e.keyspaceId, lane: e.lane, code: status, probeId: e.mutationId });
       this.armProbe(h);
+      // 14 [CLI-50]: "the client holds the lane as Table 14.1 says, within the bound of that row, and reports it with `protocol-error`": once for each hold
+      if (!held) this.emit({ type: "protocol-error", what: "Mutate", detail: `${status} with no ABPC detail: the ${e.lane} lane of the keyspace is held (A.7, 14 [CLI-50])`, keyspaces: [e.keyspaceId] });
     }
   }
 

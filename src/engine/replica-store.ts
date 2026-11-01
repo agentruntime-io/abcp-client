@@ -134,6 +134,7 @@ export abstract class ReplicaStoreLayer extends EndingLayer {
       successors: f.successors,
       interest: f.interest,
       lastSyncMs: f.lastSyncMs,
+      author: { ...this.author },
     };
   }
 
@@ -266,10 +267,19 @@ export abstract class ReplicaStoreLayer extends EndingLayer {
    * Installs the entries of a widening load into the state (14 [CLI-72]): "the load's entries for the added prefixes and the ancestor
    * tombstones that it returns, and nothing else". An installed entry whose key fails the ancestor test of 05 [STATE-38] is absent: a
    * held entity or staged tombstone of one of its ancestor markers has a deletion seq at or above the entry's version, so that a
-   * widening never brings a deleted entity back.
+   * widening never brings a deleted entity back. Returns the entries that it installed.
+   *
+   * An added prefix may cover the old interest (the old `issues/i1`, the new `issues`), and the load names the keys of the old interest too, as of its
+   * `checkpoint_seq`: the stream has kept those since, so they are not installed ("and nothing else", 09 [READ-28]), and no entry is installed
+   * over a row, or a tombstone, that the state holds at a higher version (05 [STATE-38]'s guard): a widening never takes the state of a key back.
    */
-  protected installWidening(f: Follow, entries: readonly KeyEntry[], manifestVersion: number): void {
+  protected installWidening(f: Follow, loaded: readonly KeyEntry[], manifestVersion: number): KeyEntry[] {
     const st = f.state;
+    const entries = loaded.filter((e) => {
+      if (inInterest(f.interest, e.key)) return false; // the old interest: the stream's, and newer than the load's checkpoint
+      const held = st.key(e.key)?.version ?? st.tombstone(e.key)?.version;
+      return held === undefined || e.version >= held;
+    });
     for (const e of entries) installEntry(st, e, this.manifests, manifestVersion);
     const top = this.topologyOf(f);
     for (const e of entries) {
@@ -292,5 +302,6 @@ export abstract class ReplicaStoreLayer extends EndingLayer {
       f.crdt.setConfirmed(key, doc);
     }
     f.crdt.reconcile(st);
+    return entries;
   }
 }

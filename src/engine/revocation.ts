@@ -3,10 +3,13 @@
 //  - [CLI-66] `ACCESS_REVOKED` for a keyspace: the **purge list** (the confirmed replica, cached pages, blob cache, presence state and
 //    journal) goes, and the keyspace's outbox entries that [CLI-7] has not ended are **quarantined**: never sent automatically, never
 //    deleted unreported, handed to the app's export hook for re-submission by an authorized principal, with `quarantined` for the
-//    keyspace and then `exported` for each entry. The purge and the quarantine are one local transaction, so a crash never leaves
-//    the copy purged and the entries still queued. An action that was sent, or registered, and has no outcome yet is not quarantined:
-//    [CLI-7] ends it, by `GetMutationResult`, which needs no grant (07 [MUT-53]): a recorded outcome retires it, and one that cannot
-//    be learned makes it outcome unknown (`outcome-unknown`, then `exported`, cause `ACCESS_REVOKED`, A.11);
+//    keyspace and then `exported` for each entry. The purge and the quarantine are two steps, in that order, each its own local
+//    transaction, committed and retried until it is done, with the record that the keyspace is revoked, so that a restart finishes what a
+//    crash left and never follows the keyspace again with the old token ([CLI-8]); the purge never waits for a store ([CLI-84]), and an action
+//    that the export store has no room for stays in the outbox, final and never sent again, until the app acknowledges entries. An action that
+//    was sent, or registered, or has an outcome that [CLI-7] has not confirmed in the epoch of the cursor, is not quarantined: [CLI-7] ends it,
+//    by `GetMutationResult`, which needs no grant (07 [MUT-53]): a recorded outcome that survived retires it, a lost one is the final rejection
+//    `STALE{EPOCH}`, and one that cannot be learned makes it outcome unknown (`outcome-unknown`, then `exported`, cause `ACCESS_REVOKED`, A.11);
 //  - [CLI-79], [CLI-50] `Closing{SUBJECT_REVOKED}`, or an `Unauthenticated` that carries the `SUBJECT_REVOKED` detail (a device that
 //    was offline when the revocation was made): the same for every keyspace of the subject, and the engine resumes only with a new
 //    token (the hold `SUBJECT_REVOKED`, whose probe asks the app for one);
@@ -23,19 +26,23 @@
 // only a keyspace with entries to quarantine gets one, and the app learns of an empty one from the `held` of the subject's revocation
 // alone. B leaves a revoked reader of a quiet keyspace unaware that its copy is gone.
 
-// SPEC-QUESTION (14 [CLI-66] with [CLI-7], 07 [MUT-53], 10 [AUTH-52]): "quarantine the keyspace's outbox entries that [CLI-7] has not ended" does not say
-// what becomes of (1) an action with an outcome from an earlier epoch that `GetMutationResult` has not confirmed yet ([CLI-7]: it retires only once
-// it does), nor of (2) an action that was sent, whose `GetMutationResult` a token issued before a revocation of the subject cannot make (10 [AUTH-52]
-// refuses it), although [CLI-7] says that call "needs no grant". Reading A (taken): (1) is quarantined, with its outcome in the export entry
-// (`lastResult`), so that the app knows it may have been applied; (2) is asked about, with the new token that a revoked subject resumes with, and ends
-// as [CLI-7] and [CLI-83] say; until then it stays in the outbox, never sent. Reading B: (1) waits for the answer too, which needs the epoch flow of
-// a keyspace whose copy is gone, and (2) is quarantined at once as unknown. B exports an action whose outcome the client could still learn.
+// SPEC-QUESTION (14 [CLI-66] with [CLI-7], 07 [MUT-53], 10 [AUTH-52], Q54.3, ruled): "quarantine the keyspace's outbox entries that [CLI-7] has not
+// ended" does not say what becomes of (1) an action with an outcome from an earlier epoch that `GetMutationResult` has not confirmed yet, nor of (2) an
+// action that was sent, whose `GetMutationResult` a token issued before a revocation of the subject cannot make (10 [AUTH-52] refuses it), although
+// [CLI-7] says that call "needs no grant". The coordinator ruled on 2026-11-01 (V14): the text decides, against the first reading that this engine took:
+// (1) retires only once `GetMutationResult` confirms the outcome ([CLI-7]), so it is asked about like (2), and a re-submission of an outcome that survived
+// the restore would apply it twice; (2) is asked about, with the new token that a revoked subject resumes with, and ends as [CLI-7] and [CLI-83] say;
+// until then it stays in the outbox, never sent.
 
+import type { GetMutationResultResponse } from "../gen/abpc/v2/sync_pb.js";
+import { Code, DecisionStatus, ErrorClass } from "../gen/abpc/v2/types_pb.js";
+import { resendDelay } from "./backoff.js";
+import { makeReject } from "./endings.js";
 import { RpcError } from "./errors.js";
 import { ReplicaState } from "../rules/fold/index.js";
 import type { Follow } from "./follow.js";
 import { InterestLayer } from "./interest.js";
-import type { ExportEntry, OutboxEntry, StorageOp } from "./storage.js";
+import { StoreFull, type ExportEntry, type OutboxEntry, type StorageOp, type StoredOutcome } from "./storage.js";
 import type { ExportRecord } from "./types.js";
 
 /** The app's policy for the local copy of a keyspace that it stops following without a revocation (14 [CLI-67], [CLI-77]). */
@@ -57,6 +64,14 @@ export abstract class RevocationLayer extends InterestLayer {
   private tokenExpMs: number | undefined;
   private revokingSubject: Promise<void> | undefined;
 
+  protected resetRuntime(): void {
+    super.resetRuntime();
+    this.tokenTimer?.();
+    this.tokenTimer = undefined;
+    this.tokenExpMs = undefined;
+    this.revokingSubject = undefined;
+  }
+
   /**
    * Registers what a component that keeps data of a keyspace outside the storage purges with it: the cached pages of the query layer,
    * the blob cache, the presence state (14 [CLI-66]). It is called with the keyspace and the cause, and awaited. Returns the function
@@ -73,7 +88,9 @@ export abstract class RevocationLayer extends InterestLayer {
   /** The operations that purge a keyspace's replica and journal from the storage. */
   protected purgeOps(f: Follow): StorageOp[] {
     const ops: StorageOp[] = [{ op: "deleteReplica", keyspaceId: f.id }];
-    for (const j of this.journal.values()) if (j.keyspaceId === f.id) ops.push({ op: "deleteJournal", mutationId: j.mutationId });
+    const ids = new Set(f.purgeJournal);
+    for (const j of this.journal.values()) if (j.keyspaceId === f.id) ids.add(j.mutationId);
+    for (const id of ids) ops.push({ op: "deleteJournal", mutationId: id });
     return ops;
   }
 
@@ -113,46 +130,230 @@ export abstract class RevocationLayer extends InterestLayer {
     // 14 [CLI-7]: the actions with a successful outcome in the epoch of the cursor retire at once (they write no journal: the copy is being purged)
     f.purged = true;
     await this.checkRetirements(f);
-    const live = this.entriesOf(f.id).filter((e) => !this.ending.has(e.mutationId) && e.stuck === undefined);
-    // an action that was sent or registered and has no outcome is ended by `GetMutationResult` ([CLI-7]); the others are quarantined
-    const asking = live.filter((e) => e.outcome === undefined && (e.everSent || e.registered));
-    const quarantined = live.filter((e) => !asking.includes(e));
+    // the memory is purged now: nothing of the copy is shown, and what the storage still holds of it goes in `finishRevocation`
+    f.purgeJournal = [...this.journal.values()].filter((j) => j.keyspaceId === f.id).map((j) => j.mutationId);
+    this.purgeMemory(f);
+    this.touchPersisted();
+    await this.finishRevocation(f);
+  }
+
+  /**
+   * The durable part of a revocation, in the order of 14 [CLI-66]: the purge, then the quarantine; each step is committed and retried until it is
+   * (`revocationDone` and the stored record say that both are), so that a restart finds the keyspace revoked and does what is left, and never
+   * loads it again with the old token ([CLI-8]).
+   *
+   *  - the purge (the replica, the journal) is one transaction with the record that the keyspace is revoked, and it never waits for a store:
+   *    "the purges ... by a revocation ... still run when a store is full" (14 [CLI-84]);
+   *  - the quarantine moves each action that [CLI-7] has not ended and that was never sent to the export store, in a transaction of its own; one
+   *    that the export store has no room for stays in the outbox, final and never sent again, until the app acknowledges entries
+   *    (`stuck`, [CLI-84]), and is handed over then;
+   *  - an action that was sent, or registered, or has an outcome that no cursor of the epoch retired, is not quarantined: [CLI-7] ends it by
+   *    `GetMutationResult`, which needs no grant (07 [MUT-53]) (`askRevoked`).
+   */
+  protected async finishRevocation(f: Follow): Promise<void> {
+    if (!f.revoked || this.role !== "flusher") return;
+    const cause = f.stopped === "SUBJECT_REVOKED" ? "SUBJECT_REVOKED" : "ACCESS_REVOKED";
+    let failed = false;
+    if (!f.revocationPurged) {
+      try {
+        await this.tx([...this.followedOps(), ...this.purgeOps(f)]);
+        f.revocationPurged = true;
+        this.touchPersisted();
+      } catch (e) {
+        this.noteInternalError(e);
+        failed = true;
+      }
+    }
+    // the quarantine: what the purge left in the outbox of the keyspace that was never sent and has no outcome
     const now = this.serverNow();
-    const exported: ExportEntry[] = quarantined.map((e) => ({
+    const exported: ExportEntry[] = [];
+    const batch = this.entriesOf(f.id).filter((e) => !this.ending.has(e.mutationId) && e.stuck === undefined && this.quarantinable(e));
+    for (const e of batch) {
+      const r = await this.quarantineOne(e, cause, now);
+      if (r === "retry") failed = true;
+      else f.quarantinedIds.push(e.mutationId);
+      if (r === "exported") exported.push(this.exports.get(e.mutationId) as ExportEntry);
+    }
+    if (failed) {
+      // a transaction that failed applied nothing: it is made again, with the client backoff ([CLI-43])
+      this.after(resendDelay(f.revocationAttempts++, undefined, this.random), () => this.finishRevocation(f));
+    } else if (!f.revocationDone) {
+      f.revocationDone = true;
+      f.revocationAttempts = 0;
+      await this.persistFollowed();
+      // 14 [CLI-66]: `quarantined` for the keyspace, then `exported` for each entry (14 [CLI-79] for every keyspace of the subject)
+      this.emit({ type: "quarantined", keyspaceId: f.id, cause, mutationIds: [...f.quarantinedIds] });
+      f.quarantinedIds = [];
+    }
+    for (const x of exported) {
+      this.emit({ type: "exported", mutationId: x.mutationId, keyspaceId: x.keyspaceId, reason: x.reason });
+      this.callExportHook(this.exportRecord(x));
+    }
+    if (!f.revocationAsked && this.startRequested) this.askRevoked(f);
+    if (failed || !f.revocationDone) return;
+    this.detach(this.runPurgeHooks(f, cause)); // outside the queue: a hook may call the engine
+    this.schedulePump();
+  }
+
+  /** Whether the quarantine takes the action: [CLI-7] has not ended it, and it was never sent (the server may hold an outcome for any other). */
+  private quarantinable(e: OutboxEntry): boolean {
+    return e.outcome === undefined && !e.everSent && !e.registered;
+  }
+
+  /** The export entry of a quarantined action (14 [CLI-66]): its content for re-submission by an authorized principal, with what the client knows of its outcome. */
+  private exportOf(e: OutboxEntry, cause: string, atMs: number): ExportEntry {
+    const lastResult = this.outcomeText(e);
+    return {
       mutationId: e.mutationId,
       keyspaceId: e.keyspaceId,
       opType: e.opType,
       content: e.content,
       author: e.author,
       reason: cause,
-      ...(this.outcomeText(e) !== undefined ? { lastResult: this.outcomeText(e) as string } : {}),
-      atMs: now,
-    }));
-    const ops: StorageOp[] = [];
-    for (const e of quarantined) ops.push({ op: "deleteEntry", mutationId: e.mutationId });
-    for (const x of exported) ops.push({ op: "putExport", entry: x });
-    ops.push(...this.purgeOps(f));
-    await this.tx(ops);
-    for (const e of quarantined) {
-      this.entries.delete(e.mutationId);
-      this.settleSlot(e, "wait");
-      this.dropRuntime(e.mutationId);
+      ...(lastResult !== undefined ? { lastResult } : {}),
+      atMs,
+    };
+  }
+
+  protected exportRecord(x: ExportEntry): ExportRecord {
+    return { mutationId: x.mutationId, keyspaceId: x.keyspaceId, opType: x.opType, content: x.content, reason: x.reason, reject: x.reject, lastResult: x.lastResult, dependencyOf: x.dependencyOf };
+  }
+
+  /**
+   * Quarantines one action: it leaves the outbox for the export store in one transaction. Returns `exported`; `stuck` when the export store is
+   * full, and the action stays in the outbox, final and never sent again ([CLI-84]); `retry` when the transaction failed and applied nothing.
+   */
+  protected async quarantineOne(e: OutboxEntry, cause: string, atMs: number): Promise<"exported" | "stuck" | "retry"> {
+    const x = this.exportOf(e, cause, atMs);
+    try {
+      await this.tx([{ op: "deleteEntry", mutationId: e.mutationId }, { op: "putExport", entry: x }]);
+    } catch (err) {
+      if (err instanceof StoreFull && err.store === "exports") {
+        if (e.stuck?.quarantine !== true) {
+          e.stuck = { sink: "export", reason: cause, quarantine: true };
+          try {
+            await this.tx([this.putOp(e)]);
+          } catch (e2) {
+            this.noteInternalError(e2); // the marker stays in memory; a restart finds the keyspace revoked and quarantines it again
+          }
+          this.follows.get(e.keyspaceId)?.invalidate();
+        }
+        return "stuck";
+      }
+      this.noteInternalError(err);
+      return "retry";
     }
-    for (const x of exported) this.exports.set(x.mutationId, x);
-    this.purgeMemory(f);
-    this.touchPersisted();
-    await this.persistFollowed();
-    // 14 [CLI-66]: `quarantined` for the keyspace, then `exported` for each entry
-    this.emit({ type: "quarantined", keyspaceId: f.id, cause, mutationIds: exported.map((x) => x.mutationId) });
-    const records: ExportRecord[] = [];
-    for (const x of exported) {
+    this.entries.delete(e.mutationId);
+    this.settleSlot(e, "wait");
+    this.dropRuntime(e.mutationId);
+    this.exports.set(x.mutationId, x);
+    this.follows.get(e.keyspaceId)?.invalidate();
+    return "exported";
+  }
+
+  /** The actions that the app acknowledged room for in the export store: the quarantined ones that waited are handed over now ([CLI-84]). */
+  protected async drainStuck(): Promise<void> {
+    for (const e of [...this.entries.values()].sort((a, b) => a.ordinal - b.ordinal)) {
+      if (e.stuck?.quarantine !== true || !this.entries.has(e.mutationId)) continue;
+      const r = await this.quarantineOne(e, e.stuck.reason, this.serverNow());
+      if (r !== "exported") continue;
+      const x = this.exports.get(e.mutationId) as ExportEntry;
       this.emit({ type: "exported", mutationId: x.mutationId, keyspaceId: x.keyspaceId, reason: x.reason });
-      records.push({ mutationId: x.mutationId, keyspaceId: x.keyspaceId, opType: x.opType, content: x.content, reason: x.reason, reject: undefined, lastResult: x.lastResult, dependencyOf: undefined });
+      this.callExportHook(this.exportRecord(x));
     }
-    for (const r of records) this.callExportHook(r);
-    for (const e of asking) this.pollNow(e);
-    this.detach(this.runPurgeHooks(f, cause)); // outside the queue: a hook may call the engine
-    this.schedulePump();
+    await super.drainStuck();
+  }
+
+  /**
+   * 14 [CLI-7], [CLI-8]: the actions of a revoked keyspace that the server may hold an outcome for are asked about with `GetMutationResult`, which
+   * needs no grant: one that was sent or registered and has no outcome (`pollNow`), and one whose outcome is from an earlier epoch than the cursor's, or
+   * that no cursor of the epoch retired (`askEarlier`: it retires only once the answer confirms the outcome). The answer ends each as 14 [CLI-53] and
+   * [CLI-83] say, so that no such action stays pending. A restart asks again about those that are still in the outbox.
+   */
+  protected askRevoked(f: Follow): void {
+    f.revocationAsked = true;
+    for (const e of this.entriesOf(f.id)) {
+      if (this.ending.has(e.mutationId) || e.stuck !== undefined) continue;
+      if (e.outcome !== undefined) this.askEarlier(e);
+      else if (e.everSent || e.registered) this.pollNow(e);
+    }
+  }
+
+  /** Asks about an action of a revoked keyspace that has an outcome that [CLI-7] has not confirmed in the epoch of the cursor. */
+  private askEarlier(e: OutboxEntry): void {
+    const again = (): void => {
+      this.after(resendDelay(this.rt(e.mutationId).authTries++, undefined, this.random), () => {
+        if (this.entries.has(e.mutationId)) this.askEarlier(e);
+      });
+    };
+    this.detach(
+      (async () => {
+        let resp: GetMutationResultResponse;
+        try {
+          resp = await this.transport.getMutationResult({ $typeName: "abpc.v2.GetMutationResultRequest", keyspaceId: e.keyspaceId, mutationId: e.mutationId });
+        } catch (err) {
+          this.noteRevoked(err);
+          await this.run(() => {
+            if (this.entries.has(e.mutationId)) again();
+          });
+          return;
+        }
+        await this.run(async () => {
+          const f = this.follows.get(e.keyspaceId);
+          if (f === undefined || !this.entries.has(e.mutationId) || this.ending.has(e.mutationId)) return;
+          if (!(await this.answerRevoked(f, e, resp))) again();
+          await this.flushDirty();
+        });
+      })(),
+    );
+  }
+
+  /** Acts on the answer about an action of a revoked keyspace, as 14 [CLI-53] says; false when the answer is none (the server still drives the action). */
+  protected async answerRevoked(f: Follow, e: OutboxEntry, ans: GetMutationResultResponse): Promise<boolean> {
+    const spend = (this.opInfoFor(e)?.spend ?? false) && !e.spendResent;
+    const cause = f.stopped ?? "ACCESS_REVOKED";
+    if (ans.known && ans.result !== undefined) {
+      const o = ans.result.outcome;
+      if (o.case === "appended" || (o.case === "decided" && o.value.status === DecisionStatus.COMMITTED)) {
+        // the outcome survived the restore (14 [CLI-7]): the action retires on it at once, since the keyspace is not followed any more
+        const out: StoredOutcome =
+          o.case === "appended"
+            ? { kind: "appended", seq: o.value.seq, logEpoch: f.logEpoch, overwroteNewer: [...o.value.overwroteNewer] }
+            : { kind: "decided", status: "COMMITTED", decisionSeq: (o.value as { decisionSeq: bigint }).decisionSeq, logEpoch: f.logEpoch };
+        this.setOutcome(e, out);
+        this.markDirty(e);
+        await this.checkRetirements(f);
+        return true;
+      }
+      if (o.case === "decided") {
+        await this.onRejectResult(e, o.value.reject ?? makeReject(Code.GATE_REJECTED, ErrorClass.DEAD_LETTER, "rejected"), true);
+        return true;
+      }
+      if (o.case === "rejected") {
+        await this.onRejectResult(e, o.value);
+        return true;
+      }
+      return false;
+    }
+    if (ans.voided) {
+      if (!spend) {
+        this.beginConflict(e, this.lostReject()); // the outcome was lost to a restore: the final rejection STALE{EPOCH}, through the conflict handler
+        return true;
+      }
+      // a lost spend action is resent once after an epoch change (14 [CLI-64]); a keyspace that the engine cannot send to gets no resend: it is quarantined
+      // with what is known of it, for an authorized principal to re-submit
+      const r = await this.quarantineOne(e, cause, this.serverNow());
+      if (r === "exported") {
+        const x = this.exports.get(e.mutationId) as ExportEntry;
+        this.emit({ type: "exported", mutationId: x.mutationId, keyspaceId: x.keyspaceId, reason: x.reason });
+        this.callExportHook(this.exportRecord(x));
+      }
+      return true;
+    }
+    // known = false and voided = false: "for an action of a keyspace that the client stopped following" the outcome is unknown, a spend action too (14 [CLI-83]),
+    // and no action stays pending (14 [CLI-7])
+    await this.endAction(e, { sink: "export", reject: undefined, reason: cause, outcomeUnknown: cause, dependents: "fail" });
+    return true;
   }
 
   /** What the client knows of the outcome of an action that is quarantined with an outcome it could not confirm (14 [CLI-53]). */

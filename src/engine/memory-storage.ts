@@ -13,6 +13,7 @@
 
 import { StorageError } from "./errors.js";
 import {
+  draftKey,
   StoreFull,
   type DeadLetterEntry,
   type DraftEntry,
@@ -131,10 +132,10 @@ export class MemoryStorage implements OutboxStorage {
           rejections.delete(op.mutationId);
           break;
         case "putDraft":
-          drafts.set(`${op.entry.keyspaceId}\u0000${op.entry.key}`, structuredClone(op.entry));
+          drafts.set(draftKey(op.entry), structuredClone(op.entry));
           break;
         case "deleteDraft":
-          drafts.delete(`${op.keyspaceId}\u0000${op.key}`);
+          drafts.delete(draftKey(op));
           break;
         case "setMeta":
           meta.set(op.key, op.value);

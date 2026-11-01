@@ -57,6 +57,7 @@ describe("scenario: two tabs, a flusher that closes with work queued, and the ne
     ids.push((await a.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/one", 1)] })).mutationId);
     ids.push((await b.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/two", 2)] })).mutationId); // carried to the flusher
     ids.push((await a.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/three", 3)] })).mutationId);
+    await settleAll(a.engine, b.engine); // the follower reads the flusher's stores when the flusher has told it (14 [CLI-61])
     expect(b.engine.outbox().map((e) => e.mutationId)).toEqual(ids); // one shared outbox
     await a.engine.stop();
     await settleAll(b.engine);

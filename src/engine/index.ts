@@ -19,6 +19,7 @@ export {
 } from "./manifests.js";
 export {
   StoreFull,
+  draftKey,
   type Author,
   type DeadLetterEntry,
   type DraftEntry,
@@ -47,7 +48,7 @@ export { makeReject } from "./endings.js";
 export { newUuid } from "./ids.js";
 export { DEFAULT_HORIZON_WARNING } from "./horizon.js";
 export { TOKEN_REFRESH_LEAD_MS, type CopyPolicy, type PurgeHook } from "./revocation.js";
-export { COMMAND_TIMEOUT_MS, type RuntimeSnapshot } from "./tab-layer.js";
+export { COMMAND_TIMEOUT_MS, HANDOVER_PROBE_MS, type RuntimeSnapshot } from "./tab-layer.js";
 export { checkInterest, inInterest } from "./replica-store.js";
 export {
   lockName,

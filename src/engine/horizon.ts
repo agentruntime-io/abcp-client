@@ -37,6 +37,14 @@ export abstract class HorizonLayer extends SessionLayer {
   /** The warnings that were emitted in the episode that is going on: `ACTION|keyspace` and `SYNC|keyspace`. */
   private readonly horizonWarned = new Set<string>();
 
+  protected resetRuntime(): void {
+    super.resetRuntime();
+    this.horizonTimer?.();
+    this.horizonTimer = undefined;
+    this.horizonQueued = false;
+    this.horizonWarned.clear();
+  }
+
   /** Reads the app's threshold; it is a fraction above 0 and below 1 (14 [CLI-56]: "below 100% of `max_offline`"). */
   protected setHorizonWarning(w: number | undefined): void {
     if (w === undefined) return;

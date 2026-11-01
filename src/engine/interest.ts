@@ -16,10 +16,12 @@ import { create } from "@bufbuild/protobuf";
 import { UpdateSubscriptionRequestSchema, UpdateSubscriptionRequest_InterestSchema, type LoadStateResponse } from "../gen/abpc/v2/sync_pb.js";
 import { FoldError } from "../rules/fold/index.js";
 import { LocalRefusal, ProtocolViolation } from "./errors.js";
+import type { KeyEntry } from "../gen/abpc/v2/types_pb.js";
 import type { Follow } from "./follow.js";
 import { HorizonLayer } from "./horizon.js";
 import { resendDelay } from "./backoff.js";
 import { checkInterest, covers } from "./replica-store.js";
+import type { StorageOp } from "./storage.js";
 
 /** The most keys outside the interest whose loaded version is remembered (14 [CLI-73]). */
 const OUTSIDE_KEPT = 1000;
@@ -31,20 +33,59 @@ function same(a: readonly string[], b: readonly string[]): boolean {
 export abstract class InterestLayer extends HorizonLayer {
   private readonly widenings = new Set<string>();
 
+  protected resetRuntime(): void {
+    super.resetRuntime();
+    this.widenings.clear();
+  }
+
+  /**
+   * What the stored state keeps of the keyspaces that the engine follows ([CLI-70]): each with its interest and the time of its last successful
+   * sync (so that the warning of 14 [CLI-56] survives a restart that has no replica image), and the keyspaces that a revocation stopped, with
+   * the cursor's epoch and whether the purge and the quarantine are done (14 [CLI-66], [CLI-7], [CLI-8]): a restart follows none of these, and
+   * finishes what the revocation left. The app asks for a keyspace again when it may.
+   */
+  protected followedOps(): StorageOp[] {
+    const followed: Record<string, { interest: string[]; lastSyncMs?: number }> = {};
+    const revoked: Record<string, { cause: string; done: boolean; seq: string; logEpoch: number; manifestVersion: number }> = {};
+    for (const f of this.follows.values()) {
+      if (f.revoked && (f.stopped === "ACCESS_REVOKED" || f.stopped === "SUBJECT_REVOKED")) {
+        revoked[f.id] = { cause: f.stopped, done: f.revocationDone, seq: f.state.seq.toString(), logEpoch: f.state.logEpoch, manifestVersion: f.state.manifestVersion };
+        continue;
+      }
+      if (f.stopped === "DELETED") continue; // the app asks again
+      followed[f.id] = { interest: f.widening?.to ?? f.interest, ...(f.lastSyncMs > 0 ? { lastSyncMs: f.lastSyncMs } : {}) };
+    }
+    return [
+      { op: "setMeta", key: "followed", value: JSON.stringify(followed) },
+      { op: "setMeta", key: "revoked", value: JSON.stringify(revoked) },
+    ];
+  }
+
   /** The keyspaces that the engine follows and the interest of each, kept with the stored state ([CLI-70]). */
   protected async persistFollowed(): Promise<void> {
     if (this.role !== "flusher") return;
-    const followed: Record<string, { interest: string[] }> = {};
-    for (const f of this.follows.values()) {
-      if (f.stopped === "ACCESS_REVOKED" || f.stopped === "SUBJECT_REVOKED" || f.stopped === "DELETED") continue; // the app asks again
-      followed[f.id] = { interest: f.widening?.to ?? f.interest };
-    }
     try {
-      await this.tx([{ op: "setMeta", key: "followed", value: JSON.stringify(followed) }]);
+      await this.tx(this.followedOps());
+      this.syncPersistedMs = this.latestSync();
       this.touchPersisted();
     } catch (e) {
       this.noteInternalError(e);
     }
+  }
+
+  /** The latest time of a sync that the stored followed list holds: it is written again when a sync is 30 s later than that (14 [CLI-56]). */
+  private syncPersistedMs = 0;
+
+  private latestSync(): number {
+    let at = 0;
+    for (const f of this.follows.values()) at = Math.max(at, f.lastSyncMs);
+    return at;
+  }
+
+  protected async persistSyncAge(force = false): Promise<void> {
+    if (this.role !== "flusher") return;
+    if (!force && this.latestSync() - this.syncPersistedMs < 30_000) return;
+    await this.persistFollowed();
   }
 
   // ---------------------------------------------------------------------------------------------------------------------
@@ -148,9 +189,10 @@ export abstract class InterestLayer extends HorizonLayer {
           this.onEpochMismatch(f);
           return;
         }
-        const entries = pages.flatMap((p) => p.entries);
+        const loaded = pages.flatMap((p) => p.entries);
+        let entries: KeyEntry[];
         try {
-          this.installWidening(f, entries, first.manifestVersion);
+          entries = this.installWidening(f, loaded, first.manifestVersion);
         } catch (e) {
           if (e instanceof FoldError) {
             this.onProtocolViolation(new ProtocolViolation("LoadStateResponse", e.message, [f.id]), [f.id]);

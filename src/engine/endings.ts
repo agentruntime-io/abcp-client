@@ -59,7 +59,16 @@ export abstract class EndingLayer extends EngineCore {
     return this.ending.has(e.mutationId) || e.stuck !== undefined;
   }
 
-  protected abstract submitAction(input: ActionInput, options?: SubmitOptions): Promise<SubmitResult>;
+  protected resetRuntime(): void {
+    super.resetRuntime();
+    this.ending.clear();
+    this.conflictFlows.clear();
+    this.cursorWaiters.clear();
+    this.freshReading = false;
+  }
+
+  /** `mutationId`: the id that a follower tab minted for the call (14 [CLI-61]); a mutation that a store of the partition already holds is answered, never authored again. */
+  protected abstract submitAction(input: ActionInput, options?: SubmitOptions, mutationId?: string): Promise<SubmitResult>;
 
   // ---------------------------------------------------------------------------------------------------------------------
   // Dependents (14 [CLI-34])
@@ -168,6 +177,7 @@ export abstract class EndingLayer extends EngineCore {
           content: en.content,
           ...(it.reject !== undefined ? { reject: it.reject } : {}),
           atMs: now,
+          author: en.author,
         };
         ops.push({ op: "putRejection", entry: rej });
       }
@@ -562,7 +572,7 @@ export abstract class EndingLayer extends EngineCore {
   protected async drainStuck(): Promise<void> {
     for (const e of [...this.entries.values()].sort((a, b) => a.ordinal - b.ordinal)) {
       const s = e.stuck;
-      if (s === undefined) continue;
+      if (s === undefined || s.quarantine === true) continue; // a quarantined action is handed over by the revocation layer (`drainStuck` there)
       if (s.sink === "journal") {
         const o = e.outcome;
         if (o === undefined) continue;

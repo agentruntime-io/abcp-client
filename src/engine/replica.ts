@@ -38,6 +38,13 @@ export abstract class ReplicaLayer extends ReplicaStoreLayer {
   /** The pending actions whose REJECTED DECISION a frame carried: their final rejection is handled after the frame is applied. */
   protected rejectedByRecord: { entry: OutboxEntry; reject: Reject }[] = [];
 
+  protected resetRuntime(): void {
+    super.resetRuntime();
+    this.rejectedByRecord = [];
+  }
+
+  /** Keeps the time of the last sync with the followed list (14 [CLI-56]), at most once in 30 s of server time unless `force`. */
+  protected abstract persistSyncAge(force?: boolean): Promise<void>;
   protected abstract flushDirty(): Promise<void>;
   protected abstract markDirty(e: OutboxEntry): void;
   /** `decided`: the reject is that of a `Decided{REJECTED}` (or of the DECISION record), which is final whatever its class (15 [COMPAT-39], 14 [CLI-34]). */
@@ -254,6 +261,7 @@ export abstract class ReplicaLayer extends ReplicaStoreLayer {
     // 14 [CLI-2]: the records join the persisted replica before the actions that they retire leave the outbox, so that a restart never
     // finds an action retired whose record it has not got
     await this.persistRecords(f, applied);
+    await this.persistSyncAge();
     await this.afterCursorMoved(f);
     const rejects = this.rejectedByRecord;
     this.rejectedByRecord = [];
@@ -487,6 +495,7 @@ export abstract class ReplicaLayer extends ReplicaStoreLayer {
       }
     }
     this.noteWatermarks(hb.laneWatermarks);
+    await this.persistSyncAge();
     await this.purgeJournal().catch(() => undefined);
   }
 }

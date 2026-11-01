@@ -73,7 +73,7 @@ describe("14 [CLI-66] ACCESS_REVOKED: purge the local copy, quarantine the outbo
     expect(types(r, c)).toEqual(["committed"]);
   });
 
-  it("the purge and the quarantine are one local transaction: a crash never leaves the copy purged and the entries still queued", async () => {
+  it("the purge (with the record that the keyspace is revoked) is one local transaction, and the quarantine of each entry is one of its own, after it: the purge never waits for the export store (V14 MUST-2)", async () => {
     const r = await rig();
     r.server.write(KS, [kc("settings/s", "set", 1)]);
     await r.engine.settle();
@@ -81,8 +81,13 @@ describe("14 [CLI-66] ACCESS_REVOKED: purge the local copy, quarantine the outbo
     r.storage.log.length = 0;
     r.server.revokeKeyspaces(KS);
     await r.engine.settle();
-    const tx = r.storage.log.find((ops) => ops.some((o) => o.op === "putExport" && o.entry.mutationId === b));
-    expect(tx?.map((o) => o.op)).toEqual(expect.arrayContaining(["deleteEntry", "putExport", "deleteReplica", "deleteJournal"]));
+    const purge = r.storage.log.findIndex((ops) => ops.some((o) => o.op === "deleteReplica"));
+    const quarantine = r.storage.log.findIndex((ops) => ops.some((o) => o.op === "putExport" && o.entry.mutationId === b));
+    expect(purge).toBeGreaterThanOrEqual(0);
+    expect(quarantine).toBeGreaterThan(purge); // the text orders them: the purge list, then the quarantine
+    expect(r.storage.log[purge]?.map((o) => o.op)).toEqual(expect.arrayContaining(["deleteReplica", "deleteJournal", "setMeta"]));
+    expect(r.storage.log[quarantine]?.map((o) => o.op)).toEqual(["deleteEntry", "putExport"]);
+    expect(r.storage.metaValue("revoked")).toContain(KS); // a restart finds the keyspace revoked
   });
 
   it("an action that retires after the revocation (its outcome comes with GetMutationResult) writes no journal entry: the journal is on the purge list", async () => {

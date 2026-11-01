@@ -8,13 +8,14 @@
 
 import { create } from "@bufbuild/protobuf";
 import type * as Y from "yjs";
-import { CreateKeyspaceRequestSchema } from "../gen/abpc/v2/sync_pb.js";
+import { CreateKeyspaceRequestSchema, UpdateSubscriptionRequestSchema } from "../gen/abpc/v2/sync_pb.js";
 import { ChangeKind } from "../gen/abpc/v2/types_pb.js";
 import { CrdtKey } from "./crdt-view.js";
 import { decodeContent, CanonError } from "./entry.js";
 import { makeReject } from "./endings.js";
 import type { EngineConfig } from "./core.js";
 import { LocalRefusal } from "./errors.js";
+import { newUuid } from "./ids.js";
 import { Follow } from "./follow.js";
 import type { KeyspaceView } from "./overlay.js";
 import { checkInterest, covers } from "./replica-store.js";
@@ -130,7 +131,16 @@ export class Engine extends TabLayer {
     // 14 [CLI-63]: a new client_id at every engine start and every flusher handover, kept in memory only
     this.clientId = this.mintClientId();
     // 14 [CLI-2]: the persisted replicas; one rehydration path (14 [CLI-8]): each is asked whether it can resume, by a load from its cursor
+    // 14 [CLI-66], [CLI-7], [CLI-8]: a keyspace that a revocation stopped is not followed again with the old token: its copy is purged, and what the
+    // revocation left (the quarantine, the actions that are asked about) is finished
+    const revoked = this.revokedFromMeta(s.meta["revoked"]);
     for (const img of s.replicas) {
+      // 14 [CLI-59]: the cache of another principal of a shared device is not this one's: it goes
+      if (!this.isMyImage(img)) {
+        await this.tx([{ op: "deleteReplica", keyspaceId: img.keyspaceId }]).catch(() => undefined);
+        continue;
+      }
+      if (revoked.has(img.keyspaceId)) continue; // the purge removes it (`finishRevocation`)
       const f = await this.restoreImage(img);
       if (f === undefined) {
         await this.tx([{ op: "deleteReplica", keyspaceId: img.keyspaceId }]).catch(() => undefined);
@@ -140,8 +150,15 @@ export class Engine extends TabLayer {
       f.needsLoad = { cause: "RESUME_TOO_OLD", resume: true };
       this.follows.set(f.id, f);
     }
+    for (const [id, v] of revoked) this.follows.set(id, this.revokedFollow(id, v));
     // 14 [CLI-70]: the keyspaces that the app asked for, with their interest
-    for (const [id, v] of this.followedFromMeta(s.meta["followed"])) this.applyFollowedInterest(this.addFollow(id), v.interest);
+    for (const [id, v] of this.followedFromMeta(s.meta["followed"])) {
+      if (revoked.has(id)) continue;
+      const f = this.addFollow(id);
+      this.applyFollowedInterest(f, v.interest);
+      // 14 [CLI-56]: the time of the last sync outlives a restart that has no replica image
+      if (v.lastSyncMs > f.lastSyncMs) f.lastSyncMs = v.lastSyncMs;
+    }
     const keyspaces = new Set<string>();
     for (const e of [...this.entries.values()].sort((a, b) => a.ordinal - b.ordinal)) {
       // 14 [CLI-29]: an entry that cannot be decoded goes to the dead-letter store, and stops no other entry
@@ -172,7 +189,45 @@ export class Engine extends TabLayer {
     await this.purgeJournal().catch(() => undefined);
     await this.persistFollowed();
     if (this.startRequested) this.beginRunning();
+    // what a revocation left before the restart, finished after this task
+    for (const f of this.follows.values()) if (f.revoked) this.post(() => this.resumeRevocation(f));
     this.queueState();
+  }
+
+  /** The revoked keyspaces that the stored state names (14 [CLI-66]), with the cause and the cursor that the revocation left. */
+  private revokedFromMeta(v: string | number | bigint | undefined): Map<string, { cause: string; done: boolean; seq: bigint; logEpoch: number; manifestVersion: number }> {
+    const out = new Map<string, { cause: string; done: boolean; seq: bigint; logEpoch: number; manifestVersion: number }>();
+    if (typeof v !== "string") return out;
+    try {
+      const o = JSON.parse(v) as Record<string, { cause?: string; done?: boolean; seq?: string; logEpoch?: number; manifestVersion?: number }>;
+      for (const [id, x] of Object.entries(o)) {
+        if (x.cause !== "ACCESS_REVOKED" && x.cause !== "SUBJECT_REVOKED") continue;
+        out.set(id, { cause: x.cause, done: x.done === true, seq: BigInt(x.seq ?? "0"), logEpoch: x.logEpoch ?? 0, manifestVersion: x.manifestVersion ?? 0 });
+      }
+    } catch {
+      // not what this engine wrote: no keyspace is revoked because of it
+    }
+    return out;
+  }
+
+  /** The copy of a keyspace that a revocation purged, as a restart has it: nothing is shown, the cursor's epoch is the one that the outcomes are judged against. */
+  private revokedFollow(id: string, v: { cause: string; done: boolean; seq: bigint; logEpoch: number; manifestVersion: number }): Follow {
+    const f = new Follow(id, this.random);
+    f.state.setCursor(v.seq, v.logEpoch, v.manifestVersion);
+    f.loaded = true;
+    f.purged = true;
+    f.revoked = true;
+    f.stopped = v.cause;
+    f.revocationPurged = v.done;
+    f.revocationDone = v.done;
+    return f;
+  }
+
+  /** What a revocation left at a restart (14 [CLI-66], [CLI-7], [CLI-8]): the outcomes of the epoch of the cursor retire, the purge and the quarantine are finished, the rest is asked about. */
+  private async resumeRevocation(f: Follow): Promise<void> {
+    if (!f.revoked || this.role !== "flusher") return;
+    await this.checkRetirements(f);
+    await this.finishRevocation(f);
   }
 
   /** A followed keyspace that a restored image holds with another interest than the app asked for last: widened or narrowed on the way. */
@@ -203,7 +258,7 @@ export class Engine extends TabLayer {
 
   protected commands(): Record<string, (args: unknown[]) => Promise<unknown>> {
     return {
-      submit: (a) => this.submitAction(a[0] as ActionInput, a[1] as SubmitOptions | undefined),
+      submit: (a) => this.submitAction(a[0] as ActionInput, a[1] as SubmitOptions | undefined, a[2] as string | undefined),
       cancel: (a) => super.cancel(a[0] as string),
       ackDeadLetter: (a) => super.ackDeadLetter(a[0] as string),
       ackExport: (a) => super.ackExport(a[0] as string),
@@ -211,6 +266,7 @@ export class Engine extends TabLayer {
       addKeyspace: (a) => this.addKeyspaceHere(a[0] as string, a[1] as { interest?: string[] } | undefined),
       setInterest: (a) => super.setInterest(a[0] as string, a[1] as string[]),
       createKeyspace: (a) => this.createKeyspaceHere(a[0] as string, a[1] as string),
+      removeKeyspace: (a) => this.removeKeyspaceHere(a[0] as string),
     };
   }
 
@@ -220,7 +276,10 @@ export class Engine extends TabLayer {
   /** Starts the session: loads the followed keyspaces and subscribes (14 [CLI-8]). A follower starts it when it becomes the flusher. */
   start(): void {
     this.startRequested = true;
-    if (this.role === "flusher") this.beginRunning();
+    if (this.role === "flusher") {
+      this.beginRunning();
+      for (const f of this.follows.values()) if (f.revoked && !f.revocationAsked) this.post(() => this.finishRevocation(f));
+    }
   }
 
   /**
@@ -235,6 +294,7 @@ export class Engine extends TabLayer {
           if (f.onSession) f.lastSyncMs = this.serverNow();
           await this.persistHead(f, 0, true);
         }
+        await this.persistFollowed(); // 14 [CLI-56]: the time of the last sync outlives a restart that has no replica image
       }).catch(() => undefined);
     }
     this.stopped = true;
@@ -266,6 +326,12 @@ export class Engine extends TabLayer {
         // the app asks for the keyspace again: nothing of the old copy is shown, and the first load is a cold one
         have.stopped = undefined;
         have.revoked = false;
+        have.revocationPurged = false;
+        have.revocationDone = false;
+        have.revocationAsked = false;
+        have.revocationAttempts = 0;
+        have.purgeJournal = [];
+        have.quarantinedIds = [];
         have.frozen = undefined;
         have.interest = [...interest];
         have.widening = undefined;
@@ -283,6 +349,42 @@ export class Engine extends TabLayer {
       await this.persistFollowed();
     });
     this.kick(this.follows.get(id));
+  }
+
+  /**
+   * Stops following a keyspace (14 [CLI-70]: the engine follows only the keyspaces that the app asks for): it leaves the live session, the local copy
+   * and its persisted replica go, and the keyspace is not followed again at a restart or a handover. It is refused (`REFUSED`) while the outbox
+   * holds an action of the keyspace, which the engine still has to send or to hear the outcome of; the app asks for the keyspace again with `addKeyspace`.
+   * Resolves false for a keyspace that is not followed.
+   */
+  removeKeyspace(id: string): Promise<boolean> {
+    return this.viaFlusher("removeKeyspace", [id], () => this.removeKeyspaceHere(id));
+  }
+
+  private async removeKeyspaceHere(id: string): Promise<boolean> {
+    return this.run(async () => {
+      const f = this.follows.get(id);
+      if (f === undefined) return false;
+      if (this.entriesOf(id).length > 0) throw new LocalRefusal("REFUSED", `the outbox holds actions of the keyspace ${id}: it is followed until they are ended`);
+      if (f.revoked) f.revoked = false; // the app lets go of a keyspace that a revocation stopped: nothing is left of it to follow, or to finish
+      f.crdt.destroy();
+      this.follows.delete(id);
+      await this.tx([{ op: "deleteReplica", keyspaceId: id }, ...this.followedOps()]);
+      this.touchPersisted();
+      if (this.online() && f.onSession) {
+        this.detach(
+          (async () => {
+            try {
+              await this.transport.updateSubscription(create(UpdateSubscriptionRequestSchema, { sessionId: this.sessionId(), remove: [id] }));
+            } catch (e) {
+              this.noteRevoked(e);
+              this.abortSession(); // the session resumes from the cursors that the client holds now (09 [READ-57])
+            }
+          })(),
+        );
+      }
+      return true;
+    });
   }
 
   /**
@@ -304,7 +406,9 @@ export class Engine extends TabLayer {
 
   /** Submits an action (14 [CLI-21]): resolves when it is in the durable outbox, or rejects with a `LocalRefusal`. A follower tab's action is the flusher's to author and store (tab-layer.ts). */
   submit(input: ActionInput, options?: SubmitOptions): Promise<SubmitResult> {
-    return this.viaFlusher("submit", [input, options], () => this.submitAction(input, options));
+    // a follower mints the id of the action: the flusher authors it under that id, once, whoever runs the call (tab-layer.ts)
+    const id = this.role === "follower" ? newUuid(this.random) : undefined;
+    return this.viaFlusher("submit", [input, options, id], () => this.submitAction(input, options, id));
   }
 
   private followed(keyspaceId: string): Follow {
@@ -396,6 +500,7 @@ export class Engine extends TabLayer {
       connection: this.role === "follower" ? (rt?.connection ?? "offline") : this.connection(),
       suspended: rt?.suspended ?? this.holds.all().some((h) => h.kind === "APP_SUSPENDED"),
       holds: rt?.holds ?? this.holds.info(),
+      pendingCalls: this.callsWaiting(),
     };
   }
 
@@ -581,6 +686,14 @@ export class Engine extends TabLayer {
       await this.stop();
       return { done: true, outcome: unsynced > 0 ? "discarded" : "locked", unsynced };
     }
+    // 14 [CLI-28], [CLI-83]: "Entries stay durable until the app acknowledges them": the purge takes the ones that it has not, so each is handed to the app once
+    // more first (a dead-letter entry with `dead-lettered`, an export-hook entry with `exported` and the hook), as 14 [CLI-77] does for a deleted keyspace
+    for (const d of [...this.deadLetters.values()]) this.emit({ type: "dead-lettered", mutationId: d.mutationId, keyspaceId: d.keyspaceId, reason: d.reason });
+    for (const x of [...this.exports.values()]) {
+      this.emit({ type: "exported", mutationId: x.mutationId, keyspaceId: x.keyspaceId, reason: x.reason });
+      this.callExportHook(this.exportRecord(x));
+    }
+    await this.settle();
     await this.run(() => this.tx([{ op: "purgeAll" }]));
     this.entries.clear();
     await this.stop();

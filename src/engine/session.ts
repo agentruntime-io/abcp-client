@@ -67,6 +67,8 @@ const SESSION_LIVE_RESET_MS = 60_000;
 
 export abstract class SessionLayer extends SenderLayer {
   private running = false;
+  /** `start()` was called: a flusher runs its session; a follower that is promoted does too. */
+  protected startRequested = false;
   private sess: {
     state: "idle" | "connecting" | "live";
     id: string;
@@ -85,6 +87,16 @@ export abstract class SessionLayer extends SenderLayer {
 
   protected online(): boolean {
     return this.sess.state === "live";
+  }
+
+  protected resetRuntime(): void {
+    super.resetRuntime();
+    this.running = false;
+    this.wakeSleep = undefined;
+    this.epochFlows.clear();
+    this.loadWaits.clear();
+    this.sess.watchdog?.();
+    this.sess = { state: "idle", id: "", abort: undefined, hbMs: this.sess.hbMs, watchdog: undefined, startedMono: 0, closing: undefined, reconnectAfter: undefined, attempts: 0, fatal: false };
   }
 
   protected sessionId(): string {
@@ -947,7 +959,7 @@ export abstract class SessionLayer extends SenderLayer {
   }
 
   protected needEpochResolution(f: Follow): void {
-    if (this.epochFlows.has(f.id) || !f.loaded) return;
+    if (this.epochFlows.has(f.id) || !f.loaded || f.revoked) return; // a revoked keyspace asks by `askRevoked` (14 [CLI-7]), without a hold and a re-identification
     if (this.earlierEpochItems(f).length === 0) return;
     this.startHold({ kind: "EPOCH_RESOLUTION", scope: "keyspace", keyspaceId: f.id, code: "EPOCH_RESOLUTION" });
     this.beginEpochResolution(f);
@@ -1011,7 +1023,7 @@ export abstract class SessionLayer extends SenderLayer {
   }
 
   /** The reject that a voided outcome ends with (14 [CLI-53], A.1): `STALE` with cause `EPOCH`. */
-  private lostReject(): Reject {
+  protected lostReject(): Reject {
     return create(RejectSchema, {
       code: Code.STALE,
       errorClass: ErrorClass.CONFLICT,

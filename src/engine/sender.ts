@@ -35,13 +35,21 @@ export abstract class SenderLayer extends ReactionLayer {
   // ---------------------------------------------------------------------------------------------------------------------
   // Authoring (14 [CLI-17], [CLI-18], [CLI-19], [CLI-21], [CLI-23], [CLI-82])
 
+  protected resetRuntime(): void {
+    super.resetRuntime();
+    this.seqInflight.clear();
+  }
+
   protected isOffline(f: Follow): boolean {
     if (!this.online()) return true;
     return this.holds.blocking({ keyspaceId: f.id, lane: "SEQUENCED", mutationId: "" }).some((h) => h.scope === "app" || h.scope === "keyspace");
   }
 
-  protected submitAction(input: ActionInput, options?: SubmitOptions): Promise<SubmitResult> {
+  protected submitAction(input: ActionInput, options?: SubmitOptions, presetId?: string): Promise<SubmitResult> {
     return this.run(async () => {
+      // 14 [CLI-61]: a follower tab minted the id and asks again until it is answered: the call that the flusher already committed (it may have gone away before it
+      // answered) is answered with its id, and the action is authored once
+      if (presetId !== undefined && this.knownMutation(presetId)) return { mutationId: presetId };
       const f = this.follows.get(input.keyspaceId);
       // 14 [CLI-69]: an action is authored only into a keyspace that the engine follows
       if (f === undefined) throw new LocalRefusal("NOT_FOLLOWED", `the keyspace ${input.keyspaceId} is not followed`);
@@ -56,7 +64,7 @@ export abstract class SenderLayer extends ReactionLayer {
       if (manifest === undefined) throw new LocalRefusal("INVALID", `the manifest version ${version} is not loaded`);
       const op = manifest.opType(input.opType);
       if (op === undefined) throw new LocalRefusal("INVALID", `the manifest declares no op type ${input.opType}`);
-      const id = newUuid(this.random); // 14 [CLI-23]: minted once, at authoring
+      const id = presetId ?? newUuid(this.random); // 14 [CLI-23]: minted once, at authoring
       // 14 [CLI-82]: `fail_fast` while offline is refused at once, committed to nothing, with `rejected` and the cause OFFLINE
       if (op.offlineMode === "fail_fast" && this.isOffline(f)) {
         this.emit({ type: "rejected", mutationId: id, keyspaceId: f.id, cause: "OFFLINE" });
