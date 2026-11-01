@@ -115,7 +115,26 @@ export abstract class ReplicaStoreLayer extends EndingLayer {
     // the confirmed documents of the CRDT keys that the record changed (14 [CLI-13])
     f.crdt.apply(plan);
     f.crdt.reconcile(st);
+    for (const c of rec.changes) if (c.key.startsWith("abpc.saga.v1/")) this.sagaKeyChanged(f, c.key); // the sagas that the client follows (14 [CLI-14], `sagas.ts`)
     return { plan, anomalies };
+  }
+
+  /** A key of the saga state changed in the confirmed state of the keyspace (14 [CLI-14]); the saga layer follows the runs. */
+  protected sagaKeyChanged(_f: Follow, _key: string): void {
+    // nothing here: `SagaLayer` overrides it
+  }
+
+  /**
+   * The app started a saga (11 [COORD-58]): its run key `abpc.saga.v1/run/{sagaId}` in the keyspace is followed (14 [CLI-14]). The engine calls it for the Start that it
+   * authors; an app calls it for one that it started by other means.
+   */
+  followSaga(_keyspaceId: string, _sagaId: string): void {
+    // nothing here: `SagaLayer` overrides it
+  }
+
+  /** A load or a restored image installed state: the saga layer looks at the moved keys and the run keys that it holds. */
+  protected sagaScan(_f: Follow): void {
+    // nothing here: `SagaLayer` overrides it
   }
 
   // ---------------------------------------------------------------------------------------------------------------------
@@ -255,6 +274,7 @@ export abstract class ReplicaStoreLayer extends EndingLayer {
     f.lastSyncMs = img.head.lastSyncMs;
     f.image.ok = true;
     f.image.headMs = this.serverNow();
+    f.image.entryCount = img.base.entries.length;
     return f;
   }
 

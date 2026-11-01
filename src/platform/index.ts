@@ -5,5 +5,5 @@
 export { BroadcastTabChannel, type BroadcastChannelConstructor, type BroadcastChannelLike } from "./channel.js";
 export { InProcessLocks } from "./locks.js";
 export { WebLocks, type LockManagerLike } from "./web-locks.js";
-export { IndexedDbStorage, IndexedDbStorageProvider, type IDBFactoryLike, type StorageManagerLike } from "./idb-storage.js";
+export { IndexedDbStorage, IndexedDbStorageProvider, type IDBFactoryLike, type IndexedDbOptions, type KeyRangeFactory, type StorageManagerLike } from "./idb-storage.js";
 export { WebTab, createWebHost, globalWebEnv, type WebEnv, type WebHostOptions } from "./web.js";

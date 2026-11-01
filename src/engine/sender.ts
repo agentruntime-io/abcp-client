@@ -12,7 +12,7 @@
 
 import { create } from "@bufbuild/protobuf";
 import { MutateRequestSchema, type MutateResponse, type MutationResult, type Mutation } from "../gen/abpc/v2/sync_pb.js";
-import { Code, DecisionStatus, ErrorClass, KeyspaceLifecycle, StaleCause, type Reject, type Retry } from "../gen/abpc/v2/types_pb.js";
+import { ChangeKind, Code, DecisionStatus, ErrorClass, KeyspaceLifecycle, StaleCause, type Reject, type Retry } from "../gen/abpc/v2/types_pb.js";
 import { VersionTopology } from "../rules/fold/index.js";
 import { buildMutation, checkAction } from "./author.js";
 import { codeName } from "./codes.js";
@@ -140,6 +140,11 @@ export abstract class SenderLayer extends ReactionLayer {
       this.nextOrdinal++;
       this.entries.set(id, entry);
       this.decoded.set(id, m);
+      // 14 [CLI-14]: a client that started a saga follows its run key; the Start SETs `abpc.saga.v1/run/{saga_id}` (11 [COORD-58])
+      for (const c of m.changes) {
+        const run = /^abpc\.saga\.v1\/run\/([^/]+)$/.exec(c.key);
+        if (run !== null && c.kind === ChangeKind.SET) this.followSaga(f.id, run[1] as string);
+      }
       f.invalidate();
       // 14 [CLI-11], [CLI-38]: a `CAS` that the view shows with no effect is `corrected` when it commits; what the view shows now is kept
       // with the entry, so that a restart before the commit does not lose it
@@ -202,7 +207,8 @@ export abstract class SenderLayer extends ReactionLayer {
 
   protected async pumpKeyspace(f: Follow): Promise<void> {
     if (!this.online() || !f.loaded || f.frozen !== undefined) return;
-    if (f.stopped !== undefined && f.stopped !== "GRANT_CHANGED") return;
+    // a keyspace that a session dropped with NOT_FOUND is not on the session, but `Mutate` needs none: its head is resent as the probe of the hold (Q61)
+    if (f.stopped !== undefined && f.stopped !== "GRANT_CHANGED" && f.stopped !== "NOT_FOUND") return;
     // 14 [CLI-24], [CLI-53], [CLI-64]: an action that was sent in an earlier epoch is resolved by `GetMutationResult`, never resent; the
     // client learns that the epoch changed from the `KeyspaceDropped{EPOCH_CHANGED}` that follows `Subscribed`, so it sends nothing to a
     // keyspace on a new session until the `KeyspaceAdded` has come with the epoch that it follows
@@ -372,7 +378,7 @@ export abstract class SenderLayer extends ReactionLayer {
     }
     if (hasSequenced) this.seqInflight.add(f.id);
     const req = create(MutateRequestSchema, { mutations, supportedFeatures: [...this.features] });
-    this.detach(this.sendRequest(f, live, req, hasSequenced));
+    this.detach(this.sendRequest(f, live, req, hasSequenced, this.clientId));
   }
 
   /**
@@ -384,7 +390,7 @@ export abstract class SenderLayer extends ReactionLayer {
   }
 
   /** The call, outside the queue: its answer comes back as a task. */
-  private async sendRequest(f: Follow, batch: OutboxEntry[], req: import("../gen/abpc/v2/sync_pb.js").MutateRequest, hasSequenced: boolean): Promise<void> {
+  private async sendRequest(f: Follow, batch: OutboxEntry[], req: import("../gen/abpc/v2/sync_pb.js").MutateRequest, hasSequenced: boolean, sentUnder: string): Promise<void> {
     let resp: MutateResponse;
     try {
       resp = await this.transport.mutate(req);
@@ -398,7 +404,7 @@ export abstract class SenderLayer extends ReactionLayer {
     }
     await this.run(async () => {
       if (hasSequenced) this.seqInflight.delete(f.id);
-      await this.onMutateResponse(f, batch, resp);
+      await this.onMutateResponse(f, batch, resp, sentUnder);
       await this.flushDirty();
     });
   }
@@ -406,7 +412,7 @@ export abstract class SenderLayer extends ReactionLayer {
   // ---------------------------------------------------------------------------------------------------------------------
   // The answer (14 [CLI-7], [CLI-27], [CLI-78])
 
-  private async onMutateResponse(f: Follow, batch: OutboxEntry[], resp: MutateResponse): Promise<void> {
+  private async onMutateResponse(f: Follow, batch: OutboxEntry[], resp: MutateResponse, sentUnder: string): Promise<void> {
     for (const e of batch) {
       this.rt(e.mutationId).inflight = false;
       this.rt(e.mutationId).authTries = 0;
@@ -423,6 +429,9 @@ export abstract class SenderLayer extends ReactionLayer {
       for (let i = 0; i < batch.length; i++) {
         const e = batch[i] as OutboxEntry;
         if (!this.entries.has(e.mutationId) || this.ending.has(e.mutationId)) continue;
+        // 14 [CLI-63] (V19 SHOULD-4): the request left under a `client_id` that was replaced: its SEQUENCED actions were re-stamped, in authoring order, and are sent
+        // again under the new one; what this answer says of them is of slots that no longer exist (a GATED action has no slot to lose: its result is by its id)
+        if (e.lane === "SEQUENCED" && sentUnder !== this.clientId) continue;
         await this.applyResult(e, resp.results[i] as MutationResult, "mutate");
       }
     } finally {

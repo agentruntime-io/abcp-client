@@ -287,8 +287,11 @@ export abstract class ReactionLayer extends ReplicaLayer {
       return;
     }
 
+    // 14 [CLI-34] (V19 SHOULD-3): "a `Decided` with `REJECTED`, whatever the class of its reject, an unknown one included" is a final rejection. A resend of a
+    // decided intent can only get the same stored decision again, so no class of it is a hold, a retry or a resend after a refresh of the token: the
+    // class decides how it ends (a DEAD_LETTER reject, a HOLD or RETRY one too, is dead-lettered; a CONFLICT one goes to the handler).
     // the hold rows of Table 14.1 (a HOLD code, a class that the client does not know)
-    const hk = holdKindOf(reject);
+    const hk = decided ? undefined : holdKindOf(reject);
     if (hk !== undefined) {
       await this.enterHold(e, reject, hk);
       return;
@@ -296,8 +299,8 @@ export abstract class ReactionLayer extends ReplicaLayer {
     if (known) {
       switch (reject.code) {
         case Code.PERMISSION_DENIED:
-          // 14 [CLI-46]: refresh the token once and resend before treating the result as final
-          if (!e.permissionRetried) {
+          // 14 [CLI-46]: refresh the token once and resend before treating the result as final (a decision is final already)
+          if (!decided && !e.permissionRetried) {
             e.permissionRetried = true;
             this.markDirty(e);
             this.refreshThenResend(e);
@@ -305,8 +308,8 @@ export abstract class ReactionLayer extends ReplicaLayer {
           }
           break;
         case Code.ACTOR_MISMATCH:
-          // 14 [CLI-46]: nothing was recorded; start a new client_id, re-stamp, and resend once under it
-          if (!e.actorMismatchRetried) {
+          // 14 [CLI-46]: nothing was recorded; start a new client_id, re-stamp, and resend once under it (a decision was recorded)
+          if (!decided && !e.actorMismatchRetried) {
             e.actorMismatchRetried = true;
             this.markDirty(e);
             this.reidentify("ACTOR_MISMATCH");
@@ -332,6 +335,10 @@ export abstract class ReactionLayer extends ReplicaLayer {
         default:
           break;
       }
+    }
+    if (decided && reaction !== "CONFLICT") {
+      await this.endAction(e, { sink: "deadLetter", reject, reason: codeName(reject.code), dependents: "fail" });
+      return;
     }
     switch (reaction) {
       case "RETRY":
@@ -574,18 +581,21 @@ export abstract class ReactionLayer extends ReplicaLayer {
   protected onProbeDue(h: Hold): void {
     const f = h.keyspaceId !== undefined ? this.follows.get(h.keyspaceId) : undefined;
     switch (h.kind) {
-      case "KEYSPACE_NOT_FOUND":
-        // SPEC-QUESTION (Q61, open): Table 14.1's row for `KEYSPACE_NOT_FOUND` has the client resend the action with the hold backoff, and a client that
-        // holds no action re-add the keyspace (09 [READ-65]). A keyspace that a session dropped with NOT_FOUND (a server that lost it, a restart of an
-        // in-memory server) is not on the session, and `pumpKeyspace` sends nothing to it: its actions cannot be the probe, and nothing would re-add it.
-        // Reading A (taken): the probe is the re-add, whether or not the outbox holds actions, and they are sent once the add succeeds (the row's
-        // "Clears when": "The keyspace exists: ... an add succeeds"). Reading B: the resend of the head is the whole probe, and the action stays
-        // held until its bound ends it.
-        if (f !== undefined && (this.entriesOf(f.id).length === 0 || f.stopped === "NOT_FOUND")) {
+      case "KEYSPACE_NOT_FOUND": {
+        // Q61 (the coordinator, V19: the text decides): Table 14.1's row for `KEYSPACE_NOT_FOUND` has the client resend the action with the hold backoff, "A client
+        // that holds no action for the keyspace adds it again" (14 [CLI-80], 09 [READ-65]). `Mutate` needs no session, so a keyspace that a session dropped with
+        // NOT_FOUND still has its head action resent, and what the resend gets is the answer: another result clears the hold (and the keyspace is added again,
+        // `clearProbeHolds`), the same one leaves it. The keyspace is added again as the probe only when the outbox holds nothing for it.
+        const held = f === undefined ? [] : this.entriesOf(f.id).filter((e) => e.outcome === undefined && !this.ending.has(e.mutationId) && e.stuck === undefined);
+        if (f !== undefined && held.length === 0) {
           this.advanceProbe(h);
           this.readdKeyspace(f);
-        } else this.schedulePump(); // the head is resent
+        } else {
+          if (h.probeId === undefined || !this.entries.has(h.probeId)) h.probeId = [...held].sort((a, b) => a.ordinal - b.ordinal)[0]?.mutationId; // a hold that a drop frame started names no head yet
+          this.schedulePump(); // the head is resent
+        }
         break;
+      }
       case "UNKNOWN_OP_TYPE":
       case "UNSUPPORTED_FEATURE":
       case "UNKNOWN_HOLD":
@@ -657,6 +667,11 @@ export abstract class ReactionLayer extends ReplicaLayer {
       if (h.kind !== "UNSUPPORTED_FEATURE" && h.kind !== "UNKNOWN_HOLD" && h.kind !== "MUTATE_FAILURE" && h.kind !== "KEYSPACE_NOT_FOUND" && h.kind !== "UNKNOWN_OP_TYPE") continue;
       if (h.keyspaceId !== e.keyspaceId || h.kind === keep) continue;
       if (h.scope === "lane" && h.lane !== e.lane) continue;
+      if (h.kind === "KEYSPACE_NOT_FOUND" && h.keyspaceId !== undefined) {
+        // the keyspace exists (14 Table 14.1, "Clears when"): a session that dropped it with NOT_FOUND follows it again, with the load of a resume check
+        const f = this.follows.get(h.keyspaceId);
+        if (f?.stopped === "NOT_FOUND") this.readdKeyspace(f);
+      }
       this.stopHold(h.kind, h.keyspaceId, h.lane, h.mutationId);
     }
   }
@@ -728,7 +743,10 @@ export abstract class ReactionLayer extends ReplicaLayer {
    * is first sent ([CLI-27]), and a GATED action without a definitive result takes one, with a recomputed `after_client_seq`, when it is next sent.
    * The lane state starts over. Mutation ids and content never change ([CLI-23]). A live session is rebound to the new id ([CLI-78]).
    *
-   * An action whose request is in flight, or whose intent is being polled, answers under the old `client_id`: it is re-stamped when it is next sent.
+   * An action whose request is in flight is re-stamped with the others, in authoring order (V19 SHOULD-4: "every SEQUENCED action that it sent and that has no
+   * definitive result"): the answer of that request is of the old `client_id` and its slots, and is not applied (`onMutateResponse`): the action is sent again
+   * under the new one, and the server, which has the id's outcome when it recorded one, answers with it as a duplicate. An action whose intent is being
+   * polled answers under the old `client_id` and is re-stamped when it is next sent.
    */
   protected reidentify(_why: string): void {
     this.clientId = this.mintClientId();
@@ -745,7 +763,7 @@ export abstract class ReactionLayer extends ReplicaLayer {
       this.markDirty(e);
       const rt = this.rt(e.mutationId);
       if (!rt.inflight) rt.nextAttemptAt = 0;
-      if (e.lane === "SEQUENCED" && e.everSent && !rt.inflight && !rt.polling && !this.ending.has(e.mutationId) && e.stuck === undefined) restamp.push(e);
+      if (e.lane === "SEQUENCED" && e.everSent && !rt.polling && !this.ending.has(e.mutationId) && e.stuck === undefined) restamp.push(e);
     }
     // [CLI-63]: "in authoring order", whatever the order in which the actions could be sent: an action that waits for its retry or its hold keeps
     // its place before the later ones, which then wait for it, as the lane is processed in `client_seq` order (07 §7.4)

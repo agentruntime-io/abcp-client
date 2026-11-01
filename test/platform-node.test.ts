@@ -123,8 +123,9 @@ describe("the file storage", () => {
     await expect(s.commit(putAll(["c"]))).rejects.toBeInstanceOf(StoreFull);
     expect(readFileSync(path.join(d, "journal.jsonl"), "utf8")).toBe(before);
     await s.close();
-    // a crash in the middle of a commit: the journal ends in a part of a line, and in a line whose check does not hold
-    appendFileSync(path.join(d, "journal.jsonl"), '00000000 [{"op":"deleteEntry","mutationId":"a"}]\n12345678 {"half');
+    // a crash in the middle of a commit: the journal ends in a part of a line, which has no end of line (a line that has its end of line and fails its
+    // check is damage, not a crash's, and the partition is refused: see platform-file.test.ts)
+    appendFileSync(path.join(d, "journal.jsonl"), '12345678 {"half');
     s = await FileStorage.open(d, { maxOutbox: 2 });
     expect((await s.load()).entries.map((e) => e.mutationId).sort()).toEqual(["a", "b"]);
     await s.commit([{ op: "deleteEntry", mutationId: "a" }]); // the next commit does not follow garbage

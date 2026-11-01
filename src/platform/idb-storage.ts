@@ -10,8 +10,14 @@
 //
 // The registry database `abpc:registry` lists the partitions, for `list` (`indexedDB.databases()` is not in every browser).
 //
-// The bounds of 14 [CLI-84] are judged before the transaction from the ids that the storage holds in memory (read once at open), so a commit that
-// would grow a full store is refused without a write. `mode` is `best-effort` until `navigator.storage.persist()` is granted (14 [CLI-75]).
+// Another tab writes to the same database (the tab that is the flusher changes with the handover, 14 [CLI-61]), so nothing that this storage knows of it
+// is trusted past the call that read it (V19 MUST-2): a commit reads the headers of the replicas that it touches, and the keys of the rows that it
+// removes, from the database just before its transaction, and the bounds of 14 [CLI-84] are judged on the keys of the stores that it grows, read the
+// same way; `load` reads the keys that `full` judges on. A purge (14 [CLI-66]) deletes the rows that the database holds, whoever wrote them.
+// `mode` is `best-effort` until `navigator.storage.persist()` is granted (14 [CLI-75]).
+//
+// A connection yields to a request to delete or upgrade the database (`versionchange`): it closes, so that the sign-out of another tab is not kept
+// waiting for it (V19 SHOULD-8); a storage whose connection was closed so refuses every call with a StorageError.
 //
 // Untested against a real IndexedDB (Node has none): `test/platform-idb.test.ts` runs it against a small in-memory double of the API subset that it uses.
 
@@ -25,6 +31,7 @@ import {
   type ReplicaImage,
   type StorageMode,
   type StorageOp,
+  type StoredLight,
   type StoredState,
   type StoreName,
 } from "../engine/storage.js";
@@ -48,8 +55,14 @@ export interface IDBObjectStoreLike {
   put(value: unknown, key: string): IDBRequestLike;
   delete(key: string): IDBRequestLike;
   clear(): IDBRequestLike;
-  getAll(): IDBRequestLike<unknown[]>;
-  getAllKeys(): IDBRequestLike<string[]>;
+  get(key: string): IDBRequestLike;
+  /** `range` is an `IDBKeyRange` (see `KeyRangeFactory`). */
+  getAll(range?: unknown): IDBRequestLike<unknown[]>;
+  getAllKeys(range?: unknown): IDBRequestLike<string[]>;
+}
+/** `IDBKeyRange`, for reading the rows of one keyspace without reading the others'. A platform without it reads the keys and filters. */
+export interface KeyRangeFactory {
+  bound(lower: unknown, upper: unknown): unknown;
 }
 export interface IDBTransactionLike {
   objectStore(name: string): IDBObjectStoreLike;
@@ -60,14 +73,20 @@ export interface IDBTransactionLike {
   onabort: ((ev?: unknown) => void) | null;
 }
 export interface IDBDatabaseLike {
+  /** Another connection asks to delete or upgrade the database. */
+  onversionchange?: ((ev?: unknown) => void) | null;
   createObjectStore(name: string): unknown;
   objectStoreNames: { contains(name: string): boolean };
   transaction(names: string[], mode: "readonly" | "readwrite"): IDBTransactionLike;
   close(): void;
 }
+export interface IDBDeleteRequestLike extends IDBRequestLike {
+  /** Another connection keeps the database open: the deletion waits for it. */
+  onblocked?: ((ev?: unknown) => void) | null;
+}
 export interface IDBFactoryLike {
   open(name: string, version?: number): IDBOpenRequestLike;
-  deleteDatabase(name: string): IDBRequestLike;
+  deleteDatabase(name: string): IDBDeleteRequestLike;
 }
 /** `navigator.storage`. */
 export interface StorageManagerLike {
@@ -93,13 +112,23 @@ function done(tx: IDBTransactionLike): Promise<void> {
   });
 }
 
-async function openDb(factory: IDBFactoryLike, name: string, stores: readonly string[]): Promise<IDBDatabaseLike> {
+async function openDb(factory: IDBFactoryLike, name: string, stores: readonly string[], onClosed?: () => void): Promise<IDBDatabaseLike> {
   const req = factory.open(name, 1);
   req.onupgradeneeded = (): void => {
     const db = req.result;
     for (const s of stores) if (!db.objectStoreNames.contains(s)) db.createObjectStore(s);
   };
-  return wait(req);
+  const db = await wait(req);
+  // another tab deletes the database (a sign-out, 14 [CLI-65]) or upgrades it: this connection closes at once, or that tab waits for it for ever
+  db.onversionchange = (): void => {
+    try {
+      db.close();
+    } catch {
+      // closed already
+    }
+    onClosed?.();
+  };
+  return db;
 }
 
 const pad = (n: bigint | number, width: number): string => n.toString().padStart(width, "0");
@@ -111,65 +140,87 @@ interface ReplicaHeader {
   base: Omit<ReplicaBase, "entries">;
   entryCount: number;
 }
-interface Mirror extends ReplicaHeader {
-  tail: bigint[];
-}
 
 type Write = { store: StoreId; key: string; value: unknown } | { store: StoreId; key: string; delete: true } | { store: StoreId; clear: true };
 
-const BOUNDED: { name: StoreName; store: StoreId; opts: "maxOutbox" | "maxDeadLetters" | "maxJournal" | "maxExports" }[] = [
+type Bounded = "entries" | "deadLetters" | "journal" | "exports";
+
+const BOUNDED: { name: StoreName; store: Bounded; opts: "maxOutbox" | "maxDeadLetters" | "maxJournal" | "maxExports" }[] = [
   { name: "outbox", store: "entries", opts: "maxOutbox" },
   { name: "deadLetters", store: "deadLetters", opts: "maxDeadLetters" },
   { name: "journal", store: "journal", opts: "maxJournal" },
   { name: "exports", store: "exports", opts: "maxExports" },
 ];
 
+/** What a commit reads of the database before it writes. */
+interface Fresh {
+  headers: Map<string, ReplicaHeader | undefined>;
+  entryKeys: Map<string, string[]>;
+  tailKeys: Map<string, string[]>;
+  ids: Partial<Record<Bounded, Set<string>>>;
+}
+
 export class IndexedDbStorage implements OutboxStorage {
   mode: StorageMode = "best-effort";
-  private ids: Record<"entries" | "deadLetters" | "journal" | "exports", Set<string>> = { entries: new Set(), deadLetters: new Set(), journal: new Set(), exports: new Set() };
-  private replicas = new Map<string, Mirror>();
+  /** The ids of the bounded stores, as of the last read of them (`load`, or a commit that grows one): the bounds are judged on them (14 [CLI-84]). */
+  private ids: Record<Bounded, Set<string>> = { entries: new Set(), deadLetters: new Set(), journal: new Set(), exports: new Set() };
   private chain: Promise<void> = Promise.resolve();
+  /** The connection was closed by another tab's request to delete or upgrade the database. */
+  private closed = false;
 
   private constructor(
     private readonly db: IDBDatabaseLike,
     private readonly bounds: MemoryStorageOptions,
     private readonly manager: StorageManagerLike | undefined,
+    private readonly range: KeyRangeFactory | undefined,
   ) {}
 
-  static async open(factory: IDBFactoryLike, name: string, bounds: MemoryStorageOptions = {}, manager?: StorageManagerLike): Promise<IndexedDbStorage> {
-    const db = await openDb(factory, name, STORES);
-    const s = new IndexedDbStorage(db, bounds, manager);
-    await s.index();
+  static async open(factory: IDBFactoryLike, name: string, bounds: MemoryStorageOptions = {}, manager?: StorageManagerLike, range?: KeyRangeFactory): Promise<IndexedDbStorage> {
+    let self: IndexedDbStorage | undefined;
+    const db = await openDb(factory, name, STORES, () => {
+      if (self !== undefined) self.closed = true;
+    });
+    const s = new IndexedDbStorage(db, bounds, manager, range);
+    self = s;
+    await s.readIds();
     if (manager?.persisted !== undefined && (await manager.persisted().catch(() => false))) s.mode = "persisted";
     return s;
   }
 
-  /** Reads the ids and the replica headers into memory. */
-  private async index(): Promise<void> {
-    const tx = this.db.transaction(["entries", "deadLetters", "journal", "exports", "replicas", "replicaTail"], "readonly");
+  /** Whether another tab's request to delete or upgrade the database closed this connection. */
+  get isClosed(): boolean {
+    return this.closed;
+  }
+
+  private connection(): IDBDatabaseLike {
+    if (this.closed) throw new StorageError("the database is closed (another tab deleted or upgraded it, or this storage was closed)");
+    return this.db;
+  }
+
+  /** The keys of the bounded stores, from the database now. */
+  private async readIds(): Promise<void> {
+    const names: Bounded[] = ["entries", "deadLetters", "journal", "exports"];
+    const tx = this.connection().transaction(names, "readonly");
     const finished = done(tx);
-    const [entries, dead, journal, exports, headers, tailKeys] = [
-      wait(tx.objectStore("entries").getAllKeys()),
-      wait(tx.objectStore("deadLetters").getAllKeys()),
-      wait(tx.objectStore("journal").getAllKeys()),
-      wait(tx.objectStore("exports").getAllKeys()),
-      wait(tx.objectStore("replicas").getAllKeys()),
-      wait(tx.objectStore("replicaTail").getAllKeys()),
-    ];
-    const hdrReq = tx.objectStore("replicas").getAll();
-    const hdrs = wait(hdrReq);
+    const reads = names.map((n) => wait(tx.objectStore(n).getAllKeys()));
+    void Promise.allSettled(reads); // a failed transaction fails its requests too: `finished` reports it
     await finished;
-    this.ids = { entries: new Set(await entries), deadLetters: new Set(await dead), journal: new Set(await journal), exports: new Set(await exports) };
-    const keys = await headers;
-    const values = (await hdrs) as ReplicaHeader[];
-    this.replicas = new Map();
-    keys.forEach((k, i) => this.replicas.set(k, { ...(values[i] as ReplicaHeader), tail: [] }));
-    for (const row of await tailKeys) this.replicas.get(keyspaceOf(row))?.tail.push(BigInt(row.slice(row.indexOf("\u0000") + 1)));
+    for (const [i, n] of names.entries()) this.ids[n] = new Set(await (reads[i] as Promise<string[]>));
+  }
+
+  /** The key range of the rows of one keyspace in `replicaEntries` and `replicaTail`: `<keyspace>\0` up to `<keyspace>\1`. */
+  private rangeOf(keyspace: string): unknown {
+    return this.range?.bound(`${keyspace}\u0000`, `${keyspace}\u0001`);
+  }
+
+  /** The keys of a store of rows that belong to a keyspace (a read that a key range narrowed holds no other). */
+  private ownKeys(keys: string[], keyspace: string): string[] {
+    return this.range === undefined ? keys.filter((k) => keyspaceOf(k) === keyspace) : keys;
   }
 
   async load(): Promise<StoredState> {
     await this.chain;
-    const tx = this.db.transaction([...STORES], "readonly");
+    const tx = this.connection().transaction([...STORES], "readonly");
     const finished = done(tx); // listened to from the start: the transaction can complete before the requests' promises are awaited
     const all = (s: StoreId): Promise<unknown[]> => wait(tx.objectStore(s).getAll());
     const keys = (s: StoreId): Promise<string[]> => wait(tx.objectStore(s).getAllKeys());
@@ -190,6 +241,9 @@ export class IndexedDbStorage implements OutboxStorage {
       all("replicaTail"),
     ]);
     await finished;
+    // what this read saw is what the bounds are judged on from here: a tab that became the flusher reads before it writes (V19 MUST-2)
+    const idsOf = (rows: unknown[]): Set<string> => new Set((rows as { mutationId: string }[]).map((e) => e.mutationId));
+    this.ids = { entries: idsOf(entries), deadLetters: idsOf(deadLetters), journal: idsOf(journal), exports: idsOf(exports) };
     const meta: Record<string, string | number | bigint> = {};
     metaKeys.forEach((k, i) => (meta[k] = metaValues[i] as string | number | bigint));
     const images = new Map<string, ReplicaImage>();
@@ -211,11 +265,74 @@ export class IndexedDbStorage implements OutboxStorage {
     };
   }
 
+  async loadLight(): Promise<StoredLight> {
+    await this.chain;
+    const names: StoreId[] = ["entries", "deadLetters", "journal", "exports", "rejections", "drafts", "meta", "replicas"];
+    const tx = this.connection().transaction(names, "readonly");
+    const finished = done(tx);
+    const all = (s: StoreId): Promise<unknown[]> => wait(tx.objectStore(s).getAll());
+    const [entries, deadLetters, journal, exports, rejections, drafts, metaKeys, metaValues, headerKeys, headers] = await Promise.all([
+      all("entries"),
+      all("deadLetters"),
+      all("journal"),
+      all("exports"),
+      all("rejections"),
+      all("drafts"),
+      wait(tx.objectStore("meta").getAllKeys()),
+      all("meta"),
+      wait(tx.objectStore("replicas").getAllKeys()),
+      all("replicas"),
+    ]);
+    await finished;
+    const meta: Record<string, string | number | bigint> = {};
+    metaKeys.forEach((k, i) => (meta[k] = metaValues[i] as string | number | bigint));
+    return {
+      entries: entries as StoredState["entries"],
+      deadLetters: deadLetters as StoredState["deadLetters"],
+      journal: journal as StoredState["journal"],
+      exports: exports as StoredState["exports"],
+      rejections: rejections as StoredState["rejections"],
+      drafts: drafts as StoredState["drafts"],
+      replicas: headerKeys.map((k, i) => {
+        const h = headers[i] as ReplicaHeader;
+        return { keyspaceId: k, head: h.head, base: h.base, entryCount: h.entryCount };
+      }),
+      meta,
+    };
+  }
+
+  async loadImage(keyspaceId: string, opts: { entries?: boolean; tailAfter?: bigint } = {}): Promise<ReplicaImage | undefined> {
+    await this.chain;
+    const tx = this.connection().transaction(["replicas", "replicaEntries", "replicaTail"], "readonly");
+    const finished = done(tx);
+    const withEntries = opts.entries !== false;
+    const range = this.rangeOf(keyspaceId);
+    const header = wait(tx.objectStore("replicas").get(keyspaceId));
+    // without a key range the rows of every keyspace come back, and their keys tell them apart
+    const entryKeys = withEntries ? wait(tx.objectStore("replicaEntries").getAllKeys(range)) : Promise.resolve([] as string[]);
+    const entryRows = withEntries ? wait(tx.objectStore("replicaEntries").getAll(range)) : Promise.resolve([] as unknown[]);
+    const tailKeys = wait(tx.objectStore("replicaTail").getAllKeys(range));
+    const tailRows = wait(tx.objectStore("replicaTail").getAll(range));
+    void Promise.allSettled([header, entryKeys, entryRows, tailKeys, tailRows]);
+    await finished;
+    const h = (await header) as ReplicaHeader | undefined;
+    if (h === undefined) return undefined;
+    const mine = <T>(keys: string[], rows: T[]): T[] => (this.range === undefined ? rows.filter((_, i) => keyspaceOf(keys[i] as string) === keyspaceId) : rows);
+    const tail = mine(await tailKeys, (await tailRows) as RecordMessage[]);
+    const after = opts.tailAfter;
+    return {
+      keyspaceId,
+      head: h.head,
+      base: { ...h.base, entries: withEntries ? (mine(await entryKeys, await entryRows) as KeyEntry[]) : [] },
+      tail: after === undefined ? tail : tail.filter((r) => r.seq > after),
+    };
+  }
+
   full(): StoreName[] {
     const out: StoreName[] = [];
     for (const b of BOUNDED) {
       const max = this.bounds[b.opts];
-      if (max !== undefined && this.ids[b.store as keyof typeof this.ids].size >= max) out.push(b.name);
+      if (max !== undefined && this.ids[b.store].size >= max) out.push(b.name);
     }
     return out;
   }
@@ -236,33 +353,87 @@ export class IndexedDbStorage implements OutboxStorage {
     return run;
   }
 
+  /**
+   * What the operations need of the database, read in one transaction before the one that writes: the headers of the replicas that they read or
+   * write, the keys of the rows that they remove, and the keys of the bounded stores that they grow when a bound is set.
+   */
+  private async readFresh(touched: ReadonlySet<string>, drops: ReadonlySet<string>, grows: ReadonlySet<Bounded>): Promise<Fresh> {
+    const fresh: Fresh = { headers: new Map(), entryKeys: new Map(), tailKeys: new Map(), ids: {} };
+    if (touched.size === 0 && drops.size === 0 && grows.size === 0) return fresh;
+    const names: StoreId[] = [...grows];
+    if (touched.size > 0 || drops.size > 0) names.push("replicas");
+    if (drops.size > 0) names.push("replicaEntries", "replicaTail");
+    const tx = this.connection().transaction(names, "readonly");
+    const finished = done(tx);
+    const reads: Promise<void>[] = [];
+    for (const ks of touched) reads.push(wait(tx.objectStore("replicas").get(ks)).then((h) => void fresh.headers.set(ks, h as ReplicaHeader | undefined)));
+    for (const ks of drops) {
+      const range = this.rangeOf(ks);
+      reads.push(wait(tx.objectStore("replicaEntries").getAllKeys(range)).then((k) => void fresh.entryKeys.set(ks, this.ownKeys(k, ks))));
+      reads.push(wait(tx.objectStore("replicaTail").getAllKeys(range)).then((k) => void fresh.tailKeys.set(ks, this.ownKeys(k, ks))));
+    }
+    for (const g of grows) reads.push(wait(tx.objectStore(g).getAllKeys()).then((k) => void (fresh.ids[g] = new Set(k))));
+    void Promise.allSettled(reads);
+    await finished;
+    await Promise.all(reads);
+    return fresh;
+  }
+
   private async commitNow(ops: readonly StorageOp[]): Promise<void> {
-    const ids = { entries: new Set(this.ids.entries), deadLetters: new Set(this.ids.deadLetters), journal: new Set(this.ids.journal), exports: new Set(this.ids.exports) };
-    const mirrors = new Map(this.replicas);
-    const own = new Set<string>(); // the mirrors that this commit has copied, and may change in place
-    const mirror = (ks: string): Mirror | undefined => {
-      const m = mirrors.get(ks);
-      if (m === undefined) return undefined;
-      if (!own.has(ks)) {
-        own.add(ks);
-        const c: Mirror = { ...m, tail: [...m.tail] };
-        mirrors.set(ks, c);
-        return c;
+    // what the commit needs to know of the database (V19 MUST-2): another tab wrote since this one read, so none of it is kept from an earlier read
+    const touched = new Set<string>();
+    const drops = new Set<string>();
+    const grows = new Set<Bounded>();
+    for (const op of ops) {
+      switch (op.op) {
+        case "putEntry":
+          if (this.bounds.maxOutbox !== undefined) grows.add("entries");
+          break;
+        case "putDeadLetter":
+          if (this.bounds.maxDeadLetters !== undefined) grows.add("deadLetters");
+          break;
+        case "putJournal":
+          if (this.bounds.maxJournal !== undefined) grows.add("journal");
+          break;
+        case "putExport":
+          if (this.bounds.maxExports !== undefined) grows.add("exports");
+          break;
+        case "replicaBegin":
+        case "deleteReplica":
+          touched.add(op.keyspaceId);
+          drops.add(op.keyspaceId);
+          break;
+        case "replicaAppend":
+        case "replicaHead":
+        case "replicaExtend":
+          touched.add(op.keyspaceId);
+          break;
+        default:
+          break;
       }
-      return m;
-    };
+    }
+    const fresh = await this.readFresh(touched, drops, grows);
+    const baseline: Record<Bounded, Set<string>> = { entries: fresh.ids.entries ?? this.ids.entries, deadLetters: fresh.ids.deadLetters ?? this.ids.deadLetters, journal: fresh.ids.journal ?? this.ids.journal, exports: fresh.ids.exports ?? this.ids.exports };
+    const ids: Record<Bounded, Set<string>> = { entries: new Set(baseline.entries), deadLetters: new Set(baseline.deadLetters), journal: new Set(baseline.journal), exports: new Set(baseline.exports) };
+    const headers = new Map(fresh.headers);
     const writes: Write[] = [];
+    /** The rows that this commit put for a keyspace: a later drop of the keyspace in the same commit removes them too. */
+    const putRows = new Map<string, { store: StoreId; key: string }[]>();
     const put = (store: StoreId, key: string, value: unknown): void => void writes.push({ store, key, value });
     const del = (store: StoreId, key: string): void => void writes.push({ store, key, delete: true });
-    const header = (m: Mirror): ReplicaHeader => ({ head: m.head, base: m.base, entryCount: m.entryCount });
+    const putRow = (store: "replicaEntries" | "replicaTail", ks: string, key: string, value: unknown): void => {
+      put(store, key, value);
+      const l = putRows.get(ks) ?? [];
+      l.push({ store, key });
+      putRows.set(ks, l);
+    };
     const dropReplica = (ks: string): void => {
-      const m = mirrors.get(ks);
-      if (m === undefined) return;
-      for (let i = 0; i < m.entryCount; i++) del("replicaEntries", rowKey(ks, pad(i, 10)));
-      for (const s of m.tail) del("replicaTail", rowKey(ks, pad(s, 20)));
+      for (const k of fresh.entryKeys.get(ks) ?? []) del("replicaEntries", k);
+      for (const k of fresh.tailKeys.get(ks) ?? []) del("replicaTail", k);
+      for (const r of putRows.get(ks) ?? []) del(r.store, r.key);
+      putRows.delete(ks);
       del("replicas", ks);
-      mirrors.delete(ks);
-      own.delete(ks);
+      headers.set(ks, undefined);
     };
     for (const op of ops) {
       switch (op.op) {
@@ -315,60 +486,61 @@ export class IndexedDbStorage implements OutboxStorage {
           break;
         case "replicaBegin": {
           dropReplica(op.keyspaceId);
-          const m: Mirror = { head: op.head, base: { manifestVersion: op.base.manifestVersion, logEpoch: op.base.logEpoch, checkpointSeq: op.base.checkpointSeq }, entryCount: op.base.entries.length, tail: [] };
-          op.base.entries.forEach((e, i) => put("replicaEntries", rowKey(op.keyspaceId, pad(i, 10)), e));
-          put("replicas", op.keyspaceId, header(m));
-          mirrors.set(op.keyspaceId, m);
-          own.add(op.keyspaceId);
+          const h: ReplicaHeader = { head: op.head, base: { manifestVersion: op.base.manifestVersion, logEpoch: op.base.logEpoch, checkpointSeq: op.base.checkpointSeq }, entryCount: op.base.entries.length };
+          op.base.entries.forEach((e, i) => putRow("replicaEntries", op.keyspaceId, rowKey(op.keyspaceId, pad(i, 10)), e));
+          put("replicas", op.keyspaceId, h);
+          headers.set(op.keyspaceId, h);
           break;
         }
         case "replicaAppend": {
-          const m = mirror(op.keyspaceId);
-          if (m === undefined) throw new StorageError(`no replica image of ${op.keyspaceId} to append to`);
-          m.head = op.head;
-          for (const r of op.records) {
-            put("replicaTail", rowKey(op.keyspaceId, pad(r.seq, 20)), r);
-            m.tail.push(r.seq);
-          }
-          put("replicas", op.keyspaceId, header(m));
+          const h = headers.get(op.keyspaceId);
+          if (h === undefined) throw new StorageError(`no replica image of ${op.keyspaceId} to append to`);
+          const next: ReplicaHeader = { ...h, head: op.head };
+          for (const r of op.records) putRow("replicaTail", op.keyspaceId, rowKey(op.keyspaceId, pad(r.seq, 20)), r);
+          put("replicas", op.keyspaceId, next);
+          headers.set(op.keyspaceId, next);
           break;
         }
         case "replicaHead": {
-          const m = mirror(op.keyspaceId);
-          if (m === undefined) break;
-          m.head = op.head;
-          put("replicas", op.keyspaceId, header(m));
+          const h = headers.get(op.keyspaceId);
+          if (h === undefined) break;
+          const next: ReplicaHeader = { ...h, head: op.head };
+          put("replicas", op.keyspaceId, next);
+          headers.set(op.keyspaceId, next);
           break;
         }
         case "replicaExtend": {
-          const m = mirror(op.keyspaceId);
-          if (m === undefined) throw new StorageError(`no replica image of ${op.keyspaceId} to extend`);
-          m.head = op.head;
-          for (const e of op.entries) put("replicaEntries", rowKey(op.keyspaceId, pad(m.entryCount++, 10)), e);
-          put("replicas", op.keyspaceId, header(m));
+          const h = headers.get(op.keyspaceId);
+          if (h === undefined) throw new StorageError(`no replica image of ${op.keyspaceId} to extend`);
+          let count = h.entryCount;
+          for (const e of op.entries) putRow("replicaEntries", op.keyspaceId, rowKey(op.keyspaceId, pad(count++, 10)), e);
+          const next: ReplicaHeader = { ...h, head: op.head, entryCount: count };
+          put("replicas", op.keyspaceId, next);
+          headers.set(op.keyspaceId, next);
           break;
         }
         case "deleteReplica":
           dropReplica(op.keyspaceId);
           break;
         case "purgeAll":
+          writes.length = 0;
           for (const s of STORES) writes.push({ store: s, clear: true });
-          for (const k of Object.keys(ids)) ids[k as keyof typeof ids].clear();
-          mirrors.clear();
+          for (const k of Object.keys(ids)) ids[k as Bounded].clear();
+          headers.clear();
+          putRows.clear();
           break;
       }
     }
     // 14 [CLI-84]: a commit that would grow a full store beyond its bound is refused whole
     for (const b of BOUNDED) {
-      const key = b.store as keyof typeof ids;
       const max = this.bounds[b.opts];
-      if (max !== undefined && ids[key].size > this.ids[key].size && ids[key].size > max) throw new StoreFull(b.name);
+      if (max !== undefined && ids[b.store].size > baseline[b.store].size && ids[b.store].size > max) throw new StoreFull(b.name);
     }
     if (writes.length > 0) {
       const names = [...new Set(writes.map((w) => w.store))];
       let tx: IDBTransactionLike;
       try {
-        tx = this.db.transaction(names, "readwrite");
+        tx = this.connection().transaction(names, "readwrite");
       } catch (e) {
         throw new StorageError(`cannot open a transaction: ${e instanceof Error ? e.message : String(e)}`);
       }
@@ -392,12 +564,20 @@ export class IndexedDbStorage implements OutboxStorage {
       await finished;
     }
     this.ids = ids;
-    this.replicas = mirrors;
   }
 
   close(): void {
+    this.closed = true;
     this.db.close();
   }
+}
+
+/** What `IndexedDbStorageProvider` takes besides the factory and the bounds. */
+export interface IndexedDbOptions {
+  /** `IDBKeyRange`: the rows of one keyspace are read and removed by range. */
+  keyRange?: KeyRangeFactory;
+  /** How long `destroy` waits for another tab that keeps the database open before it fails; default 10 s (real time). */
+  blockedWaitMs?: number;
 }
 
 /** The `StorageProvider` of a browser: a database for each partition, and the registry of them. */
@@ -410,10 +590,13 @@ export class IndexedDbStorageProvider implements StorageProvider {
     private readonly factory: IDBFactoryLike,
     private readonly bounds: MemoryStorageOptions = {},
     private readonly manager?: StorageManagerLike,
+    private readonly extra: IndexedDbOptions = {},
   ) {}
 
   private reg(): Promise<IDBDatabaseLike> {
-    this.registry ??= openDb(this.factory, REGISTRY, ["partitions"]);
+    this.registry ??= openDb(this.factory, REGISTRY, ["partitions"], () => {
+      this.registry = undefined; // closed for another tab's request: the next use opens it again
+    });
     return this.registry;
   }
 
@@ -424,12 +607,12 @@ export class IndexedDbStorageProvider implements StorageProvider {
   open(key: PartitionKey): Promise<OutboxStorage> {
     const id = partitionId(key);
     const have = this.open_.get(id);
-    if (have !== undefined) return Promise.resolve(have.storage);
+    if (have !== undefined && !have.storage.isClosed) return Promise.resolve(have.storage);
     const pending = this.opening.get(id);
     if (pending !== undefined) return pending;
     const p = (async (): Promise<IndexedDbStorage> => {
       const name = this.nameOf(key);
-      const storage = await IndexedDbStorage.open(this.factory, name, this.bounds, this.manager);
+      const storage = await IndexedDbStorage.open(this.factory, name, this.bounds, this.manager, this.extra.keyRange);
       const rdb = await this.reg();
       const tx = rdb.transaction(["partitions"], "readwrite");
       tx.objectStore("partitions").put({ ...key }, id);
@@ -450,13 +633,33 @@ export class IndexedDbStorageProvider implements StorageProvider {
     return rows.filter((k) => k.origin === origin && k.appId === appId);
   }
 
+  /** Deletes the database; another tab that keeps it open is asked to close it (`versionchange`), and waited for, for a while. */
+  private deleteDatabase(name: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const req = this.factory.deleteDatabase(name);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      req.onsuccess = (): void => {
+        if (timer !== undefined) clearTimeout(timer);
+        resolve();
+      };
+      req.onerror = (): void => {
+        if (timer !== undefined) clearTimeout(timer);
+        reject(req.error instanceof Error ? req.error : new StorageError(`the database cannot be deleted: ${String(req.error)}`));
+      };
+      req.onblocked = (): void => {
+        // a connection that does not close on `versionchange` (a tab of another build) keeps the data: the sign-out is told, never left waiting
+        timer ??= setTimeout(() => reject(new StorageError(`another tab keeps the database ${name} open: it is deleted when that tab closes it`)), this.extra.blockedWaitMs ?? 10_000);
+      };
+    });
+  }
+
   async destroy(key: PartitionKey): Promise<void> {
     for (const [id, o] of [...this.open_]) {
       if (!sameKey(o.key, key)) continue;
-      o.storage.close();
+      if (!o.storage.isClosed) o.storage.close();
       this.open_.delete(id);
     }
-    await wait(this.factory.deleteDatabase(this.nameOf(key)));
+    await this.deleteDatabase(this.nameOf(key));
     const rdb = await this.reg();
     const tx = rdb.transaction(["partitions"], "readwrite");
     tx.objectStore("partitions").delete(partitionId(key));

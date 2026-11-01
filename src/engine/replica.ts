@@ -153,6 +153,7 @@ export abstract class ReplicaLayer extends ReplicaStoreLayer {
     }
     f.invalidate();
     this.noteWatermarks(first.laneWatermarks);
+    this.sagaScan(f); // the moved keys and run keys of the new state (14 [CLI-14])
     this.emit({ type: "reloaded", keyspaceId: f.id, cause, logEpoch: first.logEpoch, checkpointSeq: first.checkpointSeq });
     for (const r of rebuilds) {
       const ck = f.crdt.get(r.key);

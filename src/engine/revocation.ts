@@ -41,7 +41,7 @@ import { makeReject } from "./endings.js";
 import { RpcError } from "./errors.js";
 import { ReplicaState } from "../rules/fold/index.js";
 import type { Follow } from "./follow.js";
-import { InterestLayer } from "./interest.js";
+import { SagaLayer } from "./sagas.js";
 import { StoreFull, type ExportEntry, type OutboxEntry, type StorageOp, type StoredOutcome } from "./storage.js";
 import type { ExportRecord } from "./types.js";
 
@@ -59,7 +59,7 @@ export const TOKEN_REFRESH_MIN_GAP_MS = 5_000;
 
 export type PurgeHook = (keyspaceId: string, cause: string) => void | Promise<void>;
 
-export abstract class RevocationLayer extends InterestLayer {
+export abstract class RevocationLayer extends SagaLayer {
   /** The app's policy for `GRANT_CHANGED` and `ARCHIVED`; the default keeps the local copy. */
   protected copyPolicy: CopyPolicy | ((keyspaceId: string, reason: "GRANT_CHANGED" | "ARCHIVED") => CopyPolicy) = "keep";
   private readonly purgeHooks = new Set<PurgeHook>();
@@ -180,6 +180,7 @@ export abstract class RevocationLayer extends InterestLayer {
       else f.quarantinedIds.push(e.mutationId);
       if (r === "exported") exported.push(this.exports.get(e.mutationId) as ExportEntry);
     }
+    f.exportedPending.push(...exported);
     if (failed) {
       // a transaction that failed applied nothing: it is made again, with the client backoff ([CLI-43])
       this.after(resendDelay(f.revocationAttempts++, undefined, this.random), () => this.finishRevocation(f));
@@ -191,9 +192,13 @@ export abstract class RevocationLayer extends InterestLayer {
       this.emit({ type: "quarantined", keyspaceId: f.id, cause, mutationIds: [...f.quarantinedIds] });
       f.quarantinedIds = [];
     }
-    for (const x of exported) {
-      this.emit({ type: "exported", mutationId: x.mutationId, keyspaceId: x.keyspaceId, reason: x.reason });
-      this.callExportHook(this.exportRecord(x));
+    // 14 [CLI-66] (V19 SHOULD-2): "`quarantined` for the keyspace, then `exported` for each entry": what a failed step left moved is announced after the one
+    // `quarantined` event, at the retry that completes the quarantine, never before it
+    if (f.revocationDone) {
+      for (const x of f.exportedPending.splice(0)) {
+        this.emit({ type: "exported", mutationId: x.mutationId, keyspaceId: x.keyspaceId, reason: x.reason });
+        this.callExportHook(this.exportRecord(x));
+      }
     }
     if (!f.revocationAsked && this.startRequested) this.askRevoked(f);
     if (failed || !f.revocationDone) return;

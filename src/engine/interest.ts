@@ -32,6 +32,17 @@ function same(a: readonly string[], b: readonly string[]): boolean {
 
 export abstract class InterestLayer extends HorizonLayer {
   private readonly widenings = new Set<string>();
+  /** The partition is the device's and holds the state of every principal that used it (14 [CLI-59]): what is kept per principal is kept under the principal's name. */
+  protected sharedDevice = false;
+
+  /**
+   * The name of a stored fact that belongs to the principal: `followed` and `revoked` (V14 S3). In personal mode the partition is the principal's and
+   * the name is plain; on a shared device it carries the principal, so that one principal's revocation record is never read as the next one's, and the
+   * next one follows what its own app asks for and not what the last one's did.
+   */
+  protected metaKey(name: "followed" | "revoked" | "sagas"): string {
+    return this.sharedDevice ? `${name}:${this.author.issuer}|${this.author.sub}` : name;
+  }
 
   protected resetRuntime(): void {
     super.resetRuntime();
@@ -56,9 +67,15 @@ export abstract class InterestLayer extends HorizonLayer {
       followed[f.id] = { interest: f.widening?.to ?? f.interest, ...(f.lastSyncMs > 0 ? { lastSyncMs: f.lastSyncMs } : {}) };
     }
     return [
-      { op: "setMeta", key: "followed", value: JSON.stringify(followed) },
-      { op: "setMeta", key: "revoked", value: JSON.stringify(revoked) },
+      { op: "setMeta", key: this.metaKey("followed"), value: JSON.stringify(followed) },
+      { op: "setMeta", key: this.metaKey("revoked"), value: JSON.stringify(revoked) },
+      ...this.extraMetaOps(),
     ];
+  }
+
+  /** What the layers above keep with the followed list (the sagas that are followed, `sagas.ts`). */
+  protected extraMetaOps(): StorageOp[] {
+    return [];
   }
 
   /** The keyspaces that the engine follows and the interest of each, kept with the stored state ([CLI-70]). */

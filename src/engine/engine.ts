@@ -133,7 +133,8 @@ export class Engine extends TabLayer {
     // 14 [CLI-2]: the persisted replicas; one rehydration path (14 [CLI-8]): each is asked whether it can resume, by a load from its cursor
     // 14 [CLI-66], [CLI-7], [CLI-8]: a keyspace that a revocation stopped is not followed again with the old token: its copy is purged, and what the
     // revocation left (the quarantine, the actions that are asked about) is finished
-    const revoked = this.revokedFromMeta(s.meta["revoked"]);
+    const revoked = this.revokedFromMeta(s.meta[this.metaKey("revoked")]);
+    this.restoreSagas(s.meta[this.metaKey("sagas")]); // 14 [CLI-14]: the sagas that were followed, with what was said of them
     for (const img of s.replicas) {
       // 14 [CLI-59]: the cache of another principal of a shared device is not this one's: it goes
       if (!this.isMyImage(img)) {
@@ -152,13 +153,14 @@ export class Engine extends TabLayer {
     }
     for (const [id, v] of revoked) this.follows.set(id, this.revokedFollow(id, v));
     // 14 [CLI-70]: the keyspaces that the app asked for, with their interest
-    for (const [id, v] of this.followedFromMeta(s.meta["followed"])) {
+    for (const [id, v] of this.followedFromMeta(s.meta[this.metaKey("followed")])) {
       if (revoked.has(id)) continue;
       const f = this.addFollow(id);
       this.applyFollowedInterest(f, v.interest);
       // 14 [CLI-56]: the time of the last sync outlives a restart that has no replica image
       if (v.lastSyncMs > f.lastSyncMs) f.lastSyncMs = v.lastSyncMs;
     }
+    for (const f of this.follows.values()) if (f.loaded && !f.revoked) this.sagaScan(f); // 14 [CLI-14]: the pointers of the restored copies
     const keyspaces = new Set<string>();
     for (const e of [...this.entries.values()].sort((a, b) => a.ordinal - b.ordinal)) {
       // 14 [CLI-29]: an entry that cannot be decoded goes to the dead-letter store, and stops no other entry

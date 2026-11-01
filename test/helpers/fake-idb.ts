@@ -7,6 +7,20 @@
 import type { IDBDatabaseLike, IDBFactoryLike, IDBObjectStoreLike, IDBOpenRequestLike, IDBRequestLike, IDBTransactionLike } from "../../src/platform/idb-storage.js";
 
 type Rows = Map<string, unknown>;
+
+/** `IDBKeyRange.bound(lower, upper)`, both ends closed. */
+export class FakeKeyRange {
+  constructor(
+    readonly lower: string,
+    readonly upper: string,
+  ) {}
+  static bound(lower: unknown, upper: unknown): FakeKeyRange {
+    return new FakeKeyRange(lower as string, upper as string);
+  }
+  includes(key: string): boolean {
+    return key >= this.lower && key <= this.upper;
+  }
+}
 type Db = { version: number; stores: Map<string, Rows> };
 
 class Request<T> implements IDBRequestLike<T> {
@@ -22,6 +36,10 @@ export class FakeIDBFactory implements IDBFactoryLike {
   failTransactions = 0;
   /** Every database that was opened and not closed. */
   open_ = 0;
+  /** The connections that are open, by database name: a deletion asks them to close (`versionchange`) and waits for them. */
+  readonly handles = new Map<string, Set<Database>>();
+  /** Whether a connection obeys `versionchange` by closing (a connection that was given no handler never does, as one of a build that predates it). */
+  private readonly waiting = new Map<string, (() => void)[]>();
 
   open(name: string, version = 1): IDBOpenRequestLike {
     const req = new Request<IDBDatabaseLike>() as Request<IDBDatabaseLike> & IDBOpenRequestLike;
@@ -34,7 +52,10 @@ export class FakeIDBFactory implements IDBFactoryLike {
         db = { version, stores: new Map() };
         this.dbs.set(name, db);
       }
-      const handle = new Database(this, db);
+      const handle = new Database(this, db, name);
+      const set = this.handles.get(name) ?? new Set();
+      set.add(handle);
+      this.handles.set(name, set);
       req.result = handle;
       if (fresh) req.onupgradeneeded?.();
       this.open_++;
@@ -43,21 +64,42 @@ export class FakeIDBFactory implements IDBFactoryLike {
     return req;
   }
 
-  deleteDatabase(name: string): IDBRequestLike {
-    const req = new Request<undefined>();
+  deleteDatabase(name: string): IDBRequestLike & { onblocked: ((ev?: unknown) => void) | null } {
+    const req = new Request<undefined>() as Request<undefined> & { onblocked: ((ev?: unknown) => void) | null };
+    req.onblocked = null;
     queueMicrotask(() => {
-      this.dbs.delete(name);
-      req.onsuccess?.();
+      const finish = (): void => {
+        this.dbs.delete(name);
+        req.onsuccess?.();
+      };
+      // the connections are asked to close; the deletion waits for those that do not, and says so (`blocked`)
+      for (const h of [...(this.handles.get(name) ?? [])]) h.onversionchange?.();
+      if ((this.handles.get(name)?.size ?? 0) === 0) return finish();
+      req.onblocked?.();
+      const list = this.waiting.get(name) ?? [];
+      list.push(() => {
+        if ((this.handles.get(name)?.size ?? 0) === 0) finish();
+      });
+      this.waiting.set(name, list);
     });
     return req;
+  }
+
+  /** A connection closed: a deletion that waited for it may go on. */
+  closed(name: string, handle: Database): void {
+    this.handles.get(name)?.delete(handle);
+    for (const f of this.waiting.get(name) ?? []) f();
   }
 }
 
 class Database implements IDBDatabaseLike {
   readonly objectStoreNames: { contains(name: string): boolean };
+  onversionchange: ((ev?: unknown) => void) | null = null;
+  private open = true;
   constructor(
     readonly factory: FakeIDBFactory,
     readonly db: Db,
+    readonly name: string,
   ) {
     this.objectStoreNames = { contains: (n) => db.stores.has(n) };
   }
@@ -70,7 +112,10 @@ class Database implements IDBDatabaseLike {
     return new Transaction(this.factory, this.db, names, mode);
   }
   close(): void {
+    if (!this.open) return;
+    this.open = false;
     this.factory.open_--;
+    this.factory.closed(this.name, this);
   }
 }
 
@@ -131,13 +176,14 @@ class Transaction implements IDBTransactionLike {
   }
 
   objectStore(name: string): IDBObjectStoreLike {
-    const sorted = (rows: Rows): string[] => [...rows.keys()].sort();
+    const sorted = (rows: Rows, range?: unknown): string[] => [...rows.keys()].sort().filter((k) => range === undefined || (range as FakeKeyRange).includes(k));
     return {
       put: (value, key) => this.request((rows) => (rows.set(key, structuredClone(value)), key), name, true),
       delete: (key) => this.request((rows) => void rows.delete(key), name, true),
       clear: () => this.request((rows) => void rows.clear(), name, true),
-      getAll: () => this.request((rows) => sorted(rows).map((k) => structuredClone(rows.get(k))), name, false),
-      getAllKeys: () => this.request((rows) => sorted(rows), name, false),
+      get: (key) => this.request((rows) => structuredClone(rows.get(key)), name, false),
+      getAll: (range?: unknown) => this.request((rows) => sorted(rows, range).map((k) => structuredClone(rows.get(k))), name, false),
+      getAllKeys: (range?: unknown) => this.request((rows) => sorted(rows, range), name, false),
     } as IDBObjectStoreLike;
   }
 

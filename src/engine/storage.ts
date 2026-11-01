@@ -261,6 +261,18 @@ export type StorageOp =
   /** Removes everything of the partition (14 [CLI-65]: a sign-out in personal mode, a discard of a locked partition). */
   | { op: "purgeAll" };
 
+/** What a replica image is, without its pages and its tail: its head and the sizes of the rest (see `OutboxStorage.loadLight`). */
+export interface ReplicaSummary {
+  keyspaceId: string;
+  head: ReplicaHead;
+  base: Omit<ReplicaBase, "entries">;
+  /** The entries of the pages: they grow with a widening (14 [CLI-72]). */
+  entryCount: number;
+}
+
+/** A stored state with the replicas as summaries. */
+export type StoredLight = Omit<StoredState, "replicas"> & { replicas: ReplicaSummary[] };
+
 export interface StoredState {
   entries: OutboxEntry[];
   deadLetters: DeadLetterEntry[];
@@ -305,6 +317,17 @@ export interface OutboxStorage {
   commit(ops: readonly StorageOp[]): Promise<void>;
   /** The stores that are at their bound (14 [CLI-84]). */
   full(): StoreName[];
+  /**
+   * `load()` without the pages and the tails of the replicas, which are most of what a partition holds: a follower tab (14 [CLI-61]) reads the
+   * flusher's state on every message that the flusher sends, and reads the pages of a keyspace only when they changed. A storage that leaves
+   * this out is read whole.
+   */
+  loadLight?(): Promise<StoredLight>;
+  /**
+   * The image of one keyspace: its pages unless `entries` is false, and its tail from the first record above `tailAfter` (all of it when unset).
+   * Undefined when the storage holds none. Part of `loadLight`'s pair.
+   */
+  loadImage?(keyspaceId: string, opts?: { entries?: boolean; tailAfter?: bigint }): Promise<ReplicaImage | undefined>;
 }
 
 /** A commit that a full store refuses (14 [CLI-84]): nothing was applied. */

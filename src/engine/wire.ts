@@ -49,6 +49,7 @@ import {
   type UpdateSubscriptionResponse,
 } from "../gen/abpc/v2/sync_pb.js";
 import { CanonError, checkTimestamps, encode, unmarshal } from "../rules/canon/index.js";
+import { checkCounts, pageBound, type DecodeLimits } from "./counts.js";
 import { ProtocolViolation } from "./errors.js";
 import type { CallOptions, Transport } from "./transport.js";
 
@@ -58,8 +59,13 @@ export interface RawCaller {
   stream(method: string, request: Uint8Array, o?: CallOptions): AsyncIterable<Uint8Array>;
 }
 
-/** Decodes the bytes of a message that a server sent, strictly. Throws a ProtocolViolation for bytes that break 02 [ARC-61]. */
-export function decodeMessage<T extends Message>(schema: DescMessage, bytes: Uint8Array): T {
+/**
+ * Decodes the bytes of a message that a server sent, strictly. Throws a ProtocolViolation for bytes that break 02 [ARC-61], and for a message whose
+ * repeated fields hold more elements than the text allows (16 [SEC-1]): the counts are judged on the octets, before one element is decoded
+ * (`counts.ts`). `limits` are the counts that the call fixes (the page of a load, the mutations of a request).
+ */
+export function decodeMessage<T extends Message>(schema: DescMessage, bytes: Uint8Array, limits?: DecodeLimits): T {
+  checkCounts(schema, bytes, limits);
   try {
     const m = unmarshal(schema, bytes);
     checkTimestamps(schema, m);
@@ -84,22 +90,25 @@ export class BytesTransport implements Transport {
     resSchema: DescMessage,
     req: Req,
     o: CallOptions | undefined,
+    limits?: DecodeLimits,
   ): Promise<Res> {
     const bytes = await this.raw.unary(method, encodeMessage(reqSchema, req), o);
-    return decodeMessage<Res>(resSchema, bytes);
+    return decodeMessage<Res>(resSchema, bytes, limits);
   }
 
   getManifest(req: GetManifestRequest, o?: CallOptions): Promise<GetManifestResponse> {
     return this.unary("GetManifest", GetManifestRequestSchema, GetManifestResponseSchema, req, o);
   }
   mutate(req: MutateRequest, o?: CallOptions): Promise<MutateResponse> {
-    return this.unary("Mutate", MutateRequestSchema, MutateResponseSchema, req, o);
+    // 07 [MUT-4], [MUT-7]: one result for each mutation, and one watermark at most for each
+    const n = req.mutations.length;
+    return this.unary("Mutate", MutateRequestSchema, MutateResponseSchema, req, o, { "abpc.v2.MutateResponse.results": n, "abpc.v2.MutateResponse.watermarks": n });
   }
   getMutationResult(req: GetMutationResultRequest, o?: CallOptions): Promise<GetMutationResultResponse> {
     return this.unary("GetMutationResult", GetMutationResultRequestSchema, GetMutationResultResponseSchema, req, o);
   }
   getMutationResults(req: GetMutationResultsRequest, o?: CallOptions): Promise<GetMutationResultsResponse> {
-    return this.unary("GetMutationResults", GetMutationResultsRequestSchema, GetMutationResultsResponseSchema, req, o);
+    return this.unary("GetMutationResults", GetMutationResultsRequestSchema, GetMutationResultsResponseSchema, req, o, { "abpc.v2.GetMutationResultsResponse.results": req.mutationIds.length });
   }
   cancelIntent(req: CancelIntentRequest, o?: CallOptions): Promise<CancelIntentResponse> {
     return this.unary("CancelIntent", CancelIntentRequestSchema, CancelIntentResponseSchema, req, o);
@@ -108,10 +117,12 @@ export class BytesTransport implements Transport {
     return this.unary("CreateKeyspace", CreateKeyspaceRequestSchema, CreateKeyspaceResponseSchema, req, o);
   }
   loadState(req: LoadStateRequest, o?: CallOptions): Promise<LoadStateResponse> {
-    return this.unary("LoadState", LoadStateRequestSchema, LoadStateResponseSchema, req, o);
+    // 09 [READ-10]: `page_size` is an upper bound on the entries of a page
+    return this.unary("LoadState", LoadStateRequestSchema, LoadStateResponseSchema, req, o, { "abpc.v2.LoadStateResponse.entries": pageBound(req.pageSize) });
   }
   updateSubscription(req: UpdateSubscriptionRequest, o?: CallOptions): Promise<UpdateSubscriptionResponse> {
-    return this.unary("UpdateSubscription", UpdateSubscriptionRequestSchema, UpdateSubscriptionResponseSchema, req, o);
+    // 09 [READ-62]: `rejected` is bounded by the request's entries
+    return this.unary("UpdateSubscription", UpdateSubscriptionRequestSchema, UpdateSubscriptionResponseSchema, req, o, { "abpc.v2.UpdateSubscriptionResponse.rejected": req.add.length + req.setInterest.length });
   }
   refreshSession(req: RefreshSessionRequest, o?: CallOptions): Promise<RefreshSessionResponse> {
     return this.unary("RefreshSession", RefreshSessionRequestSchema, RefreshSessionResponseSchema, req, o);

@@ -23,6 +23,7 @@ import {
   type OutboxStorage,
   type RejectionRecord,
   type ReplicaImage,
+  type StoredLight,
   type StorageMode,
   type StorageOp,
   type StoredState,
@@ -71,6 +72,7 @@ export class MemoryStorage implements OutboxStorage {
   persistenceRequests = 0;
 
   load(): Promise<StoredState> {
+    for (const r of this.replicas.values()) this.pagesRead += r.base.entries.length;
     const meta: Record<string, string | number | bigint> = {};
     for (const [k, v] of this.meta) meta[k] = v;
     return Promise.resolve({
@@ -83,6 +85,34 @@ export class MemoryStorage implements OutboxStorage {
       replicas: [...this.replicas.values()].map((e) => structuredClone(e)),
       meta,
     });
+  }
+
+  /** A test hook: the pages of replicas that `load`, `loadImage` and `loadLight` handed out, as a measure of what a reader read. */
+  pagesRead = 0;
+
+  loadLight(): Promise<StoredLight> {
+    const meta: Record<string, string | number | bigint> = {};
+    for (const [k, v] of this.meta) meta[k] = v;
+    return Promise.resolve({
+      entries: [...this.entries.values()].map((e) => structuredClone(e)),
+      deadLetters: [...this.deadLetters.values()].map((e) => structuredClone(e)),
+      journal: [...this.journal.values()].map((e) => structuredClone(e)),
+      exports: [...this.exports.values()].map((e) => structuredClone(e)),
+      rejections: [...this.rejections.values()].map((e) => structuredClone(e)),
+      drafts: [...this.drafts.values()].map((e) => structuredClone(e)),
+      replicas: [...this.replicas.values()].map((r) => ({ keyspaceId: r.keyspaceId, head: structuredClone(r.head), base: { manifestVersion: r.base.manifestVersion, logEpoch: r.base.logEpoch, checkpointSeq: r.base.checkpointSeq }, entryCount: r.base.entries.length })),
+      meta,
+    });
+  }
+
+  loadImage(keyspaceId: string, opts: { entries?: boolean; tailAfter?: bigint } = {}): Promise<ReplicaImage | undefined> {
+    const r = this.replicas.get(keyspaceId);
+    if (r === undefined) return Promise.resolve(undefined);
+    const withEntries = opts.entries !== false;
+    const after = opts.tailAfter;
+    const tail = after === undefined ? r.tail : r.tail.filter((x) => x.seq > after);
+    if (withEntries) this.pagesRead += r.base.entries.length;
+    return Promise.resolve(structuredClone({ keyspaceId, head: r.head, base: { ...r.base, entries: withEntries ? r.base.entries : [] }, tail }));
   }
 
   commit(ops: readonly StorageOp[]): Promise<void> {

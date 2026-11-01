@@ -226,7 +226,12 @@ export interface LiveStats {
 
 export interface LiveQuery {
   readonly query: Query;
-  /** The result now. */
+  /**
+   * The result now: its rows are the ones that the listener has been told of. Two things in it change without the listener being called, since no row changed
+   * (V19 N2): `next` of a window that is full, when only a key after the window came or went (whether a row follows it), and `keyspace.seq`, which is the
+   * cursor of the copy as of the last change that touched the query, and is read again by the next `snapshot()` of a query that something touched. A
+   * reader that needs the current cursor of the copy reads `Engine.cursor(keyspaceId)`; a reader that pages from `next` reads `snapshot()` when it pages.
+   */
   snapshot(): QueryResult;
   readonly stats: LiveStats;
   readonly closed: boolean;

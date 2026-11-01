@@ -33,6 +33,7 @@ import {
   type OutboxStorage,
   type RejectionRecord,
   type StorageOp,
+  type StoredLight,
   type StoredState,
 } from "./storage.js";
 import type { Transport } from "./transport.js";
@@ -509,6 +510,22 @@ export abstract class EngineCore {
   /** Loads what the storage holds into the mirrors (14 [CLI-8]). */
   protected async loadStored(): Promise<StoredState> {
     const s = await this.storage.load();
+    this.adoptStored(s);
+    return s;
+  }
+
+  /**
+   * `loadStored` without the pages and tails of the replicas (a follower reads the stored state on every message of the flusher, 14 [CLI-61]);
+   * undefined when the storage has no light read, and the state is read whole.
+   */
+  protected async loadStoredLight(): Promise<StoredLight | undefined> {
+    if (this.storage.loadLight === undefined || this.storage.loadImage === undefined) return undefined;
+    const s = await this.storage.loadLight();
+    this.adoptStored(s);
+    return s;
+  }
+
+  private adoptStored(s: Omit<StoredState, "replicas">): void {
     this.lockedEntries = [];
     // 14 [CLI-60]: only the entries whose author is the current principal are the engine's; the others stay in the store, locked
     const mine = (a: Author | undefined): boolean => a === undefined || (a.issuer === this.author.issuer && a.sub === this.author.sub);
@@ -528,7 +545,6 @@ export abstract class EngineCore {
     if (typeof off === "number") this.restoreServerOffset(off);
     const mo = s.meta["maxOfflineSeconds"];
     if (typeof mo === "number" && mo > 0) this.limits = { ...this.limits, maxOfflineMs: mo * 1000 };
-    return s;
   }
 
   // ---------------------------------------------------------------------------------------------------------------------

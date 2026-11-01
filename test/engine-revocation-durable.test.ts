@@ -114,6 +114,42 @@ describe("14 [CLI-66], [CLI-84]: the purge by a revocation still runs when the e
   });
 });
 
+describe("14 [CLI-66] (V19 SHOULD-2): `quarantined` for the keyspace, then `exported` for each entry, whichever step failed first", () => {
+  it("the quarantine of the second action fails once: nothing is announced until it is made, and then `quarantined` comes first", async () => {
+    const hook: ExportRecord[] = [];
+    const storage = new MemoryStorage();
+    const r = await rig({ storage, cfg: { exportHook: (x) => void hook.push(x) } });
+    r.server.write(KS, [kc("settings/s", "set", 1)]);
+    await r.engine.settle();
+    r.server.inject("mutate", { kind: "result", result: (m) => (m.changes[0]?.key === "settings/a" ? retryResult(m, RetryReason.CONTENTION, 3_600_000) : undefined) });
+    await r.engine.submit(setK("settings/a"));
+    await r.engine.settle();
+    const b1 = (await r.engine.submit(setK("settings/a", 2))).mutationId;
+    const b2 = (await r.engine.submit(setK("settings/a", 3))).mutationId;
+    await r.engine.settle();
+    const commit = storage.commit.bind(storage);
+    let failing = true;
+    storage.commit = (ops): Promise<void> => {
+      if (failing && ops.some((o) => o.op === "putExport" && o.entry.mutationId === b2)) return Promise.reject(new StorageError("the quarantine failed"));
+      return commit(ops);
+    };
+    r.server.revokeKeyspaces(KS);
+    await r.engine.settle();
+    // b1 moved to the export store and b2 did not: neither is announced, the keyspace's step is not done
+    expect(r.engine.exportEntries().map((x) => x.mutationId)).toContain(b1);
+    expect(r.engine.exportEntries().map((x) => x.mutationId)).not.toContain(b2);
+    expect(ofType(r, "quarantined")).toHaveLength(0);
+    expect(ofType(r, "exported")).toHaveLength(0);
+    expect(hook).toEqual([]);
+    failing = false;
+    for (let i = 0; i < 20 && ofType(r, "quarantined").length === 0; i++) await tick(r, 60_000);
+    const order = r.events.filter((e) => e.type === "quarantined" || e.type === "exported").map((e) => e.type);
+    expect(order).toEqual(["quarantined", "exported", "exported"]);
+    expect(ofType(r, "quarantined")[0]?.mutationIds.sort()).toEqual([b1, b2].sort());
+    expect(hook.map((x) => x.mutationId).sort()).toEqual([b1, b2].sort());
+  });
+});
+
 describe("14 [CLI-7], [CLI-8], [CLI-66]: a revocation is durable across a restart (V14 MUST-4)", () => {
   it("the action that was sent and is still being asked about is asked about after a restart, and the revoked keyspace is not loaded again with the old token", async () => {
     const r = await rig({ cfg: { exportHook: () => undefined } });

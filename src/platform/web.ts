@@ -9,13 +9,15 @@
 import type { MemoryStorageOptions } from "../engine/memory-storage.js";
 import type { CrossTabLocks, StorageProvider, TabChannel, TabHost } from "../engine/tabs.js";
 import { BroadcastTabChannel, type BroadcastChannelConstructor } from "./channel.js";
-import { IndexedDbStorageProvider, type IDBFactoryLike, type StorageManagerLike } from "./idb-storage.js";
+import { IndexedDbStorageProvider, type IDBFactoryLike, type KeyRangeFactory, type StorageManagerLike } from "./idb-storage.js";
 import { WebLocks, type LockManagerLike } from "./web-locks.js";
 
 export interface WebEnv {
   locks?: LockManagerLike;
   BroadcastChannel?: BroadcastChannelConstructor;
   indexedDB?: IDBFactoryLike;
+  /** `IDBKeyRange`: the replica of one keyspace is read and purged by key range. */
+  IDBKeyRange?: KeyRangeFactory;
   storageManager?: StorageManagerLike;
   sessionStorage?: { getItem(k: string): string | null; setItem(k: string, v: string): void };
   document?: {
@@ -28,6 +30,8 @@ export interface WebEnv {
 
 export interface WebHostOptions extends MemoryStorageOptions {
   env?: WebEnv;
+  /** How long a sign-out waits for another tab that keeps the database open, in real ms; default 10 s. */
+  blockedWaitMs?: number;
   /** The id of the tab; default the one that `sessionStorage` keeps for this tab, or a new one. */
   tabId?: string;
 }
@@ -38,6 +42,7 @@ export function globalWebEnv(): WebEnv {
     navigator?: { locks?: LockManagerLike; storage?: StorageManagerLike };
     BroadcastChannel?: BroadcastChannelConstructor;
     indexedDB?: IDBFactoryLike;
+    IDBKeyRange?: KeyRangeFactory;
     sessionStorage?: WebEnv["sessionStorage"];
     document?: WebEnv["document"];
     crypto?: { randomUUID?: () => string };
@@ -52,6 +57,7 @@ export function globalWebEnv(): WebEnv {
     ...(g.navigator?.locks !== undefined ? { locks: g.navigator.locks } : {}),
     ...(g.BroadcastChannel !== undefined ? { BroadcastChannel: g.BroadcastChannel } : {}),
     ...(g.indexedDB !== undefined ? { indexedDB: g.indexedDB } : {}),
+    ...(g.IDBKeyRange !== undefined ? { IDBKeyRange: g.IDBKeyRange } : {}),
     ...(g.navigator?.storage !== undefined ? { storageManager: g.navigator.storage } : {}),
     ...(session !== undefined ? { sessionStorage: session } : {}),
     ...(g.document !== undefined ? { document: g.document } : {}),
@@ -101,7 +107,7 @@ export class WebTab implements TabHost {
 export function createWebHost(opts: WebHostOptions = {}): WebTab {
   const env = opts.env ?? globalWebEnv();
   if (env.indexedDB === undefined) throw new Error("this platform has no IndexedDB: the outbox would be memory only (14 [CLI-21]); give the engine a storage explicitly if that is meant");
-  const { env: _e, tabId: _t, ...bounds } = opts;
+  const { env: _e, tabId: _t, blockedWaitMs, ...bounds } = opts;
   let tabId = opts.tabId;
   if (tabId === undefined) {
     try {
@@ -118,5 +124,5 @@ export function createWebHost(opts: WebHostOptions = {}): WebTab {
       // storage blocked: the id lasts for as long as this tab object
     }
   }
-  return new WebTab(env, new IndexedDbStorageProvider(env.indexedDB, bounds, env.storageManager), tabId);
+  return new WebTab(env, new IndexedDbStorageProvider(env.indexedDB, bounds, env.storageManager, { ...(env.IDBKeyRange !== undefined ? { keyRange: env.IDBKeyRange } : {}), ...(blockedWaitMs !== undefined ? { blockedWaitMs } : {}) }), tabId);
 }

@@ -37,7 +37,7 @@ import { LocalRefusal, type LocalRefusalCode, type StorageCause } from "./errors
 import type { EngineConfig } from "./core.js";
 import { Follow } from "./follow.js";
 import { RevocationLayer } from "./revocation.js";
-import type { ReplicaImage } from "./storage.js";
+import type { ReplicaImage, ReplicaSummary } from "./storage.js";
 import type { LockLease, PartitionKey, StorageProvider, TabChannel, TabHost } from "./tabs.js";
 import { lockName } from "./tabs.js";
 import type { EngineEvent, HoldInfo } from "./types.js";
@@ -135,6 +135,7 @@ export abstract class TabLayer extends RevocationLayer {
     this.tabHost = cfg.tab;
     this.provider = cfg.store ?? cfg.tab?.storage;
     this.handOverWhenHidden = cfg.handOverWhenHidden ?? false;
+    this.sharedDevice = (cfg.mode ?? "personal") === "shared-device";
     this.setHorizonWarning(cfg.horizonWarning);
     this.copyPolicy = cfg.copyPolicy ?? "keep";
     this.persistReplica = cfg.persistReplica !== false;
@@ -272,14 +273,25 @@ export abstract class TabLayer extends RevocationLayer {
     });
   }
 
+  /**
+   * A tab of the engine is visible (it joined, or it was shown) and this tab is a flusher that is hidden: 14 [CLI-61] says it "MUST hand its role over to a
+   * visible tab of the engine, when there is one", and there is one now, though there was none when this tab was hidden (V19, V14 MUST-3). The offer is made
+   * again; the tab that answers it, as before, is a follower that is alive and visible.
+   */
+  private offerAgain(): void {
+    if (this.handOverWhenHidden && this.role === "flusher" && !this.stopped && !this.visibleNow()) void this.handOver().catch((e: unknown) => this.noteInternalError(e));
+  }
+
   private onMessage(m: TabMessage): void {
     switch (m.t) {
       case "hello":
         this.peers.set(m.from, m.visible);
         if (!m.reply && this.tabHost !== undefined) this.send({ t: "hello", from: this.tabHost.tabId, visible: this.visibleNow(), reply: true });
+        if (m.visible) this.offerAgain();
         return;
       case "visible":
         this.peers.set(m.from, m.visible);
+        if (m.visible) this.offerAgain();
         return;
       case "gone":
         this.peers.delete(m.from);
@@ -529,33 +541,52 @@ export abstract class TabLayer extends RevocationLayer {
     this.rejections.clear();
     this.drafts.clear();
     this.decoded.clear();
-    const s = await this.loadStored();
+    // 14 [CLI-61], V14 S4: the pages and the tails of the replicas are most of what a partition holds, and a message of the flusher says that
+    // something changed, not what: the follower reads the heads, and the pages and the tail of a keyspace only when its image moved
+    const light = await this.loadStoredLight();
+    const s = light ?? (await this.loadStored());
     const ids = new Set<string>();
     for (const img of s.replicas) {
       if (!this.isMyImage(img)) continue; // another principal's cache on a shared device (14 [CLI-59])
       ids.add(img.keyspaceId);
       const have = this.follows.get(img.keyspaceId);
+      const entryCount = "entries" in img.base ? img.base.entries.length : (img as ReplicaSummary).entryCount;
       const same =
         have !== undefined &&
         have.loaded &&
         have.state.seq === img.head.seq &&
         have.state.logEpoch === img.head.logEpoch &&
         have.image.baseSeq === img.base.checkpointSeq &&
+        (have.image.entryCount === undefined || have.image.entryCount === entryCount) &&
         have.interest.length === img.head.interest.length &&
         have.interest.every((p, i) => p === img.head.interest[i]);
       if (same) {
         have.lastSyncMs = img.head.lastSyncMs;
         continue;
       }
-      // the flusher applied records since: fold only those (the cost of a frame is the frame, not the whole persisted tail)
-      if (have !== undefined && (await this.advanceMirror(have, img))) continue;
-      const f = await this.restoreImage(img);
+      let image: ReplicaImage | undefined;
+      if (light === undefined) {
+        image = img as ReplicaImage;
+        // the flusher applied records since: fold only those (the cost of a frame is the frame, not the whole persisted tail)
+        if (have !== undefined && (await this.advanceMirror(have, image, true))) continue;
+      } else {
+        const sum = img as ReplicaSummary;
+        if (have !== undefined && have.loaded && !have.purged) {
+          // the records above the last one that this mirror folded: the tail of an image only grows while its pages are the same
+          const after = [...have.image.seqs].reduce((m, x) => (x > m ? x : m), have.image.baseSeq ?? sum.base.checkpointSeq);
+          const part = await this.storage.loadImage?.(sum.keyspaceId, { entries: false, tailAfter: after });
+          if (part !== undefined && (await this.advanceMirror(have, { ...part, head: sum.head, base: { ...sum.base, entries: [] } }, false, entryCount))) continue;
+        }
+        image = await this.storage.loadImage?.(sum.keyspaceId);
+        if (image === undefined) continue;
+      }
+      const f = await this.restoreImage(image);
       if (f === undefined) continue;
       have?.crdt.destroy();
       f.image.baseSeq = img.base.checkpointSeq;
       this.follows.set(f.id, f);
     }
-    const followed = this.followedFromMeta(s.meta["followed"]);
+    const followed = this.followedFromMeta(s.meta[this.metaKey("followed")]);
     for (const [id, v] of followed) {
       ids.add(id);
       if (!this.follows.has(id)) {
@@ -580,12 +611,14 @@ export abstract class TabLayer extends RevocationLayer {
    * that the mirror holds (the same pages, epoch and interest, and every record that it folded still in the tail). Returns false when it is
    * not, or when a record does not fold: the caller then builds the mirror again from the whole image (`restoreImage`), which replaces it.
    */
-  private async advanceMirror(have: Follow, img: ReplicaImage): Promise<boolean> {
+  private async advanceMirror(have: Follow, img: ReplicaImage, whole: boolean, entryCount?: number): Promise<boolean> {
     if (!have.loaded || have.purged || have.image.baseSeq !== img.base.checkpointSeq) return false;
     if (img.head.logEpoch !== img.base.logEpoch || have.state.logEpoch !== img.head.logEpoch) return false;
     if (have.interest.length !== img.head.interest.length || !have.interest.every((p, i) => p === img.head.interest[i])) return false;
+    if (entryCount !== undefined && have.image.entryCount !== undefined && have.image.entryCount !== entryCount) return false; // a widening added pages
     const fresh = img.tail.filter((r) => !have.image.seqs.has(r.seq));
-    if (img.tail.length - fresh.length !== have.image.seqs.size || img.head.seq < have.state.seq) return false;
+    // the image that was read whole: every record that this mirror folded is still in the tail; a tail read from the last one folded is only what is new
+    if ((whole && img.tail.length - fresh.length !== have.image.seqs.size) || img.head.seq < have.state.seq) return false;
     try {
       for (const r of fresh) if (r.logEpoch !== img.base.logEpoch || !(await this.manifests.ensure(r.manifestVersion))) return false;
       for (const r of fresh) {
@@ -608,7 +641,7 @@ export abstract class TabLayer extends RevocationLayer {
   }
 
   /** Whether the image is this principal's: the partition of a shared device holds the caches of the principals that used it, one at a time (14 [CLI-59]). */
-  protected isMyImage(img: ReplicaImage): boolean {
+  protected isMyImage(img: { head: { author?: { issuer: string; sub: string } | undefined } }): boolean {
     const a = img.head.author;
     return a === undefined || (a.issuer === this.author.issuer && a.sub === this.author.sub);
   }

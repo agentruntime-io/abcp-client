@@ -8,6 +8,11 @@
 
 const TAGS = ["$big", "$u8", "$num", "$obj"] as const;
 
+/** Sets an own member, a member named `__proto__` included: a plain assignment to it would set the prototype of the object instead (a map that a server filled can name it). */
+function own(o: Record<string, unknown>, k: string, v: unknown): void {
+  Object.defineProperty(o, k, { value: v, enumerable: true, writable: true, configurable: true });
+}
+
 function hasTagKey(o: object): boolean {
   for (const k of TAGS) if (Object.prototype.hasOwnProperty.call(o, k)) return true;
   return false;
@@ -34,7 +39,7 @@ export function pack(v: unknown): unknown {
       const out: Record<string, unknown> = {};
       for (const [k, x] of Object.entries(v)) {
         const p = pack(x);
-        if (p !== undefined) out[k] = p;
+        if (p !== undefined) own(out, k, p);
       }
       return hasTagKey(v) ? { $obj: out } : out;
     }
@@ -57,12 +62,12 @@ export function unpack(v: unknown): unknown {
     if (k === "$num" && typeof x === "string") return x === "-0" ? -0 : Number(x);
     if (k === "$obj" && typeof x === "object" && x !== null && !Array.isArray(x)) {
       const inner: Record<string, unknown> = {};
-      for (const [ik, iv] of Object.entries(x)) inner[ik] = unpack(iv);
+      for (const [ik, iv] of Object.entries(x)) own(inner, ik, unpack(iv));
       return inner;
     }
   }
   const out: Record<string, unknown> = {};
-  for (const [k, x] of Object.entries(o)) out[k] = unpack(x);
+  for (const [k, x] of Object.entries(o)) own(out, k, unpack(x));
   return out;
 }
 

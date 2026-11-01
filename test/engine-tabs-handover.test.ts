@@ -317,6 +317,48 @@ describe("14 [CLI-61]: a follower folds what the flusher applied since it read, 
     expect(b.engine.confirmed(KS).json(`settings/k${n}`)).toBe(n);
     expect(folds).toBeLessThanOrEqual(n); // not n * (n + 1) / 2
   });
+
+  it("it does not read the pages of the replicas on a message that moved none: a change of the outbox, a new frame, a heartbeat (V19: V14 S4 read the whole storage on every message)", async () => {
+    const r = tabsRig();
+    for (let i = 1; i <= 20; i++) r.server.write(KS, [{ key: `settings/seed${i}`, kind: 1, value: new TextEncoder().encode(String(i)), encoding: "json/v1" } as never]);
+    const a = await r.open();
+    const b = await r.open();
+    await settleAll(a.engine, b.engine);
+    await r.clock.advance(20_000);
+    await settleAll(a.engine, b.engine);
+    const storage = r.device.storage.storageOf(a.engine.partitionKey()) as MemoryStorage & { pagesRead: number };
+    expect(b.engine.confirmed(KS).json("settings/seed20")).toBe(20);
+    expect(storage.pagesRead).toBeGreaterThanOrEqual(20); // the follower's first read took the 20 pages of the image
+    const before = storage.pagesRead;
+    // the outbox changes: an action is submitted through the follower (the flusher stores it, the follower reads the stores again)
+    await b.engine.submit(setA("settings/mine", 5));
+    await settleAll(a.engine, b.engine);
+    // a frame of records, and a heartbeat
+    r.server.write(KS, [{ key: "settings/late", kind: 1, value: new TextEncoder().encode("7"), encoding: "json/v1" } as never]);
+    await settleAll(a.engine, b.engine);
+    await r.clock.advance(20_000);
+    await settleAll(a.engine, b.engine);
+    expect(storage.pagesRead - before).toBe(0); // the 20 pages of the keyspace were not read again
+    expect(b.engine.confirmed(KS).json("settings/late")).toBe(7);
+    expect(b.engine.confirmed(KS).json("settings/mine")).toBe(5);
+    expect(b.engine.outbox()).toHaveLength(0);
+  });
+
+  it("it reads the pages when the image moved under it: the flusher cold-loads the keyspace again, and the follower shows the new state", async () => {
+    const r = tabsRig();
+    r.server.write(KS, [{ key: "settings/old", kind: 1, value: new TextEncoder().encode("1"), encoding: "json/v1" } as never]);
+    const a = await r.open();
+    const b = await r.open();
+    await settleAll(a.engine, b.engine);
+    const storage = r.device.storage.storageOf(a.engine.partitionKey()) as MemoryStorage & { pagesRead: number };
+    const before = storage.pagesRead;
+    r.server.write(KS, [{ key: "settings/new", kind: 1, value: new TextEncoder().encode("2"), encoding: "json/v1" } as never]);
+    await a.engine.setInterest(KS, ["settings"]); // a narrowing: the head's interest changes, the follower builds its mirror from the image
+    await settleAll(a.engine, b.engine);
+    expect(storage.pagesRead).toBeGreaterThan(before);
+    expect(b.engine.confirmed(KS).json("settings/new")).toBe(2);
+    expect(b.engine.confirmed(KS).json("settings/old")).toBe(1);
+  });
 });
 
 describe("14 [CLI-61]: where no reliable lock exists each tab keeps an outbox of its own, named by its tab id (V14 S8)", () => {

@@ -7,6 +7,7 @@ import type { Random } from "./clock.js";
 import { CrdtStore } from "./crdt-view.js";
 import type { LaneName } from "./manifests.js";
 import type { KeyspaceView } from "./overlay.js";
+import type { ExportEntry } from "./storage.js";
 import type { KeyTouch, Shown, ViewFeed } from "./view-feed.js";
 
 /** The state of one lane of the current client instance in one keyspace (07 §7.4). */
@@ -167,7 +168,7 @@ export class Follow {
    */
   widening: { to: string[]; added: string[] } | undefined;
   /** The persisted replica (§14.10): whether the image of this keyspace follows the in-memory state, and what its tail holds. */
-  image: { ok: boolean; seqs: Set<bigint>; headMs: number; baseSeq?: bigint } = { ok: false, seqs: new Set(), headMs: 0 };
+  image: { ok: boolean; seqs: Set<bigint>; headMs: number; baseSeq?: bigint; entryCount?: number } = { ok: false, seqs: new Set(), headMs: 0 };
   /** The estimate of the server time, in ms, of the last successful sync of the keyspace (14 [CLI-56]); 0 when none was. */
   lastSyncMs = 0;
   /** The local copy was purged (14 [CLI-66], [CLI-67]): nothing of the keyspace is shown, and nothing is authored into it. */
@@ -186,6 +187,8 @@ export class Follow {
   purgeJournal: string[] = [];
   /** The actions that the quarantine took, for the one `quarantined` event of the keyspace. */
   quarantinedIds: string[] = [];
+  /** The export entries that the quarantine made and that the app has not been told of: `exported` follows the `quarantined` event of the keyspace (14 [CLI-66]). */
+  exportedPending: ExportEntry[] = [];
   /** The changes that records carried and that their kind does not define, counted (02 [ARC-46]). */
   anomalies = 0;
   /** Keys outside the interest that the app loaded to author a change (14 [CLI-73]): the version that the load showed, or 0 for a key that was absent. */
