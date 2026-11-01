@@ -5,7 +5,8 @@
 //  - a string is never repaired: invalid UTF-8 is a CanonError, and a leading U+FEFF is an ordinary character (protobuf-es
 //    replaces invalid octets with U+FFFD and drops a leading byte-order mark);
 //  - a known field that arrives with a wire type its kind does not have is kept as an unknown field, as Go's decoder keeps
-//    it (SPEC-QUESTIONS Q1), where protobuf-es reads it as if it had the right one;
+//    it, where protobuf-es reads it as if it had the right one. `unmarshal` refuses such a message first (07 [MUT-45], round
+//    16: `checkEncoding`, kind `wire-type`); `decode`, which runs no check, keeps the field as received;
 //  - nothing but a CanonError is thrown for bad bytes (02 [ARC-46]).
 // Unknown fields are kept as received, in `$unknown`, so that the canonical encoding can write them at their numbers.
 
@@ -133,7 +134,8 @@ class Decoder {
         break;
       }
       default:
-        // a group (3, 4) or a wire type that does not exist: refused (SPEC-QUESTIONS Q2)
+        // a group (3, 4) or a wire type that does not exist: refused as bytes that do not parse; `checkEncoding` refuses a
+        // group first, as a wire type that does not fit (07 [MUT-45], round 16)
         throw malformed(`wire type ${wt} at byte ${p}`);
     }
     return { next, data: this.b.slice(p, next) };

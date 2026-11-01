@@ -47,10 +47,11 @@ function writeFixed(w: ByteWriter, bytes: number, set: (v: DataView) => void): v
 function encodeMessage(w: ByteWriter, m: ReflectMessage, view: EncodeView | undefined, depth: number): void {
   if (depth > MAX_DEPTH) throw malformed(`nested deeper than ${MAX_DEPTH}`);
   const md = m.desc;
-  // SPEC-QUESTION: 07 [MUT-45] (SPEC-QUESTIONS Q1) "A field that the encoding party does not know is written as the wire
-  // bytes it was received with". A known field that arrived with a wire type that its kind does not have (a string field as
-  // a varint) is kept by `unmarshal` as an unknown field, as Go's decoder does, and is written here at its number, after the
-  // known field of that number, if one is set. The text does not say whether such a field is unknown or the message refused.
+  // 07 [MUT-45] "A field that the encoding party does not know is written as the wire bytes it was received with". A known
+  // field that arrived with a wire type that its kind does not have (a string field as a varint) is kept by `decode` as an
+  // unknown field, as Go's decoder does, and is written here at its number, after the known field of that number, if one is
+  // set. Since round 16 the text refuses such a message (`checkShortest`, kind `wire-type`), so a received message that passes
+  // the checks holds none; a message that a caller built with one is still encoded as received.
   //
   // 07 [MUT-45] puts each unknown field at the place of its number, several of one number in the order received. A sender that writes
   // the canonical encoding writes them in increasing order of their numbers already, which one pass checks with no allocation; the

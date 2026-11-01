@@ -247,9 +247,9 @@ function readNode(v: JsonValue, depth: number, path: string, use: SchemaUse): Sc
         if (!Array.isArray(val)) throw definitionError("MAN-25", p, "required is a list of field names");
         val.forEach((r, i) => {
           if (typeof r !== "string") throw definitionError("MAN-25", `${p}[${i}]`, "required is a list of field names");
-          // SPEC-QUESTION (ruled, Q5: the code reading stands): 04 [MAN-26] (SPEC-QUESTIONS Q5): "Every name in `required` MUST be in `fields`." The text does not
-          // say whether a name may be listed twice. It is read as a set here, as the Go server does: a repeated name is
-          // accepted and kept once.
+          // 04 [MAN-26] (draft 14, Q5): "a name listed twice in `required` is accepted and means the same as one, and the
+          // canonical form (MAN-4) keeps the list as published". Read as a set here, as the Go server does: a repeated name is
+          // kept once in the schema; the manifest's canonical form is made from the document.
           if (!s.requiredSet.has(r)) {
             s.requiredSet.add(r);
             s.required.push(r);

@@ -5,6 +5,8 @@ import { ScalarType, type DescField, type DescMessage } from "@bufbuild/protobuf
 export const WT_VARINT = 0;
 export const WT_FIXED64 = 1;
 export const WT_LEN = 2;
+export const WT_SGROUP = 3;
+export const WT_EGROUP = 4;
 export const WT_FIXED32 = 5;
 
 /** The largest valid field number (2^29 − 1). */
@@ -41,6 +43,10 @@ export interface FieldInfo {
   kind: "string" | "message" | "map" | "varint" | "other";
   /** A repeated field (never a map). */
   list: boolean;
+  /** The wire type that the field's kind has (07 [MUT-45]); a repeated numeric, bool or enum field may also arrive packed, length-delimited. */
+  wire: number;
+  /** A repeated numeric, bool or enum field: written packed, read packed or not. */
+  packable: boolean;
   /** kind "message": the message type. */
   message?: DescMessage;
   /** kind "map": the entry's key (field 1) and value (field 2). */
@@ -48,9 +54,11 @@ export interface FieldInfo {
 }
 
 function scalarInfo(name: string, t: ScalarType, list: boolean): FieldInfo {
-  if (t === ScalarType.STRING) return { name, kind: "string", list };
-  if (scalarWire(t) === WT_VARINT) return { name, kind: "varint", list };
-  return { name, kind: "other", list };
+  const wire = scalarWire(t);
+  const packable = list && scalarPackable(t);
+  if (t === ScalarType.STRING) return { name, kind: "string", list, wire, packable };
+  if (wire === WT_VARINT) return { name, kind: "varint", list, wire, packable };
+  return { name, kind: "other", list, wire, packable };
 }
 
 /** Describes one field of a message for the checker. */
@@ -59,20 +67,20 @@ export function fieldInfo(f: DescField): FieldInfo {
     case "scalar":
       return scalarInfo(f.name, f.scalar, false);
     case "enum":
-      return { name: f.name, kind: "varint", list: false };
+      return { name: f.name, kind: "varint", list: false, wire: WT_VARINT, packable: false };
     case "message":
-      return { name: f.name, kind: "message", list: false, message: f.message };
+      return { name: f.name, kind: "message", list: false, wire: WT_LEN, packable: false, message: f.message };
     case "list":
       if (f.listKind === "scalar") return scalarInfo(f.name, f.scalar, true);
-      if (f.listKind === "enum") return { name: f.name, kind: "varint", list: true };
-      return { name: f.name, kind: "message", list: true, message: f.message };
+      if (f.listKind === "enum") return { name: f.name, kind: "varint", list: true, wire: WT_VARINT, packable: true };
+      return { name: f.name, kind: "message", list: true, wire: WT_LEN, packable: false, message: f.message };
     case "map": {
       const key = scalarInfo("key", f.mapKey, false);
       let value: FieldInfo;
       if (f.mapKind === "scalar") value = scalarInfo("value", f.scalar, false);
-      else if (f.mapKind === "enum") value = { name: "value", kind: "varint", list: false };
-      else value = { name: "value", kind: "message", list: false, message: f.message };
-      return { name: f.name, kind: "map", list: false, entry: { key, value } };
+      else if (f.mapKind === "enum") value = { name: "value", kind: "varint", list: false, wire: WT_VARINT, packable: false };
+      else value = { name: "value", kind: "message", list: false, wire: WT_LEN, packable: false, message: f.message };
+      return { name: f.name, kind: "map", list: false, wire: WT_LEN, packable: false, entry: { key, value } };
     }
   }
 }

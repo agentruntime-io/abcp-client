@@ -3,7 +3,7 @@
 
 export { CanonError, MAX_DEPTH, type CanonKind } from "./errors.js";
 export { encode, type EncodeView } from "./encode.js";
-export { checkEncoding, checkShortest, checkTimestamps, checkUtf8, timestampInRange } from "./check.js";
+export { checkEncoding, checkShortest, checkTimestamps, checkUtf8, checkUtf8Request, checkWireTypes, timestampInRange } from "./check.js";
 export { decode, unmarshal, unmarshalJson } from "./decode.js";
 export {
   SALT_SIZE,

@@ -12,7 +12,13 @@ export type CanonKind =
   /** A string field, at any depth, is not valid UTF-8 (02 [ARC-61]). */
   | "invalid-utf8"
   /** A google.protobuf.Timestamp is out of the range of 02 [ARC-61]. */
-  | "timestamp-range";
+  | "timestamp-range"
+  /**
+   * A known field arrives with a wire type that its kind does not have, or a field, known or unknown, has wire type 3 or 4 (the
+   * group tags). 07 [MUT-45] (round 16) says such a message is malformed in the same way as one that is not in its shortest
+   * form, with the same refusal at the same place (`invalidEnvelope`).
+   */
+  | "wire-type";
 
 /**
  * The typed refusal of this package (02 [ARC-46]): untrusted bytes never throw anything else. A client engine that gets
@@ -35,11 +41,14 @@ export class CanonError extends Error {
 
   /**
    * Whether the refusal of a Mutation, received in the binary codec and checked as the root message, answers
-   * INVALID_ENVELOPE for that mutation alone: an encoding not in its shortest form (07 [MUT-45], step 4 of Table 7-1), or an
-   * authored_at out of range (02 [ARC-61]). Every other refusal fails the whole request with InvalidArgument.
+   * INVALID_ENVELOPE for that mutation alone: an encoding not in its shortest form or a wire type that does not fit, a group
+   * tag included (07 [MUT-45], step 4 of Table 7-1), or an authored_at out of range (02 [ARC-61]). Every other refusal fails
+   * the whole request with InvalidArgument. A request of the AdminService that is not in its shortest form, or has a wire type
+   * that does not fit, is answered with InvalidArgument and Reject{INVALID_ENVELOPE} (07 [MUT-45]); so is a SyncService request
+   * with a wire type that does not fit.
    */
   get invalidEnvelope(): boolean {
-    return this.kind === "not-shortest" || (this.kind === "timestamp-range" && this.path === "authored_at");
+    return this.kind === "not-shortest" || this.kind === "wire-type" || (this.kind === "timestamp-range" && this.path === "authored_at");
   }
 }
 
@@ -53,6 +62,8 @@ function describe(kind: CanonKind): string {
       return "string is not valid UTF-8";
     case "timestamp-range":
       return "timestamp out of range";
+    case "wire-type":
+      return "wire type does not fit";
   }
 }
 

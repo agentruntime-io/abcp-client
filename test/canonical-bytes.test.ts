@@ -12,6 +12,7 @@ import {
   checkTimestamps,
   contentHash,
   contentHashInput,
+  decode,
   encode,
   hashRecord,
   hashRecordFromDigests,
@@ -165,10 +166,19 @@ describe("07 [MUT-45] and 02 [ARC-61] beyond the vectors", () => {
     expect(hex.endsWith("980607" + "a2060161" + "a2060162")).toBe(true);
   });
 
-  it("a known field with a wire type that its kind does not have stays an unknown field (SPEC-QUESTIONS Q1)", () => {
+  it("a known field with a wire type that its kind does not have is refused by unmarshal, and kept as an unknown field by decode (07 [MUT-45], round 16)", () => {
     // KeyChange.key (1, a string) as a varint 5, then a valid kind: protobuf-es would read it as a string
     const wire = fromHex("0805" + "1001");
-    const m = unmarshal(KeyChangeSchema, wire) as unknown as { key: string; kind: number; $unknown?: { no: number; wireType: number }[] };
+    expect(() => unmarshal(KeyChangeSchema, wire)).toThrow(CanonError);
+    try {
+      unmarshal(KeyChangeSchema, wire);
+    } catch (e) {
+      expect((e as CanonError).kind).toBe("wire-type");
+      expect((e as CanonError).invalidEnvelope).toBe(true);
+      expect((e as CanonError).path).toBe("key");
+    }
+    // decode runs no check (the caller has), and keeps the field as received, as Go's decoder does
+    const m = decode(KeyChangeSchema, wire) as unknown as { key: string; kind: number; $unknown?: { no: number; wireType: number }[] };
     expect(m.key).toBe("");
     expect(m.kind).toBe(1);
     expect(m.$unknown?.map((u) => [u.no, u.wireType])).toEqual([[1, 0]]);

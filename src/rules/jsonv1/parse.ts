@@ -61,9 +61,8 @@ export function parse(b: Uint8Array): JsonValue {
  * json/v1 value do not apply (nesting is bounded by MAX_DOCUMENT_DEPTH only so that untrusted input cannot recurse without
  * limit). The document is at most 4 MiB (04 [MAN-4]). Every error has code INVALID_ENVELOPE (04 [MAN-77]).
  *
- * SPEC-QUESTION (ruled, Q4: closed by 05 [STATE-7], the reading stands): 04 [MAN-3] (SPEC-QUESTIONS Q4): 1e-400 denotes the finite value 0 under one reading and is refused under
- * the other (and a noncharacter is valid I-JSON under one reading). The code follows the Go server and the reference
- * models: both are refused.
+ * 04 [MAN-3] (Q4, decided by 05 [STATE-7]): 1e-400 is refused like 1e400, and so is a string with a noncharacter, as the Go
+ * server and the reference models do.
  */
 export function parseDocument(b: Uint8Array): JsonValue {
   const p = new Parser(b, true, true, MAX_DOCUMENT_DEPTH, 0);
