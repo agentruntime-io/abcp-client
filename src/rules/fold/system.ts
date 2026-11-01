@@ -195,9 +195,10 @@ function selectRedacted(rec: RecordMessage): Selection {
   const markKeys = new Set<string>([...keys, ...erased]);
   const finish = (st: ReplicaState): void => {
     for (const k of keys) {
-      // STATE-85: the key's version after the record: the record's seq for a key that it deleted, the conversion's seq for a
-      // former path, which holds the tombstone that its conversion's DELETE gave it. Only a key tombstone carries a reset seq; a
-      // key under an entity tombstone, or with no tombstone, gets none.
+      // STATE-85 (draft 14): the key's version after the record: the record's seq for a key that it deleted and, for a former path, the
+      // version of the tombstone that it holds after the record: the seq of its conversion's DELETE, or that of the later DELETE that
+      // moved the tombstone past its conversion (06 [LOG-44]). Only a key tombstone carries a reset seq; a key under an entity
+      // tombstone, or with no tombstone, gets none.
       const t = st.tombstone(k);
       if (t !== undefined && t.kind === "key") st.setResetSeq(k, t.version);
     }

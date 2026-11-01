@@ -87,8 +87,8 @@ export function parseDocument(b: Uint8Array): JsonValue {
  * depth, member and U+0000 limits of [STATE-7], and not necessarily in canonical form. b is valid UTF-8 (the update was read
  * strictly). Returns null for a valid text and a JsonV1Error otherwise (reason `json-limits` for a limit, else another).
  *
- * SPEC-QUESTION: 05 [STATE-71] (SPEC-QUESTIONS Q6): U+0000 in these texts is refused as [STATE-7] says, as the Go server does;
- * the reference models do not apply that limit to them and no vector has the case.
+ * U+0000 in these texts is refused as [STATE-7] says, as the Go server does (Q6, decided by the text: the reference models apply the
+ * limit to them since draft 14, and the vectors `crdt-str-020` and `crdt-str-021` hold it).
  */
 export function checkJsonText(b: Uint8Array): JsonV1Error | null {
   try {

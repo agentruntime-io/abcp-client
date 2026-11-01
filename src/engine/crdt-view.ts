@@ -218,6 +218,113 @@ export function snapToCodePoint(s: string, i: number): number {
   return i;
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// The user's own edits of a root text (14 [CLI-13], verifier V19 MUST-4)
+
+/**
+ * The UTF-16 unit at `index` of the text as Yjs counts it (an embed counts one and has none), or null when the text holds no string unit
+ * there. It walks the text's items without building its string.
+ */
+function unitAtIndex(t: Y.Text, index: number): number | null {
+  let pos = 0;
+  for (let item = t._start; item !== null; item = item.right) {
+    if (item.deleted || !item.countable) continue;
+    if (index < pos + item.length) {
+      const c = item.content;
+      return c instanceof Y.ContentString ? c.str.charCodeAt(index - pos) : null;
+    }
+    pos += item.length;
+  }
+  return null;
+}
+
+/** Whether the bound `index` of the text falls between the two code units of a surrogate pair. */
+function insidePair(t: Y.Text, index: number): boolean {
+  if (index <= 0) return false;
+  const before = unitAtIndex(t, index - 1);
+  if (before === null || !isHigh(before)) return false;
+  const after = unitAtIndex(t, index);
+  return after !== null && isLow(after);
+}
+
+/** The text of a root text as a string of one unit for each unit that Yjs counts: an embed is a U+0000. */
+function unitsOf(t: Y.Text): string {
+  let out = "";
+  for (let item = t._start; item !== null; item = item.right) {
+    if (item.deleted || !item.countable) continue;
+    const c = item.content;
+    out += c instanceof Y.ContentString ? c.str : "\u0000".repeat(item.length);
+  }
+  return out;
+}
+
+/**
+ * The ops of a Quill-style delta (`applyDelta`) with every bound between them that falls inside a surrogate pair of `units`, the text before the
+ * delta, moved to the boundary before the pair; null when none does. Each retain and each delete covers the range of the text that its bounds,
+ * moved, enclose, so that the ops still partition the text and the ones after a moved bound are not shifted; an insert goes where the bounds
+ * before it have brought the cursor.
+ */
+function snapDelta(units: string, delta: readonly Record<string, unknown>[]): Record<string, unknown>[] | null {
+  const out: Record<string, unknown>[] = [];
+  let moved = false;
+  let at = 0; // the bound after the ops so far, in the units of the text before the delta
+  let from = 0; // the same bound, moved
+  for (const op of delta) {
+    const key = typeof op.retain === "number" ? "retain" : typeof op.delete === "number" ? "delete" : null;
+    if (key === null) {
+      out.push(op);
+      continue;
+    }
+    at += op[key] as number;
+    const to = snapToCodePoint(units, Math.min(units.length, at));
+    if (to !== Math.min(units.length, at)) moved = true;
+    if (to > from) out.push({ ...op, [key]: to - from });
+    from = Math.max(from, to);
+  }
+  return moved ? out : null;
+}
+
+const GUARDED = Symbol("abpc.surrogate-guard");
+
+/**
+ * Makes the edits that the user, or the editor binding that the app puts on the view document, makes of a root text keep every bound out of
+ * a surrogate pair (14 [CLI-13]): "A client MUST NOT author an insert, a delete or a format whose bound falls between the two code units of a
+ * surrogate pair: it moves the bound to the boundary before the pair, so that no update it authors would split a pair, which 05 [STATE-76]
+ * makes a no-op for good". Every update that the view document records as unsent comes of a transaction of the user, and Yjs would
+ * write the one that splits a pair as it was asked, which the server then folds to nothing, for good, so the view would show text that the
+ * confirmed document never does. The edit is moved before it is made: an insert, an embed, a format and a delete are made as the methods
+ * of the text are called, with each bound that falls inside a pair taken to the boundary before it (a delete that starts inside a pair then
+ * deletes the pair, and one that ends inside it leaves it), and a delta (`applyDelta`) with the bounds between its ops moved the same way.
+ *
+ * SPEC-QUESTION (14 [CLI-13]): the text says where a bound goes, not what a delete whose start is inside a pair then takes. The pair, here:
+ * the bound moves to before it, so the range reaches the high unit that the user's delete did not name. A delete that ends inside a pair
+ * leaves the pair whole, by the same move. A text that the app creates inside a map or an array (a nested Y.Text) is not a root, and is not
+ * guarded: its edits are authored as they are made.
+ */
+function guardText(t: Y.Text): void {
+  const g = t as unknown as Record<symbol, boolean>;
+  if (g[GUARDED] === true) return;
+  g[GUARDED] = true;
+  const P = Y.Text.prototype;
+  const at = (index: number): number => (insidePair(t, index) ? index - 1 : index);
+  t.insert = (index: number, text: string, attributes?: Parameters<Y.Text["insert"]>[2]): void => P.insert.call(t, at(index), text, attributes);
+  t.insertEmbed = (index: number, embed: Parameters<Y.Text["insertEmbed"]>[1], attributes?: Parameters<Y.Text["insertEmbed"]>[2]): void =>
+    P.insertEmbed.call(t, at(index), embed, attributes);
+  t.delete = (index: number, length: number): void => {
+    const start = at(index);
+    P.delete.call(t, start, at(index + length) - start);
+  };
+  t.format = (index: number, length: number, attributes: Parameters<Y.Text["format"]>[2]): void => {
+    const start = at(index);
+    P.format.call(t, start, at(index + length) - start, attributes);
+  };
+  t.applyDelta = (delta: Parameters<Y.Text["applyDelta"]>[0], opts?: Parameters<Y.Text["applyDelta"]>[1]): void => {
+    const units = unitsOf(t);
+    const snapped = units.length === 0 ? null : snapDelta(units, delta as Record<string, unknown>[]);
+    P.applyDelta.call(t, snapped ?? delta, opts);
+  };
+}
+
 /** Maps the user's edit, taken on `a`, onto `c`, where `c` is `a` with something taken out or replaced. */
 function mapPos(edit: { pos: number; del: number }, rem: { pos: number; del: number; insLen: number }, cLen: number): { pos: number; del: number } {
   if (edit.pos + edit.del <= rem.pos) return { pos: edit.pos, del: edit.del };
@@ -372,6 +479,7 @@ export class CrdtKey {
     }
     const kinds = this.kinds(v);
     ensureRoots(v, kinds);
+    for (const [name, kind] of kinds) if (kind === "text") guardText(v.getText(name)); // 14 [CLI-13]: the user's edits keep every bound out of a pair
     v.on("update", (u: Uint8Array) => {
       if (this.integrating) return;
       this.unsent.push(u);

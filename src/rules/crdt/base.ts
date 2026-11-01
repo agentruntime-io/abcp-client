@@ -12,8 +12,8 @@ export type BaseFault =
   | "pending" // it has pending structs (05 [STATE-76]); reason is the no-op rule
   | "state-vector" // its state vector is not the key's at crdt_covered_seq
   | "delete-set" // its normalized delete set is not the key's canonical one
-  | "gc-not-allowed" // a GC stands in place of an id whose parent is not hidden
-  | "content"; // an id does not hold what its first definition in the key's fold holds
+  | "gc-not-allowed" // a GC stands in place of an id that is hidden neither by its parent nor by a GC that it takes its parent from
+  | "content"; // an id does not hold what its first definition in the key's fold holds, or an item stands where a GC first defines the id
 
 /** Why a candidate base is not valid (05 [STATE-74]). */
 export interface BaseError {
@@ -37,14 +37,14 @@ function baseError(fault: BaseFault, reason?: Reason): BaseError {
  *  - it has no pending structs: applied alone to an empty document it is not a no-op for good (05 [STATE-76]);
  *  - its state vector equals the key's;
  *  - its delete set, normalized (05 [STATE-41]), equals the key's canonical delete set;
- *  - a GC stands only in place of an id that a GC first defines in the covered updates, or of an id whose parent is hidden, which is
- *    the part of the content rule that the key's fold can check (05 [STATE-74], Q7 ruled: an item whose origin is a GC has a hidden
- *    parent, so a GC may stand in place of it);
+ *  - a GC stands only in place of an id that a GC first defines in the covered updates, of an id whose parent is hidden, or of an id
+ *    that takes its parent from a GC (05 [STATE-74], [STATE-76]), which is the part of the content rule that the key's fold can check;
  *  - and the rest of that rule, as far as the key's fold can check it: each id holds the kind, the content ref and the parent of its
  *    first definition (05 [STATE-76]: first definition wins), or a ContentDeleted in its place for an id that the canonical delete set
- *    holds. A base that has an item where the key's first definition is a GC, or another content ref or another parent than the first
- *    definition has, gives a party that loads it other hidden ids and other parents than every party that folds the updates ("whatever
- *    base it holds", 05 [STATE-76]).
+ *    holds and that an item first defines. A base that has an item where the key's first definition is a GC (an id that a GC first
+ *    defines is a GC in every base, 05 [STATE-74]), or another content ref or another parent than the first definition has, gives a
+ *    party that loads it other hidden ids and other parents than every party that folds the updates ("whatever base it holds",
+ *    05 [STATE-76]).
  *
  * The fold keeps of a first definition its kind, content ref and parent, not its bytes, so that two items that differ only in their text
  * or values are not told apart here. A server MAY compare the content itself, by loading the base and the covered updates with one Yjs
@@ -87,14 +87,9 @@ function checkBaseContent(u: Update, own: Analysis, key: Doc): BaseError | null 
         const d = defs[i] as Def;
         if (d.start >= hi) break;
         if (s.kind === "gc") {
-          // 05 [STATE-74]: a GC stands in place of an id that a GC defines, or whose parent is hidden. An item whose origin is a GC has
-          // a hidden parent (05 [STATE-76]: "hidden when the origin is a `GC`"), so it allows one too.
-          //
-          // SPEC-QUESTION (ruled, Q7): 05 [STATE-74] "or a `GC` in its place for an id whose parent is hidden", with [STATE-76]: "an item
-          // that encodes none has the parent of its origin when it has an origin (hidden when the origin is a `GC`)". Both reference
-          // models (runner-yjs/lib/crdt.mjs gcAllowed, runner-yrs/abpc/crdt.py check_base) read only the parent id that the definition
-          // carries, which an item whose origin is a GC has not, and refuse the GC; no vector has the case. Ruled by the coordinator
-          // (2026-10-31): reading (a), the text. The reference models will be fixed in spec round 16.
+          // 05 [STATE-74]: a GC stands in place of an id that a GC first defines, of an id that is hidden because its parent is hidden, or
+          // of an id that is hidden because it takes its parent from a GC (05 [STATE-76]: its origin or right origin is a GC, an item
+          // whose parent is hidden, or an item that takes its parent from a GC; the three count alike). Q7, reading (a), is the text's now.
           if (!(d.kind === "gc" || d.gcParent || (d.hasParent && d.parentId !== null && hid.hidden(d.parentId)))) return baseError("gc-not-allowed");
         } else if (!baseItemHolds(own, hid, s, d, ds, Math.max(lo, d.start), Math.min(hi, d.end))) {
           // an item of the base, over a definition of the key: only the overlap of the two is judged
@@ -120,21 +115,27 @@ function firstEndingAbove(defs: readonly Def[], clock: number): number {
 
 /**
  * Whether the item s of a base holds, over the ids [lo, hi) that the key's definition d covers, what d holds (05 [STATE-74]): the same
- * content ref, or a ContentDeleted where the canonical delete set holds every id, and the same parent. An item over a GC does not.
- * `own` answers for the base, `hid` for the key.
+ * content ref, or a ContentDeleted where the canonical delete set holds every id, and the same parent, with the root that it names when it
+ * is a root. An item over an id that a GC first defines holds nothing: that id is a GC in every base (05 [STATE-74], Q53, decided by the
+ * text). `own` answers for the base, `hid` for the key.
  */
 function baseItemHolds(own: Analysis, hid: Analysis, s: Struct, d: Def, ds: readonly Range[], lo: number, hi: number): boolean {
-  if (d.kind === "gc") return false; // the id's first definition is a GC, which hides it: an item there shows it
+  // 05 [STATE-74]: "a `ContentDeleted` in its place for an id that the canonical delete set holds and that an item first defines (an id
+  // that a `GC` first defines is a `GC` in every base)". An item that comes later and names the id as its origin or right origin takes its
+  // parent from a GC, and is hidden (05 [STATE-76]); an item with a visible parent in its place would make it shown by the party that
+  // loads the base and hidden by the one that folds the updates.
+  if (d.kind === "gc") return false;
   if (s.content !== d.content && !(s.content === ContentRef.Deleted && rangesHold(ds, lo, hi))) return false;
   // The parent that the item takes, against the parent of the first definition (05 [STATE-76]: the same for every party, whatever base
-  // it holds). A parent that a GC origin hides on both sides is the same hidden parent whichever item the chain ends at. On one side
-  // only, the item is hidden for the party that folds the updates and shown for the party that loads the base, or the other way round,
-  // unless the parent that the other side names is hidden too: then both hide the item, and it matters no more which hidden parent it has.
+  // it holds). An item that takes its parent from a GC on both sides is hidden on both, whichever GC or hidden parent it comes from. On
+  // one side only, the item is hidden for the party that folds the updates and shown for the party that loads the base, or the other way
+  // round, unless the parent that the other side names is hidden too: then both hide the item, and it matters no more which hidden parent
+  // it has. Otherwise the parents are the same item or the same root.
   const p = own.parentOf(s);
   if (p.gc && d.gcParent) return true;
   if (p.gc) return d.hasParent && d.parentId !== null && hid.hidden(d.parentId);
   if (d.gcParent) return p.hasId && p.id !== null && hid.hidden(p.id);
-  if (p.hasId !== d.hasParent) return false;
+  if (p.hasId !== d.hasParent || p.root !== d.root) return false;
   return !p.hasId || (p.id !== null && d.parentId !== null && p.id.client === d.parentId.client && p.id.clock === d.parentId.clock);
 }
 

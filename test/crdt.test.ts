@@ -6,7 +6,7 @@
 // [CLI-13]: stock Yjs, which the engine uses) after the updates that the spec integrates is compared with `expect.content`, per root;
 // for a base, the base loaded alone is compared with the covered updates folded (`expect.content_matches_fold`) and with `expect.content`;
 // for a rename, the base and the later updates. Nothing is skipped: the vectors where a library differs from the spec are listed by id
-// below (`KNOWN_LIBRARY_DIFFERENCES`), and a difference anywhere else fails the run.
+// below (`KNOWN_LIBRARY_DIFFERENCES`: since draft 14 yrs only, stock Yjs agrees), and a difference anywhere else fails the run.
 
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -26,30 +26,29 @@ const toRoots = (m: Record<string, string>): Roots => new Map(Object.entries(m) 
 // ---- the documents that a library shows (Q33, client side; the twin of runner-yjs/run.mjs) ----
 
 /**
- * The vectors where a library document differs from the spec one, by id, and which library (the vector's `library.known`). Stock Yjs
- * hides an item whose right origin is a GC (`crdt-int-par-004`: it integrates it as a GC, so its text is not shown), which 05
- * [STATE-76] does not: its canonical form is the same either way, and only the document differs. yrs differs on `crdt-int-par-005` (with a
- * GC as the origin it takes the parent of the right origin) and aborts on `crdt-any-008`; Yjs agrees with the spec on both. Round 16 will
- * change the text to match Yjs (docs/SPEC-QUESTIONS.md, Q33); until then an entry here is the one place where a document may differ.
- * `shows` is the document that the library gives, so that a difference that moves fails too.
+ * The vectors where a library document differs from the spec one, by id, and which library (the vector's `library.known`). Since draft 14
+ * (rulings Y9 and Z3, Q33) the text follows Yjs: an item whose origin or right origin is a GC, an item whose parent is hidden or an item
+ * that takes its parent from a GC is hidden, and an item whose origin and right origin are items with different parents is a no-op for
+ * good (05 [STATE-76]), so stock Yjs, which this client shows (14 [CLI-13]), agrees with the text on every vector with a document, and the
+ * vectors list yrs only: it shows the item of `crdt-int-par-004`, `-005`, `-009` and `-011` and of the base of `crdt-base-021` (a neighbour
+ * that is a GC, or an item whose parent is deleted, does not hide the item for it), and aborts on `crdt-any-008`. An entry here is the one
+ * place where a library document may differ, and it is a yrs one. `shows` is the document that a Yjs library gives, for an entry that
+ * names yjs, so that a difference that moves fails too; no entry does now.
  */
 const KNOWN_LIBRARY_DIFFERENCES: Record<string, { library: "yjs" | "yrs"; shows?: Record<string, unknown> }> = {
-  "crdt-int-par-004": { library: "yjs", shows: { a: ["p"] } },
-  "crdt-int-par-005": { library: "yrs" },
   "crdt-any-008": { library: "yrs" },
+  "crdt-int-par-004": { library: "yrs" },
+  "crdt-int-par-005": { library: "yrs" },
+  "crdt-int-par-009": { library: "yrs" },
+  "crdt-int-par-011": { library: "yrs" },
+  "crdt-base-021": { library: "yrs" },
 };
 
 /**
  * The vectors of the pinned spec (draft 14, omniview 4377ab8) that the client's rules do not pass yet, with the work that will
  * make them pass (the twin of the server's `vectors.SkipPending`). Remove an id when its work lands.
  */
-const PENDING = new Map<string, string>([
-  ["crdt-int-par-004", "round 16 B1 (05 [STATE-76], Y9/Z3)"],
-  ["crdt-int-par-008", "round 16 B1 (05 [STATE-76], Y9/Z3)"],
-  ["crdt-int-par-009", "round 16 B1 (05 [STATE-76], Y9/Z3)"],
-  ["crdt-int-par-010", "round 16 B1 (05 [STATE-76], Y9/Z3)"],
-  ["crdt-int-par-011", "round 16 B1 (05 [STATE-76], Y9/Z3)"],
-]);
+const PENDING = new Map<string, string>([]);
 const vit = (id: string) => (PENDING.has(id) ? it.skip : it);
 
 /** Stable JSON for a comparison of documents: object keys sorted. */
@@ -267,16 +266,19 @@ describe("06 [LOG-40] rename of a CRDT key (crdt-rename vectors)", () => {
 });
 
 describe("17 [CONF-9], Q33: no vector hides a difference between the documents of a library and the spec", () => {
-  // pending round 16 B1: at draft 14 the text follows Yjs (Q33), the vectors list only yrs differences, and 76 give a document
-  it.skip("the vectors with a document are all checked, and the known library differences are exactly those that the vectors list", () => {
+  // at draft 14 the text follows Yjs (Y9, Z3, Q33): the vectors list yrs differences only, and 76 give a document
+  it("the vectors with a document are all checked, and the known library differences are exactly those that the vectors list", () => {
     const withContent = all.filter((v) => v.expect?.content !== undefined && v.expect.content !== null);
-    expect(withContent.length, "vectors that give an expected document at draft 13").toBe(70);
+    expect(withContent.length, "vectors that give an expected document at draft 14").toBe(76);
     const listed = all.filter((v) => v.library?.known !== undefined).map((v) => [v.id, Object.keys(v.library.known as object).sort()] as const);
     expect(listed.map(([id]) => id).sort()).toEqual(Object.keys(KNOWN_LIBRARY_DIFFERENCES).sort());
     for (const [id, libs] of listed) expect(libs, id).toEqual([(KNOWN_LIBRARY_DIFFERENCES[id] as { library: string }).library]);
-    // the two that this client library (Yjs) is concerned with: -004 differs, -005 agrees
-    expect(KNOWN_LIBRARY_DIFFERENCES["crdt-int-par-004"]?.library).toBe("yjs");
-    expect(KNOWN_LIBRARY_DIFFERENCES["crdt-int-par-005"]?.library).toBe("yrs");
+    // the library that this client shows (stock Yjs) agrees with the spec on every vector: no entry names it
+    expect(Object.values(KNOWN_LIBRARY_DIFFERENCES).filter((k) => k.library === "yjs")).toEqual([]);
+    // and the four items and the base that yrs shows differently, which the vectors name
+    for (const id of ["crdt-int-par-004", "crdt-int-par-005", "crdt-int-par-009", "crdt-int-par-011", "crdt-base-021"]) {
+      expect(KNOWN_LIBRARY_DIFFERENCES[id]?.library, id).toBe("yrs");
+    }
   });
 });
 

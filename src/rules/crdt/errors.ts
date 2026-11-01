@@ -35,6 +35,7 @@ export type NoopReason =
   | "skip" // a Skip struct anywhere
   | "missing" // an origin, right origin, parent or deleted id that is not present
   | "non-type-parent" // a parent id that is not hidden and is not a ContentType item
+  | "cross-parent" // an item whose origin and right origin are items with different parents, none hidden
   | "surrogate"; // the update would split a surrogate pair
 
 export type Reason = RefusalReason | NoopReason;

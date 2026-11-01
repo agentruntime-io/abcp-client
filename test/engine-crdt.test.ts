@@ -85,6 +85,35 @@ describe("14 [CLI-13] a confirmed document and a view document", () => {
     expect(textOf(stock)).toBe("abXc");
   });
 
+  it("an item whose origin and right origin are items with different parents is a no-op for good: the confirmed document never integrates it (05 [STATE-76], Y9)", async () => {
+    const r = await rig();
+    // the encoding of a Yjs update, by hand: 1:0 "p" under the root, 2:0 a type under the root, 2:1 "q" inside that type, and X = 3:0 "x"
+    // with origin 1:0 and right origin 2:1, which stock Yjs integrates after "p" and 05 [STATE-76] does not integrate at all
+    const uv = (n: number): number[] => [n];
+    const lstr = (t: string): number[] => [t.length, ...new TextEncoder().encode(t)];
+    const group = (client: number, ...structs: number[][]): number[] => [structs.length, client, 0, ...structs.flat()];
+    const update = (...groups: number[][]): Uint8Array => Uint8Array.from([groups.length, ...groups.flat(), 0]);
+    const u1 = update(
+      group(2, [0x07, 1, ...lstr("text"), ...uv(2)], [0x04, 0, ...uv(2), ...uv(0), ...lstr("q")]),
+      group(1, [0x04, 1, ...lstr("text"), ...lstr("p")]),
+    );
+    const x = update(group(3, [0xc4, ...uv(1), ...uv(0), ...uv(2), ...uv(1), ...lstr("x")]));
+    const h = r.engine.crdt(KS, KEY);
+    writeRemote(r, u1);
+    await r.engine.settle();
+    expect(textOf(h.confirmedDoc)).toBe("p");
+    writeRemote(r, x);
+    await r.engine.settle();
+    expect(textOf(h.confirmedDoc)).toBe("p");
+    expect(textOf(h.doc)).toBe("p");
+    expect(Y.decodeStateVector(Y.encodeStateVector(h.confirmedDoc)).has(3)).toBe(false);
+    // what stock Yjs does instead: it integrates the item
+    const stock = new Y.Doc();
+    Y.applyUpdate(stock, u1);
+    Y.applyUpdate(stock, x);
+    expect(textOf(stock)).toBe("px");
+  });
+
   it("a rejected pending update rebuilds the view document: a fresh Yjs client id, the confirmed document and the remaining pending updates, and the user's unsent edits re-applied once, as a diff, after `rebuilt`", async () => {
     const r = await rig();
     writeRemote(r, remoteEdit(r, (t) => t.insert(0, "base")));
@@ -198,6 +227,64 @@ describe("14 [CLI-13] no insert, delete or format bound falls between the two co
     expect(snapToCodePoint(s, s.length)).toBe(s.length);
     expect(snapToCodePoint("\ude00x", 1)).toBe(1); // a lone low unit is no pair
     expect(snapToCodePoint("\ud83dx", 1)).toBe(1); // a lone high unit is no pair
+  });
+
+  /** The text "a😀b", committed, in a rig; the edit `fn` is then made on the view document by the user and committed. */
+  async function userEdit(fn: (t: Y.Text) => void): Promise<{ view: string; confirmed: string; server: string; events: string[]; outbox: number }> {
+    const r = await rig();
+    const h = r.engine.crdt(KS, KEY);
+    h.doc.getText("text").insert(0, "a\u{1F600}b");
+    await h.flush("DocEdit");
+    await r.engine.settle();
+    expect(textOf(h.confirmedDoc)).toBe("a\u{1F600}b");
+    fn(h.doc.getText("text"));
+    const res = await h.flush("DocEdit");
+    await r.engine.settle();
+    return {
+      view: textOf(h.doc),
+      confirmed: textOf(h.confirmedDoc),
+      server: textOf(r.server.ydoc(KS, KEY) as Y.Doc),
+      events: types(r, res?.mutationId),
+      outbox: r.engine.outbox().length,
+    };
+  }
+
+  it("the user's insert at an index inside a pair is authored before the pair, and the view, the confirmed document and the server agree (V19 MUST-4)", async () => {
+    // an app's binding inserts "x" at code-unit offset 2: between the high and the low unit of the emoji
+    const o = await userEdit((t) => t.insert(2, "x"));
+    expect(o.view).toBe("ax\u{1F600}b");
+    expect(o.confirmed).toBe(o.view);
+    expect(o.server).toBe(o.view);
+    expect(o.events).toEqual(["committed"]); // not `corrected`: the server did not fold the update to no effect
+    expect(o.outbox).toBe(0);
+  });
+
+  it("a delete whose start is inside a pair deletes the pair, and one whose end is inside it leaves the pair whole", async () => {
+    const start = await userEdit((t) => t.delete(2, 1)); // the low unit: the bound moves before the pair, which the range now holds
+    expect([start.view, start.confirmed, start.server, start.events]).toEqual(["ab", "ab", "ab", ["committed"]]);
+    const end = await userEdit((t) => t.delete(0, 2)); // "a" and the high unit: the end moves before the pair
+    expect([end.view, end.confirmed, end.server, end.events]).toEqual(["\u{1F600}b", "\u{1F600}b", "\u{1F600}b", ["committed"]]);
+  });
+
+  it("a format, an embed and a delta of the user keep their bounds out of a pair too", async () => {
+    const fmt = await userEdit((t) => t.format(2, 1, { bold: true })); // the pair is formatted whole
+    expect([fmt.view, fmt.confirmed, fmt.server, fmt.events]).toEqual(["a\u{1F600}b", "a\u{1F600}b", "a\u{1F600}b", ["committed"]]);
+    const embed = await userEdit((t) => t.insertEmbed(2, { image: "x" })); // before the pair
+    expect([embed.confirmed, embed.server, embed.events]).toEqual(["a\u{1F600}b", "a\u{1F600}b", ["committed"]]);
+    // retain 2 ends inside the pair: the ops are the same ops over the text with that bound before the pair: retain 1, insert, delete the pair
+    const delta = await userEdit((t) => t.applyDelta([{ retain: 2 }, { insert: "Q" }, { delete: 1 }]));
+    expect([delta.view, delta.confirmed, delta.server, delta.events]).toEqual(["aQb", "aQb", "aQb", ["committed"]]);
+    const inserted = await userEdit((t) => t.applyDelta([{ retain: 2 }, { insert: "Z" }]));
+    expect([inserted.view, inserted.confirmed, inserted.server]).toEqual(["aZ\u{1F600}b", "aZ\u{1F600}b", "aZ\u{1F600}b"]);
+  });
+
+  it("an edit that has no bound inside a pair is made as it is asked", async () => {
+    const o = await userEdit((t) => {
+      t.insert(1, "x"); // before the pair
+      t.insert(5, "y"); // after "ax😀b"
+      t.delete(2, 2); // the pair, whole
+    });
+    expect([o.view, o.confirmed, o.server, o.events]).toEqual(["axby", "axby", "axby", ["committed"]]);
   });
 
   it("a re-applied edit that starts inside a pair replaces the whole pair and keeps it whole: the inserted text begins with the unit that the start gave up", async () => {

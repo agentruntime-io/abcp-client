@@ -65,8 +65,13 @@ export interface Def {
   parentId: Id | null;
   /** the parent that the struct takes is an item */
   hasParent: boolean;
-  /** the item takes its parent from an origin that is a GC, so its parent is hidden (05 [STATE-76]) */
+  /**
+   * the item takes its parent from a GC: its origin or right origin is a GC, an item whose parent is hidden, or an item that takes its
+   * parent from a GC (05 [STATE-76]); it is hidden
+   */
   gcParent: boolean;
+  /** the name of the root that the parent is, when it is a root */
+  root: string | null;
 }
 
 /** Whether e, which starts where d ends, can join d: the ids agree on everything that a reader of the definitions asks. */
@@ -79,6 +84,7 @@ function sameRun(d: Def, e: Def): boolean {
     d.content === e.content &&
     d.hasParent === e.hasParent &&
     d.gcParent === e.gcParent &&
+    d.root === e.root &&
     sameId(d.parentId, e.parentId)
   );
 }
@@ -228,8 +234,8 @@ export class Doc {
    * Folds an update that `parseUpdate` has read, and whose roots the caller has checked at commit, onto the Doc.
    *
    * 05 [STATE-76]: the update is checked against the state vector SV of the key's integrated updates. It is a no-op for good
-   * when it has a gap, a partly present struct, a Skip, a missing dependency, a parent that is not a type, or when it would
-   * split a surrogate pair; a no-op for good integrates no part of itself. Otherwise it is integrated so that the first
+   * when it has a gap, a partly present struct, a Skip, a missing dependency, a parent that is not a type, an item whose origin and
+   * right origin are items with different parents, or when it would split a surrogate pair; a no-op for good integrates no part of itself. Otherwise it is integrated so that the first
    * definition wins: a struct wholly below its client's next clock is ignored. The canonical form of 05 [STATE-41] then grows
    * by the update's state vector and delete set, and the verdict is APPLIED when the form changed and NO_EFFECT when it did not.
    */
@@ -254,6 +260,7 @@ export class Doc {
         parentId: p.id,
         hasParent: p.hasId,
         gcParent: p.gc,
+        root: p.root,
       };
       const last = news[news.length - 1];
       if (last !== undefined && last.client === s.client && sameRun(last.def, def)) last.def.end = def.end; // last.def is this call's own
@@ -331,15 +338,52 @@ export function unionRanges(cur: readonly Range[], add: readonly Range[]): { uni
 
 // ---- the questions of 05 [STATE-76] ----
 
-/** The parent that a struct takes: an item (hasId), or a root or none. */
+/** The parent that a struct takes: an item (hasId), a root, or none. */
 interface ParentRef {
   id: Id | null;
   hasId: boolean;
-  /** the parent is hidden because it comes from an origin that is a GC */
+  /** the name of the root, when the parent is a root */
+  root: string | null;
+  /** the item takes its parent from a GC (05 [STATE-76]): it takes none, and is hidden */
   gc: boolean;
 }
 
-const NO_PARENT: ParentRef = { id: null, hasId: false, gc: false };
+const NO_PARENT: ParentRef = { id: null, hasId: false, root: null, gc: false };
+const GC_PARENT: ParentRef = { id: null, hasId: false, root: null, gc: true };
+
+/**
+ * Whether two parents are the same one in the sense of 05 [STATE-76]: the same root, or the same item. A struct that takes no parent
+ * counts as having the same parent as any other, since the other rules of the no-op decide it.
+ */
+function sameParent(a: ParentRef, b: ParentRef): boolean {
+  if ((!a.hasId && a.root === null) || (!b.hasId && b.root === null)) return true;
+  if (a.root !== null || b.root !== null) return a.root === b.root;
+  return a.id !== null && b.id !== null && a.id.client === b.id.client && a.id.clock === b.id.clock;
+}
+
+/** What 05 [STATE-76] asks of the struct that the origin or the right origin of an item names. */
+interface Neighbour {
+  /** the parent that it takes */
+  parent: ParentRef;
+  /** it is a GC, an item whose parent is hidden, or an item that takes its parent from a GC: the three count alike */
+  hides: boolean;
+  /** some struct defines the id */
+  found: boolean;
+}
+
+const NOT_FOUND: Neighbour = { parent: NO_PARENT, hides: false, found: false };
+const GC_NEIGHBOUR: Neighbour = { parent: NO_PARENT, hides: true, found: true };
+
+/** The states of an item of the update in `Analysis.state`. */
+const ITEM_KNOWN = 1;
+const ITEM_ON_PATH = 2;
+
+/** An item that `resolve` is working on: the ids that it names, and how many of them it has looked at. */
+interface ResolveFrame {
+  s: Struct;
+  ids: Id[];
+  k: number;
+}
 
 /**
  * Answers the questions of 05 [STATE-76] about one update against the state of a Doc. The questions are asked in the order of
@@ -347,7 +391,7 @@ const NO_PARENT: ParentRef = { id: null, hasId: false, gc: false };
  */
 export class Analysis {
   private readonly implied: ParentRef[];
-  private readonly known: boolean[];
+  private readonly state: number[];
   private readonly hmemo = new Map<string, boolean>();
 
   /** u is null when the questions are about the Doc alone. */
@@ -356,55 +400,100 @@ export class Analysis {
     readonly u: Update | null,
   ) {
     this.implied = u === null ? [] : new Array<ParentRef>(u.all.length).fill(NO_PARENT);
-    this.known = u === null ? [] : new Array<boolean>(u.all.length).fill(false);
+    this.state = u === null ? [] : new Array<number>(u.all.length).fill(0);
   }
 
   /**
-   * The parent that s takes (05 [STATE-76]): the one it encodes; for an item that encodes none, the parent of its origin when it
-   * has an origin, and otherwise that of its right origin (hidden when that struct is a GC); the right origin of an item that
-   * has an origin takes no part. A GC has none. The chain of origins is followed without recursion, and every struct on it
-   * takes the same answer.
+   * The parent that s takes (05 [STATE-76]): the one it encodes. An item that encodes none takes none, and is hidden, when its origin
+   * or its right origin is a GC, an item whose parent is hidden, or an item that takes its parent from a GC. Otherwise it takes the
+   * parent of its origin when it has one, and else that of its right origin; an item that has both takes the parent that they share,
+   * since one whose origin and right origin have different parents is a no-op for good (noOpForGood finds it, and the update is
+   * folded no further). A GC has none.
    */
   parentOf(s: Struct): ParentRef {
     if (s.kind !== "item") return NO_PARENT;
-    if (s.parentKind === ParentKind.Item) return { id: s.parentId, hasId: true, gc: false };
-    if (s.parentKind === ParentKind.Root) return NO_PARENT;
-    if (this.known[s.idx] === true) return this.implied[s.idx] as ParentRef;
+    if (s.parentKind === ParentKind.Item) return { id: s.parentId, hasId: true, root: null, gc: false };
+    if (s.parentKind === ParentKind.Root) return { id: null, hasId: false, root: s.root, gc: false };
+    if (((this.state[s.idx] as number) & ITEM_KNOWN) === 0) this.resolve(s);
+    return this.implied[s.idx] as ParentRef;
+  }
+
+  /**
+   * Finds the parent of the item s and of each item that it depends on and that is not known yet: the items that s names (its origin,
+   * its right origin and its parent), those that they name, and so on, each before the item that names it. That is every item whose
+   * definition the answer for s reads: the parent of a neighbour, and whether the neighbour's parent is hidden, which follows the
+   * parents up. The references of an update have no cycle (05 [STATE-71], References), so the order exists. The walk keeps its own
+   * stack, so that a chain as long as the update costs the update's time and no recursion (02 [ARC-46]).
+   */
+  private resolve(s: Struct): void {
     const u = this.u as Update;
-    const path: number[] = [];
-    let res: ParentRef = NO_PARENT;
-    let cur = s;
-    for (;;) {
-      path.push(cur.idx);
-      const via = cur.hasOrigin ? cur.origin : cur.right;
-      if (via.clock < this.doc.next(via.client)) {
-        const d = this.doc.defAt(via);
-        if (d !== undefined) res = { id: d.parentId, hasId: d.hasParent, gc: d.kind === "gc" || d.gcParent };
-        break;
+    const stack: ResolveFrame[] = [];
+    const push = (t: Struct): void => {
+      this.state[t.idx] = (this.state[t.idx] as number) | ITEM_ON_PATH;
+      const ids: Id[] = [];
+      if (t.hasOrigin) ids.push(t.origin);
+      if (t.hasRight) ids.push(t.right);
+      if (t.parentKind === ParentKind.Item) ids.push(t.parentId);
+      stack.push({ s: t, ids, k: 0 });
+    };
+    push(s);
+    while (stack.length > 0) {
+      const top = stack[stack.length - 1] as ResolveFrame;
+      if (top.k < top.ids.length) {
+        const id = top.ids[top.k++] as Id;
+        if (id.clock >= this.doc.next(id.client)) {
+          // below it, the Doc's definition of the id says it all
+          const t = u.find(id);
+          if (t !== undefined && t.kind === "item" && this.state[t.idx] === 0) push(t);
+        }
+        continue;
       }
-      const t = u.find(via);
-      if (t === undefined) break;
-      if (t.kind === "gc") {
-        res = { id: null, hasId: false, gc: true };
-        break;
-      }
-      if (t.parentKind === ParentKind.Item) {
-        res = { id: t.parentId, hasId: true, gc: false };
-        break;
-      }
-      if (t.parentKind === ParentKind.Root) break;
-      if (this.known[t.idx] === true) {
-        res = this.implied[t.idx] as ParentRef;
-        break;
-      }
-      if (path.length > u.all.length) break; // no chain of an acyclic update is longer than the update
-      cur = t;
+      this.implied[top.s.idx] = this.compute(top.s);
+      this.state[top.s.idx] = ITEM_KNOWN;
+      stack.pop();
     }
-    for (const i of path) {
-      this.implied[i] = res;
-      this.known[i] = true;
+  }
+
+  /** `parentOf` for an item whose neighbours' answers are known. */
+  private compute(s: Struct): ParentRef {
+    if (s.parentKind === ParentKind.Item) return { id: s.parentId, hasId: true, root: null, gc: false };
+    if (s.parentKind === ParentKind.Root) return { id: null, hasId: false, root: s.root, gc: false };
+    let via = NO_PARENT; // the parent of the origin, else of the right origin
+    let hides = false;
+    if (s.hasOrigin) {
+      const n = this.neighbourAt(s.origin);
+      via = n.parent;
+      hides = n.hides;
     }
-    return res;
+    if (s.hasRight) {
+      const n = this.neighbourAt(s.right);
+      if (!s.hasOrigin) via = n.parent;
+      hides = hides || n.hides;
+    }
+    return hides ? GC_PARENT : via;
+  }
+
+  /**
+   * The neighbour that the id names: its definition among the key's integrated updates when id is below the next clock of its client,
+   * and otherwise the struct of the update, whose parent is known when this is called by the walk of `resolve` or after it.
+   */
+  neighbourAt(id: Id): Neighbour {
+    if (id.clock < this.doc.next(id.client)) {
+      const d = this.doc.defAt(id);
+      if (d === undefined) return NOT_FOUND;
+      if (d.kind === "gc") return GC_NEIGHBOUR;
+      return {
+        found: true,
+        parent: { id: d.parentId, hasId: d.hasParent, root: d.root, gc: false },
+        hides: d.gcParent || (d.hasParent && d.parentId !== null && this.hidden(d.parentId)),
+      };
+    }
+    if (this.u === null) return NOT_FOUND;
+    const t = this.u.find(id);
+    if (t === undefined) return NOT_FOUND;
+    if (t.kind === "gc") return GC_NEIGHBOUR;
+    const p = this.parentOf(t);
+    return { found: true, parent: p, hides: p.gc || (p.hasId && p.id !== null && this.hidden(p.id)) };
   }
 
   /** The first definition of id: among the key's integrated updates when id is below the next clock of its client, and otherwise in the update. */
@@ -423,6 +512,7 @@ export class Analysis {
       parentId: p.id,
       hasParent: p.hasId,
       gcParent: p.gc,
+      root: p.root,
     };
   }
 
@@ -523,6 +613,16 @@ export function noOpForGood(d: Doc, a: Analysis): Reason | undefined {
     if (s.kind !== "item" || s.parentKind !== ParentKind.Item) continue;
     const pd = a.defOf(s.parentId);
     if (!(pd !== undefined && pd.kind === "item" && pd.content === 7) && !a.hidden(s.parentId)) return "non-type-parent";
+  }
+  // One of its items has both an origin and a right origin that are items with different parents, none of them a GC, an item whose
+  // parent is hidden, or an item that takes its parent from a GC (the three count alike, so that the answer is the same whatever base a
+  // party holds, 05 [STATE-74]). Such an item is no part of any document.
+  for (const s of u.all) {
+    if (s.kind !== "item" || !s.hasOrigin || !s.hasRight) continue;
+    const o = a.neighbourAt(s.origin);
+    if (!o.found || o.hides) continue;
+    const r = a.neighbourAt(s.right);
+    if (r.found && !r.hides && !sameParent(o.parent, r.parent)) return "cross-parent";
   }
   // It would split a surrogate pair whose ids are not hidden: the origin of one of its items is the first code unit of the pair,
   // the right origin of one of its items is the second, or a range of its delete set starts at the second or ends at the first.

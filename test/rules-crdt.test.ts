@@ -1,7 +1,8 @@
 // The rules that the Go crdt package gained after the client's first port (C1): Q7 (ruled, reading a), V2 S2 and V6 S-3 (the content rule
-// of a base), V2 SHOULD S3 (a Doc a reader holds never moves), and V2 MUST-1 / V6 MUST-A (the memory of a key follows the shape of its
-// document, not its number of structs or clients, 02 [ARC-46]). The tests are the twins of server/internal/crdt/clone_test.go,
-// resource_test.go and clients_test.go.
+// of a base), V2 SHOULD S3 (a Doc a reader holds never moves), V2 MUST-1 / V6 MUST-A (the memory of a key follows the shape of its
+// document, not its number of structs or clients, 02 [ARC-46]), and, from spec draft 14, the parent of an item that has both an origin and
+// a right origin (05 [STATE-76], Y9, Z3, Q33). The tests are the twins of server/internal/crdt/clone_test.go, resource_test.go,
+// clients_test.go and parents_test.go.
 
 import * as v8 from "node:v8";
 import * as vm from "node:vm";
@@ -9,6 +10,7 @@ import { create } from "@bufbuild/protobuf";
 import { describe, expect, it } from "vitest";
 import { ChangeKind, KeyChangeSchema, RecordKind, RecordSchema } from "../src/gen/abpc/v2/types_pb.js";
 import { Doc, parseUpdate, validateBase, type BaseError, type Roots, type Verdict } from "../src/rules/crdt/index.js";
+import { Analysis } from "../src/rules/crdt/doc.js";
 import { applyRecord, ReplicaState } from "../src/rules/fold/index.js";
 
 // ---- a small encoder for Yjs updates, format v1 (the helpers of server/internal/crdt/crdt_test.go) ----
@@ -47,7 +49,7 @@ function mustApply(d: Doc, b: Uint8Array, want: Verdict): void {
 
 const code = (d: Doc, b: Uint8Array): string => validateBase(b, textRoots, d)?.code ?? "";
 
-describe("05 [STATE-74] with [STATE-76], Q7 (ruled, reading a): a GC may stand in place of an item whose origin is a GC", () => {
+describe("05 [STATE-74] with [STATE-76], Q7 (reading a, now the text): a GC may stand in place of an item whose origin is a GC", () => {
   it("the base that holds the GC, the base that holds the item, and a GC for live text", () => {
     const key = new Doc();
     mustApply(key, update([group(1, 0, gcOf(1))]), "APPLIED");
@@ -327,5 +329,183 @@ describe("02 [ARC-46] (V2 MUST-1, V6 MUST-A): the memory of a read and of a key 
     expect(performance.now() - start).toBeLessThan(5000);
     expect(cur.next(1)).toBe(2001);
     expect(cur.defs.get(1)).toHaveLength(2); // the text item and a run of 2,000 items that share a definition
+  });
+});
+
+// ---- 05 [STATE-76], Y9 and Z3 (Q33): the parent of an item is read from both its neighbours (the twin of server/internal/crdt/parents_test.go) ----
+
+const parentRoots: Roots = new Map([
+  ["t", "text"],
+  ["u", "text"],
+  ["a", "array"],
+]);
+/** A YText (type ref 2) under the root, and one that takes its parent from its origin. */
+const rootType = (root: string): number[] => cat([0x07, 1], lstr(root), uv(2));
+const typeAfter = (client: number, clock: number): number[] => cat([0x87], uv(client), uv(clock), uv(2));
+/** A ContentString item whose parent is the item at (client, clock). */
+const textIn = (client: number, clock: number, text: string): number[] => cat([0x04, 0], uv(client), uv(clock), lstr(text));
+/** A ContentString item with an origin and a right origin, and one with a right origin only. */
+const textBetween = (oc: number, ok: number, rc: number, rk: number, text: string): number[] =>
+  cat([0xc4], uv(oc), uv(ok), uv(rc), uv(rk), lstr(text));
+const textBefore = (client: number, clock: number, text: string): number[] => cat([0x44], uv(client), uv(clock), lstr(text));
+
+function applyIn(d: Doc, b: Uint8Array, want: Verdict, reason?: string): void {
+  const r = d.apply(b, parentRoots);
+  expect({ verdict: r.verdict, reason: r.reason }, `${r.error?.message ?? ""}`).toEqual({ verdict: want, reason });
+}
+const hiddenIn = (d: Doc, client: number, clock: number): boolean => new Analysis(d, null).hidden({ client, clock });
+const hasClient = (d: Doc, client: number): boolean => d.stateVector().some((e) => e.client === client);
+
+// The nested texts P1 = 1:0 (kept) and P2 = 1:1 (deleted), the items O = 2:0 in P1 and R = 2:1 in P2, X = 3:0 a surrogate pair with origin O
+// and right origin R, and an insert between the units of X's pair.
+const pair = "\u{1F600}";
+const parTypes = update([group(1, 0, rootType("a"), typeAfter(1, 0))]);
+const parInner = update([group(2, 0, textIn(1, 0, "p"), textIn(1, 1, "q"))]);
+const parDelP2 = update([], ds(1, 1, 1));
+const parX = update([group(3, 0, textBetween(2, 0, 2, 1, pair))]);
+const parSplit = update([group(4, 0, textAfter(3, 0, "z"))]);
+
+describe("05 [STATE-76] (Y9, Q33): neighbours with different parents are a no-op for good", () => {
+  it("X while P2 is live is a no-op, keeps nothing, and the later deletion of P2 does not integrate it", () => {
+    const d = new Doc();
+    applyIn(d, parTypes, "APPLIED");
+    applyIn(d, parInner, "APPLIED");
+    const before = d.canonical();
+    applyIn(d, parX, "NOOP_FOR_GOOD", "cross-parent");
+    expect(hasClient(d, 3)).toBe(false);
+    expect(d.canonical()).toEqual(before);
+    applyIn(d, parSplit, "NOOP_FOR_GOOD", "missing"); // nothing of it is kept: an insert that names it names an id that is not present
+    applyIn(d, parDelP2, "APPLIED");
+    expect(hasClient(d, 3)).toBe(false);
+    // sent again, it finds R an item whose parent is hidden: integrated, hidden
+    applyIn(d, parX, "APPLIED");
+    expect(hiddenIn(d, 3, 0)).toBe(true);
+  });
+
+  it("items under different roots are different parents, and the names are what is compared", () => {
+    const d = new Doc();
+    applyIn(d, update([group(1, 0, rootText("t", "p"))]), "APPLIED");
+    applyIn(d, update([group(2, 0, rootText("u", "q"))]), "APPLIED");
+    applyIn(d, update([group(3, 0, textBetween(1, 0, 2, 0, "x"))]), "NOOP_FOR_GOOD", "cross-parent");
+    expect(hasClient(d, 3)).toBe(false);
+    applyIn(d, update([group(4, 0, rootText("t", "r"))]), "APPLIED");
+    applyIn(d, update([group(5, 0, textBetween(1, 0, 4, 0, "x"))]), "APPLIED");
+    expect(hiddenIn(d, 5, 0)).toBe(false);
+    const c = d.clone();
+    applyIn(c, update([group(6, 0, textBetween(2, 0, 4, 0, "x"))]), "NOOP_FOR_GOOD", "cross-parent");
+    applyIn(c, update([group(6, 0, textBetween(4, 0, 1, 0, "x"))]), "APPLIED");
+  });
+});
+
+describe("05 [STATE-76] (Z3): a neighbour that is a GC, an item whose parent is hidden or an item that takes its parent from a GC hides the item", () => {
+  for (const [name, x] of [
+    ["right origin", parX],
+    ["origin", update([group(3, 0, textBetween(2, 1, 2, 0, pair))])],
+  ] as const) {
+    it(`an item whose ${name} is an item whose parent is hidden is integrated hidden (crdt-int-par-004, -005)`, () => {
+      const d = new Doc();
+      for (const b of [parTypes, parInner, parDelP2]) applyIn(d, b, "APPLIED");
+      applyIn(d, x, "APPLIED");
+      expect(hiddenIn(d, 3, 0) && hiddenIn(d, 3, 1)).toBe(true);
+      const def = d.defAt({ client: 3, clock: 0 });
+      expect(def).toMatchObject({ gcParent: true, hasParent: false, root: null });
+      applyIn(d, parSplit, "APPLIED"); // the pair is hidden, so an insert inside it integrates
+    });
+  }
+
+  it("a GC as the right origin of an item with a live origin, and as the only neighbour (crdt-int-par-009, -007)", () => {
+    const d = new Doc();
+    applyIn(d, update([group(1, 0, rootText("t", "p"))]), "APPLIED");
+    applyIn(d, update([group(2, 0, gcOf(1))]), "APPLIED");
+    applyIn(d, update([group(3, 0, textBetween(1, 0, 2, 0, pair))]), "APPLIED");
+    expect(hiddenIn(d, 3, 0)).toBe(true);
+    applyIn(d, parSplit, "APPLIED");
+    const e = new Doc();
+    applyIn(e, update([group(2, 0, gcOf(1))]), "APPLIED");
+    applyIn(e, update([group(3, 0, textBefore(2, 0, pair))]), "APPLIED");
+    expect(hiddenIn(e, 3, 0)).toBe(true);
+  });
+
+  it("an item whose origin or right origin takes its parent from a GC is hidden, not a no-op, though its other neighbour is visible (crdt-int-par-011)", () => {
+    const d = new Doc();
+    applyIn(d, update([group(1, 0, gcOf(1))]), "APPLIED");
+    applyIn(d, update([group(2, 0, textAfter(1, 0, "v"))]), "APPLIED");
+    applyIn(d, update([group(3, 0, rootText("t", "w"))]), "APPLIED");
+    applyIn(d, update([group(4, 0, textBetween(2, 0, 3, 0, "y"))]), "APPLIED");
+    applyIn(d, update([group(5, 0, textBetween(3, 0, 2, 0, pair))]), "APPLIED");
+    for (const [c, k] of [[2, 0], [4, 0], [5, 0], [5, 1]] as const) expect(hiddenIn(d, c, k), `${c}:${k}`).toBe(true);
+    applyIn(d, update([group(6, 0, textAfter(5, 0, "q"))]), "APPLIED");
+    expect(hiddenIn(d, 3, 0)).toBe(false);
+  });
+});
+
+describe("05 [STATE-74] (Z3, Q33, Q53): the base rules that follow", () => {
+  const baseCode = (key: Doc, b: Uint8Array): string => validateBase(b, parentRoots, key)?.code ?? "";
+  const folded = (...updates: Uint8Array[]): Doc => {
+    const d = new Doc();
+    for (const b of updates) applyIn(d, b, "APPLIED");
+    return d;
+  };
+
+  it("R as a GC and X as first defined is a valid base (crdt-base-021); R kept as an item of the deleted P2 is pending when read alone", () => {
+    const key = folded(parTypes, parInner, parDelP2, parX);
+    const hand = update(
+      [
+        group(3, 0, textBetween(2, 0, 2, 1, pair)),
+        group(2, 0, textIn(1, 0, "p"), gcOf(1)),
+        group(1, 0, rootType("a"), cat([0x81], uv(1), uv(0), uv(1))),
+      ],
+      ds(1, 1, 1),
+    );
+    expect(baseCode(key, hand)).toBe("");
+    const kept = update(
+      [group(3, 0, textBetween(2, 0, 2, 1, pair)), group(2, 0, textIn(1, 0, "p"), textIn(1, 1, "q")), group(1, 0, rootType("a"), typeAfter(1, 0))],
+      ds(1, 1, 1),
+    );
+    expect(baseCode(key, kept)).toBe("pending:cross-parent");
+  });
+
+  it("a GC in place of an item whose origin is a GC, or that takes its parent from one, is valid (crdt-base-022)", () => {
+    const key = folded(
+      update([group(1, 0, gcOf(1))]),
+      update([group(2, 0, textAfter(1, 0, "v"))]),
+      update([group(3, 0, textAfter(2, 0, "w"))]),
+    );
+    expect(baseCode(key, update([group(3, 0, gcOf(1)), group(2, 0, gcOf(1)), group(1, 0, gcOf(1))]))).toBe("");
+  });
+
+  it("a ContentDeleted over an id that a GC first defines is refused, whatever its parent (Q53)", () => {
+    const key = folded(update([group(1, 0, gcOf(2))], ds(1, 0, 2)));
+    expect(baseCode(key, update([group(1, 0, gcOf(2))], ds(1, 0, 2)))).toBe("");
+    // 1:1 a ContentDeleted whose origin is the GC 1:0: it takes its parent from a GC, a hidden one
+    expect(baseCode(key, update([group(1, 0, gcOf(1), cat([0x81], uv(1), uv(0), uv(1)))], ds(1, 0, 2)))).toBe("content");
+    // 1:0 a ContentDeleted under the root t: a visible parent
+    expect(baseCode(key, update([group(1, 0, cat([0x01, 1], lstr("t"), uv(1)), gcOf(1))], ds(1, 0, 2)))).toBe("content");
+  });
+
+  it("an item under another root than its first definition's is another content", () => {
+    const key = folded(update([group(1, 0, rootText("t", "p"))]));
+    expect(baseCode(key, update([group(1, 0, rootText("t", "p"))]))).toBe("");
+    expect(baseCode(key, update([group(1, 0, rootText("u", "p"))]))).toBe("content");
+  });
+});
+
+describe("02 [ARC-46]: the walk that reads the parent of an item through its neighbours", () => {
+  it("a chain of neighbours across 20,000 client groups costs the update's time and no stack", () => {
+    const n = 20_000;
+    const chain = (first: number[]): Uint8Array => {
+      const groups: number[][] = [];
+      for (let c = n; c >= 1; c--) groups.push(group(c, 0, c === 1 ? first : textAfter(c - 1, 0, "a")));
+      return update(groups);
+    };
+    const start = performance.now();
+    const d = new Doc();
+    applyIn(d, chain(rootText("t", "a")), "APPLIED");
+    expect(performance.now() - start).toBeLessThan(3000);
+    expect(d.defAt({ client: n, clock: 0 })).toMatchObject({ gcParent: false, hasParent: false, root: "t" });
+    const e = new Doc();
+    applyIn(e, chain(gcOf(1)), "APPLIED");
+    expect(e.defAt({ client: n, clock: 0 })?.gcParent).toBe(true);
+    expect(hiddenIn(e, n, 0)).toBe(true);
   });
 });
