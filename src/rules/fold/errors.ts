@@ -38,10 +38,12 @@ const STOPS: ReadonlySet<FoldCode> = new Set<FoldCode>([
  * The refusal of a record, a typed refusal (02 [ARC-46]). The state is unchanged: a record is applied whole or not at all
  * (02 [ARC-28]).
  *
- * `stop` says whether the refusal is one of the cases that 15 [COMPAT-35] lists. A client that gets such an error stops applying
- * records for the keyspace at the previous seq and holds it as 14 [CLI-4], [CLI-5] and 16 [SEC-3] say (the hold is
- * UPGRADE_REQUIRED). Any other FoldError is a record that no server writes and that the fold cannot apply: 15 [COMPAT-35] does
- * not stop the keyspace for it, and 02 [ARC-46] has the reader count and report it, which the caller does.
+ * `stop` says whether the refusal is one of the cases that 15 [COMPAT-35] lists: a record that needs a later revision. A client that gets
+ * such an error stops applying records for the keyspace at the previous seq and holds it as 14 [CLI-4] and 15 [COMPAT-36] say (the hold is
+ * UPGRADE_REQUIRED). Any other FoldError is a structurally invalid record, one that no server writes and that the fold cannot apply: 15
+ * [COMPAT-35] does not list it, so it is no case for UPGRADE_REQUIRED (16 [SEC-3]: 15 [COMPAT-36] and §15.5 are cited only for a record that
+ * needs a later revision). It stops the engine for that keyspace and is reported, as 16 [SEC-3] and 02 [ARC-46] say, which the caller does:
+ * the `protocol-error` event and the hold PROTOCOL_ERROR (14 [CLI-50], Table 14.1).
  */
 export class FoldError extends Error {
   readonly code: FoldCode;

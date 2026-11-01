@@ -45,6 +45,7 @@ describe("14 [CLI-50] transport errors", () => {
     expect(w.engine.deadLetterEntries()[0]?.reject.errorClass).toBe(3);
   });
 
+  // 02 [ARC-63]: this is also the refusal of a `Mutation` over 2,000 changes, which a server may refuse while it decodes: the whole request, InvalidArgument with `Reject{INVALID_ENVELOPE}`
   it("InvalidArgument for a whole MutateRequest, which recorded none of its mutations: each is sent alone once, and one that still gets InvalidArgument is dead-lettered with that status as its reason", async () => {
     const r = await rig();
     await goOffline(r);

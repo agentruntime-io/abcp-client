@@ -12,7 +12,7 @@
 // Revocation (`ACCESS_REVOKED`, `SUBJECT_REVOKED`, `GRANT_CHANGED`, `DELETED`): the session reads the frame and calls what 14 §14.9 and
 // §14.10 define, which `revocation.ts` implements ([CLI-66], [CLI-67], [CLI-77], [CLI-79]).
 
-import { create } from "@bufbuild/protobuf";
+import { create, toBinary } from "@bufbuild/protobuf";
 import {
   GetMutationResultsRequestSchema,
   LoadStateRequestSchema,
@@ -64,8 +64,19 @@ interface EarlierEpochItem {
 }
 
 const SESSION_LIVE_RESET_MS = 60_000;
+/** 02 [ARC-59]: no message, a request included, exceeds 16 MiB in the codec of its call; the engine calls in the binary codec. */
+export const MAX_SUBSCRIBE_BYTES = 16 * 1024 * 1024;
+
+/** The octets that a varint of `n` takes. */
+function varintLength(n: number): number {
+  let len = 1;
+  for (let v = n; v >= 128; v = Math.floor(v / 128)) len++;
+  return len;
+}
 
 export abstract class SessionLayer extends SenderLayer {
+  /** The most octets of a `SubscribeRequest` that this engine builds (02 [ARC-59], 09 [READ-57]); a test lowers it. */
+  protected maxSubscribeBytes = MAX_SUBSCRIBE_BYTES;
   private running = false;
   /** `start()` was called: a flusher runs its session; a follower that is promoted does too. */
   protected startRequested = false;
@@ -260,8 +271,7 @@ export abstract class SessionLayer extends SenderLayer {
     // 14 [CLI-72]: a widening of the interest that waited for a session: its load, before the keyspace is followed with the new interest
     for (const f of this.followList()) if (this.needsWidening(f)) await this.widenKeyspace(f);
     if (!this.running) return { kind: "clean" };
-    const follows = this.followList().filter((f) => this.subscribable(f));
-    const cursors: KeyspaceCursor[] = follows.map((f) => this.cursorOf(f));
+    const { follows, cursors } = this.fitSubscribe(this.followList().filter((f) => this.subscribable(f)));
     const ac = new AbortController();
     const s = this.sess;
     s.abort = ac;
@@ -333,6 +343,27 @@ export abstract class SessionLayer extends SenderLayer {
       }
       ac.abort();
     }
+  }
+
+  /**
+   * The cursors that the `Subscribe` names (09 [READ-57]): as many of the followed keyspaces, in order, as keep the request within `maxSubscribeBytes` in
+   * the binary encoding (02 [ARC-59]; the engine calls in no other codec). The rest are named in `UpdateSubscription` adds on the new session, which
+   * `Subscribed` starts for each followed keyspace that is not on it yet, each request within that size (one cursor of at most 1,000 prefixes is far
+   * under it). The `Subscribe` names one keyspace at least, whatever its size.
+   */
+  private fitSubscribe(all: Follow[]): { follows: Follow[]; cursors: KeyspaceCursor[] } {
+    let size = toBinary(SubscribeRequestSchema, create(SubscribeRequestSchema, { supportedFeatures: [...this.features], clientId: this.clientId })).byteLength;
+    const follows: Follow[] = [];
+    const cursors: KeyspaceCursor[] = [];
+    for (const f of all) {
+      const c = this.cursorOf(f);
+      const n = toBinary(KeyspaceCursorSchema, c).byteLength;
+      size += 1 + varintLength(n) + n; // the tag of `keyspaces` (field 1), the length and the cursor
+      if (follows.length > 0 && size > this.maxSubscribeBytes) break;
+      follows.push(f);
+      cursors.push(c);
+    }
+    return { follows, cursors };
   }
 
   /** The client deadline of 09 [READ-56]: 60 s without a frame, or three heartbeat intervals when that is shorter, ends the session. */

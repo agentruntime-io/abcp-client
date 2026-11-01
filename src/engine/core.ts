@@ -13,6 +13,7 @@ import type { Mutation } from "../gen/abpc/v2/sync_pb.js";
 import { VersionTopology, DEFAULT_FEATURES } from "../rules/fold/index.js";
 import { BoundedSet, pushBounded } from "./bounded.js";
 import { systemClock, systemRandom, type Clock, type Random } from "./clock.js";
+import { MAX_CHANGES_PER_ACTION, MAX_INTEREST_PREFIXES } from "./counts.js";
 import { CanonError, decodeContent } from "./entry.js";
 import { StorageError } from "./errors.js";
 import { EventBus } from "./events.js";
@@ -96,6 +97,11 @@ export interface EngineConfig {
   persistReplica?: boolean;
   /** The longest tail of records that a persisted replica may hold at a restart; a longer one is dropped and the keyspace is loaded again. */
   replicaTailLimit?: number;
+  /**
+   * The most octets of a `SubscribeRequest` that the engine builds, in the binary encoding that it calls with; default 16 MiB, the bound of 02 [ARC-59].
+   * The cursors that do not fit are named in `UpdateSubscription` adds on the new session (09 [READ-57]). A test lowers it.
+   */
+  maxSubscribeBytes?: number;
 }
 
 /** The limits in force, as the engine uses them (04 Table 4.10a). */
@@ -445,8 +451,19 @@ export abstract class EngineCore {
   protected applyLimits(l: AppLimits | undefined): void {
     if (l === undefined) return;
     const next: Limits = { ...this.limits };
-    const take = (field: string, v: number | bigint, floor: number, set: (n: number) => void): void => {
+    // `max`: the field's protocol maximum where 04 Table 4.10a gives one that 02 [ARC-63] lets a server refuse a message for. 07 [MUT-75] has a server
+    // advertise at most the maximum; a value above it is a server that breaks that rule, which the client reports as it reports a 0, and then holds itself to
+    // the maximum, so that it never builds a `Mutation` of more than 2,000 changes or an interest of more than 1,000 prefixes, which a server refuses whole.
+    const take = (field: string, v: number | bigint, floor: number, set: (n: number) => void, max?: number): void => {
       const n = Number(v);
+      if (max !== undefined && n > max) {
+        if (!this.limitsReported.has(field)) {
+          this.limitsReported.add(field);
+          this.emit({ type: "protocol-error", what: `AppLimits.${field}`, detail: `${n}, over its protocol maximum of ${max} (04 Table 4.10a, 07 [MUT-75]); the engine uses ${max} (02 [ARC-63])`, keyspaces: [] });
+        }
+        set(max);
+        return;
+      }
       if (n === 0) {
         if (!this.limitsReported.has(field)) {
           this.limitsReported.add(field);
@@ -459,14 +476,14 @@ export abstract class EngineCore {
       }
     };
     take("max_offline_seconds", l.maxOfflineSeconds, FLOOR_LIMITS.maxOfflineMs / 1000, (n) => (next.maxOfflineMs = n * 1000));
-    take("max_changes_per_action", l.maxChangesPerAction, FLOOR_LIMITS.maxChangesPerAction, (n) => (next.maxChangesPerAction = n));
+    take("max_changes_per_action", l.maxChangesPerAction, FLOOR_LIMITS.maxChangesPerAction, (n) => (next.maxChangesPerAction = n), MAX_CHANGES_PER_ACTION);
     take("max_action_bytes", l.maxActionBytes, FLOOR_LIMITS.maxActionBytes, (n) => (next.maxActionBytes = n));
     take("max_value_bytes", l.maxValueBytes, FLOOR_LIMITS.maxValueBytes, (n) => (next.maxValueBytes = n));
     take("max_mutations_per_request", l.maxMutationsPerRequest, FLOOR_LIMITS.maxMutationsPerRequest, (n) => (next.maxMutationsPerRequest = n));
     take("max_request_bytes", l.maxRequestBytes, FLOOR_LIMITS.maxRequestBytes, (n) => (next.maxRequestBytes = n));
     take("max_inflight_gated_per_client", l.maxInflightGatedPerClient, FLOOR_LIMITS.maxInflightGated, (n) => (next.maxInflightGated = n));
     take("keyspace_not_found_wait_seconds", l.keyspaceNotFoundWaitSeconds, FLOOR_LIMITS.keyspaceNotFoundWaitMs / 1000, (n) => (next.keyspaceNotFoundWaitMs = n * 1000));
-    take("max_interest_prefixes", l.maxInterestPrefixes, FLOOR_LIMITS.maxInterestPrefixes, (n) => (next.maxInterestPrefixes = n));
+    take("max_interest_prefixes", l.maxInterestPrefixes, FLOOR_LIMITS.maxInterestPrefixes, (n) => (next.maxInterestPrefixes = n), MAX_INTEREST_PREFIXES);
     const changed = next.maxOfflineMs !== this.limits.maxOfflineMs;
     this.limits = next;
     if (changed) {

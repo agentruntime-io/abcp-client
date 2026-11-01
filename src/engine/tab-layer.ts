@@ -141,6 +141,7 @@ export abstract class TabLayer extends RevocationLayer {
     this.copyPolicy = cfg.copyPolicy ?? "keep";
     this.persistReplica = cfg.persistReplica !== false;
     if (cfg.replicaTailLimit !== undefined) this.replicaTailLimit = cfg.replicaTailLimit;
+    if (cfg.maxSubscribeBytes !== undefined) this.maxSubscribeBytes = cfg.maxSubscribeBytes;
   }
 
   get tabId(): string {
