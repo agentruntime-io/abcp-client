@@ -308,7 +308,6 @@ export async function startServer(o: ServerOptions): Promise<ServerProcess> {
       fetch_timeout_seconds: 5,
       heartbeat_seconds: 5,
       gate_tick_ms: 100,
-      features: [],
       apps: [
         {
           id: APP,
