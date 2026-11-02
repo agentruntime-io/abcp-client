@@ -5,10 +5,12 @@
 // build for an "upgraded server") hashes the same way.
 
 import type { DescField, DescMessage, Message } from "@bufbuild/protobuf";
+import type { ReflectMessage } from "@bufbuild/protobuf/reflect";
 import { ByteWriter, concat } from "../bytes.js";
 import { hmacSha256, sha256 } from "../crypto.js";
 import { MutationSchema } from "../../gen/abpc/v2/sync_pb.js";
 import {
+  ChangeKind,
   KeyChangeSchema,
   KeyEntrySchema,
   RecordSchema,
@@ -22,6 +24,9 @@ const MUTATION = "abpc.v2.Mutation";
 const KEY_CHANGE = "abpc.v2.KeyChange";
 const RECORD = "abpc.v2.Record";
 const OWNER_CONTACT = "abpc.v2.OwnerContact";
+const REDACT_REQUEST = "abpc.v2.RedactRequest";
+/** ChangeKind `OVERRIDE` (types.proto), compared by number so that a dynamic type works too. */
+const OVERRIDE_KIND = ChangeKind.OVERRIDE;
 
 /** The size of the salt of a value digest, in octets (06 [LOG-71]). */
 export const SALT_SIZE = 16;
@@ -202,31 +207,59 @@ export function hashRecordFromDigests(r: RecordMessage, digests: readonly Uint8A
 
 /**
  * The view of the request digest (12 [ADM-94]): every value field cleared first, which is the value fields of every
- * KeyChange (06 [LOG-71]), unknown fields included, and the `address` of every owner contact. Unknown fields of every other
- * message stay as received.
+ * KeyChange (06 [LOG-71]), unknown fields included, the `address` of every owner contact and, since round 18,
+ * `RedactRequest.keys`, so that the digest of a `Redact` is a function of the keyspace, the reason and `shared_blobs` and
+ * holds no key path of a `personal` template. Unknown fields of every other message stay as received. With `personal`, the
+ * `key` of every `OVERRIDE` change for which it holds is cleared too.
  */
-const requestView: EncodeView = {
-  skipField: (md: DescMessage, fd: DescField) => {
-    switch (md.typeName) {
-      case KEY_CHANGE:
-        return !nonValue(fd.name);
-      case OWNER_CONTACT:
-        return fd.name === "address";
-      default:
-        return false;
-    }
-  },
-  skipUnknown: (md) => md.typeName === KEY_CHANGE,
-};
+function requestViewFor(personal?: (key: string) => boolean): EncodeView {
+  const view: EncodeView = {
+    skipField: (md: DescMessage, fd: DescField) => {
+      switch (md.typeName) {
+        case KEY_CHANGE:
+          return !nonValue(fd.name);
+        case OWNER_CONTACT:
+          return fd.name === "address";
+        case REDACT_REQUEST:
+          return fd.name === "keys"; // no key path of a personal template, so no key path of a Redact
+        default:
+          return false;
+      }
+    },
+    skipUnknown: (md) => md.typeName === KEY_CHANGE,
+  };
+  if (personal === undefined) return view;
+  return {
+    ...view,
+    skipFieldIn: (m: ReflectMessage, fd: DescField) => {
+      if (m.desc.typeName !== KEY_CHANGE || fd.name !== "key") return false;
+      const kind = m.desc.fields.find((f) => f.name === "kind");
+      return kind !== undefined && m.get(kind) === OVERRIDE_KIND && personal(m.get(fd) as string);
+    },
+  };
+}
+
+const requestView = requestViewFor();
 
 /**
  * Returns the canonical encoding that 12 [ADM-94] digests, and the digest: SHA-256 over the canonical encoding of the
- * request with every value field cleared, so that no digest of a value remains after a `Redact`, and none of a contact ever.
- * The request keeps its unknown fields as received (07 [MUT-45]). For the audit entry of a `Mutate/abpc.Override`, m is the
- * override's Mutation. An entry that has no request, and one of a request that was refused before it could be decoded
- * (02 [ARC-61]), carries an empty digest, which this function is not for.
+ * request with every value field cleared (and `RedactRequest.keys`), so that no digest of a value remains after a `Redact`,
+ * none of a contact ever, and none of a key path of a `personal` template. The request keeps its unknown fields as received
+ * (07 [MUT-45]). An entry that has no request, and one of a request that was refused before it could be decoded (02
+ * [ARC-61]), carries an empty digest, which this function is not for.
+ *
+ * For the audit entry of a `Mutate/abpc.Override`, m is the override's Mutation and `personal` says whether a key matches a
+ * template that is `personal` in the manifest version in force for the keyspace at the commit, the version under which 07
+ * Table 7-2 item 3 judges the override and that the override's record carries as `manifest_version` (06 [LOG-8]); the key of
+ * every `OVERRIDE` change for which it holds is cleared with the value fields, so that such a change keeps its kind and
+ * `seen_version`. A later change of `personal` in a newer version does not change the digest (A.7: a client that recomputes it
+ * clears the same fields under the same version). Without `personal` every key stays.
  */
-export function requestDigest(schema: DescMessage, m: Message): { digest: Uint8Array; canonical: Uint8Array } {
-  const canonical = encode(schema, m, requestView);
+export function requestDigest(
+  schema: DescMessage,
+  m: Message,
+  personal?: (key: string) => boolean,
+): { digest: Uint8Array; canonical: Uint8Array } {
+  const canonical = encode(schema, m, personal === undefined ? requestView : requestViewFor(personal));
   return { digest: sha256(canonical), canonical };
 }

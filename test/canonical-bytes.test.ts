@@ -112,13 +112,13 @@ describe("06 [LOG-71] value digests, E, C, W and record_hash (record-hash vector
 
 // Round 18 (spec draft 16, omniview 6e5fe6f): the vectors the code does not pass yet, with the batch that will (the server's list is
 // server/internal/vectors/pending.go). Remove an entry when its work lands.
-const PENDING = new Map<string, string>([
-  ["request-digest-006", "round 18 R18-B3 (12 [ADM-94]: the audit digest clears personal keys)"],
-  ["request-digest-007", "round 18 R18-B3 (12 [ADM-94]: the audit digest clears personal keys)"],
-  ["request-digest-008", "round 18 R18-B3 (12 [ADM-94]: the audit digest clears personal keys)"],
-]);
+const PENDING = new Map<string, string>([]);
 
+// Since round 18 (12 [ADM-94], m9) the digest also clears `RedactRequest.keys` and the `key` of every OVERRIDE change whose key
+// matches a template that is `personal` in the manifest version in force; a vector lists those keys in `personal_keys` (the
+// manifest is not carried), and `same_digest_as` names the vector whose digest it must equal.
 describe("12 [ADM-94] request digest (request-digest vectors)", () => {
+  const digests = new Map<string, string>();
   for (const v of ofKind("request-digest")) {
     (PENDING.has(v.id) ? it.skip : it)(`${v.id}: ${v.title.slice(0, 100)}`, () => {
       let canonical: Uint8Array = new Uint8Array(0);
@@ -136,12 +136,48 @@ describe("12 [ADM-94] request digest (request-digest vectors)", () => {
           refused = "InvalidArgument"; // a request that breaks 02 [ARC-61] fails as a whole, whatever the refusal
         }
         expect(refused).toBe(v.expect.refused ?? "");
-        if (m !== undefined) ({ canonical, digest } = requestDigest(desc, m));
+        if (m !== undefined) {
+          const personalKeys = (v.personal_keys ?? []) as string[];
+          ({ canonical, digest } = requestDigest(desc, m, (key) => personalKeys.includes(key)));
+        }
       }
       expect(toHex(canonical)).toBe(v.expect.canonical);
       expect(toHex(digest)).toBe(v.expect.request_digest);
+      digests.set(v.id, toHex(digest));
+      const other = v.expect.same_digest_as as string | undefined;
+      if (other !== undefined && digests.has(other)) expect(toHex(digest), `the digest of ${other}`).toBe(digests.get(other));
     });
   }
+});
+
+describe("12 [ADM-94] the personal keys of a request digest, beyond the vectors", () => {
+  const override = (kind: number, ...keys: string[]) =>
+    fromVectorJson(MutationSchema, {
+      mutation_id: "0579af62-c045-42bc-a979-5a9ce8f2e400",
+      keyspace_id: "acme/clinic",
+      op_type: "abpc.Override",
+      lane: 1,
+      reason: "fix",
+      changes: keys.map((key) => ({ key, kind, value: { hex: "31" }, encoding: "json/v1", seen_version: "3" })),
+    });
+  const personal = (key: string): boolean => key.startsWith("patient/");
+
+  it("the key of a personal OVERRIDE change is cleared, the key of another change stays, and no predicate clears none", () => {
+    const withBoth = requestDigest(MutationSchema, override(6, "patient/p7/email", "stock/s1/qty"), personal);
+    const other = requestDigest(MutationSchema, override(6, "patient/p9/phone", "stock/s1/qty"), personal);
+    expect(toHex(withBoth.digest)).toBe(toHex(other.digest));
+    expect(toHex(withBoth.canonical)).not.toContain(toHex(utf8("patient")));
+    expect(toHex(withBoth.canonical)).toContain(toHex(utf8("stock/s1/qty")));
+    const another = requestDigest(MutationSchema, override(6, "patient/p7/email", "stock/s2/qty"), personal);
+    expect(toHex(another.digest)).not.toBe(toHex(withBoth.digest));
+    const none = requestDigest(MutationSchema, override(6, "patient/p7/email", "stock/s1/qty"));
+    expect(toHex(none.canonical)).toContain(toHex(utf8("patient/p7/email")));
+  });
+
+  it("only an OVERRIDE change is judged: the key of a change of another kind stays", () => {
+    const set = requestDigest(MutationSchema, override(1, "patient/p7/email"), personal);
+    expect(toHex(set.canonical)).toContain(toHex(utf8("patient/p7/email")));
+  });
 });
 
 describe("07 [MUT-45] and 02 [ARC-61] beyond the vectors", () => {

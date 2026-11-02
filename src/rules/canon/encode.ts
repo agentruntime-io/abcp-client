@@ -20,6 +20,11 @@ export interface EncodeView {
   skipField?(md: DescMessage, fd: DescField): boolean;
   /** Whether the unknown fields of a message of type md are left out. */
   skipUnknown?(md: DescMessage): boolean;
+  /**
+   * skipField for a decision that reads the message itself and not only its type: the `key` of a change whose kind and key the
+   * request digest judges (12 [ADM-94]).
+   */
+  skipFieldIn?(m: ReflectMessage, fd: DescField): boolean;
 }
 
 /**
@@ -90,7 +95,7 @@ function encodeMessage(w: ByteWriter, m: ReflectMessage, view: EncodeView | unde
   };
   for (const fd of m.sortedFields) {
     if (!m.isSet(fd)) continue;
-    if (view?.skipField?.(md, fd) === true) continue;
+    if (view?.skipField?.(md, fd) === true || view?.skipFieldIn?.(m, fd) === true) continue;
     writeUnknownBelow(fd.number);
     try {
       encodeField(w, fd, m, view, depth);
