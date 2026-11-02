@@ -30,13 +30,24 @@ export interface StagedBlob {
   stagedAtMs: number;
 }
 
-/** Where the engine keeps the bytes of the blobs that actions name until the actions are confirmed (09 [READ-94]). A durable one survives a restart; the default is in memory. */
+/**
+ * Where the engine keeps the bytes of the blobs that actions name until the actions are confirmed (09 [READ-94]). A durable one survives a restart: an action that names a staged blob
+ * finds its bytes after a reload, and the engine uploads them again on `BLOB_MISSING` (14 [CLI-44]). The default is in memory; the browser host's is `IndexedDbBlobStash`, and a Node
+ * process's is `FileBlobStash`, which the app gives the engine.
+ */
 export interface BlobStash {
   put(blob: StagedBlob): Promise<void>;
   get(keyspaceId: string, blobId: string): Promise<StagedBlob | undefined>;
+  /** Whether the blob is staged: what a stash that keeps its bytes in a database or on a disk answers without reading them. */
+  has(keyspaceId: string, blobId: string): Promise<boolean>;
   delete(keyspaceId: string, blobId: string): Promise<void>;
   /** What is staged, without the bytes. */
   list(): Promise<{ keyspaceId: string; blobId: string; size: number }[]>;
+  /**
+   * Erases every staged blob: a sign-out purges what the principal's partition holds (14 [CLI-65]), and the bytes that an action carries are the principal's data too. Resolves when
+   * nothing is left, and fails when something could not be erased.
+   */
+  clear(): Promise<void>;
 }
 
 /** A `BlobStash` in memory. */
@@ -50,12 +61,19 @@ export class MemoryBlobStash implements BlobStash {
   get(keyspaceId: string, blobId: string): Promise<StagedBlob | undefined> {
     return Promise.resolve(this.rows.get(`${keyspaceId}\u0000${blobId}`));
   }
+  has(keyspaceId: string, blobId: string): Promise<boolean> {
+    return Promise.resolve(this.rows.has(`${keyspaceId}\u0000${blobId}`));
+  }
   delete(keyspaceId: string, blobId: string): Promise<void> {
     this.rows.delete(`${keyspaceId}\u0000${blobId}`);
     return Promise.resolve();
   }
   list(): Promise<{ keyspaceId: string; blobId: string; size: number }[]> {
     return Promise.resolve([...this.rows.values()].map((b) => ({ keyspaceId: b.keyspaceId, blobId: b.blobId, size: b.size })));
+  }
+  clear(): Promise<void> {
+    this.rows.clear();
+    return Promise.resolve();
   }
 }
 
@@ -107,6 +125,8 @@ export interface BlobRef {
 export type BlobErrorCode =
   | "BLOB_MISSING"
   | "BLOB_DELETED"
+  /** The blob is withheld (12 [ADM-103]) and the call does not wait for it: an upload that an engine makes for an action it sends (14 [CLI-44]). */
+  | "BLOB_WITHHELD"
   | "PAYLOAD_TOO_LARGE"
   | "QUOTA_EXCEEDED"
   | "IDEMPOTENCY_KEY_REUSED"
@@ -273,6 +293,12 @@ export class BlobCache {
     this.rows.delete(k);
     this.octets -= b.size;
     return true;
+  }
+
+  /** Drops every blob. */
+  clear(): void {
+    this.rows.clear();
+    this.octets = 0;
   }
 
   /** Drops every blob of the keyspace; returns how many. */

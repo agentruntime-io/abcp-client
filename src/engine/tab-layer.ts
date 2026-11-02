@@ -173,6 +173,8 @@ export abstract class TabLayer extends RevocationLayer {
       ...(this.tabHost !== undefined && !reliable ? { tab: this.tabHost.tabId } : {}),
     };
     if (cfg.storage === undefined && this.provider !== undefined) this.storage = await this.provider.open(this.partition);
+    // 09 [READ-94]: the bytes that the partition's actions name outlive a restart as its outbox does, where the platform has a durable stash (a browser's IndexedDB); the app's own goes first
+    if (cfg.blobs?.stash === undefined && this.provider?.blobStash !== undefined) this.useBlobStash(this.provider.blobStash(this.partition));
     if (this.storage.requestPersistence !== undefined) {
       try {
         await this.storage.requestPersistence(); // 14 [CLI-75]: the mode of the sync status says what the platform promised

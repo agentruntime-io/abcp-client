@@ -4,7 +4,7 @@
 
 import { create } from "@bufbuild/protobuf";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { BlobError, LocalRefusal, set, type PresenceEvent } from "../../src/engine/index.js";
+import { BlobError, fetchBlobHttp, LocalRefusal, set, type BlobHttp, type PresenceEvent } from "../../src/engine/index.js";
 import { CreateUploadRequestSchema } from "../../src/gen/abpc/v2/sync_pb.js";
 import { createQueries } from "../../src/query/index.js";
 import { digestSha256 } from "../../src/engine/index.js";
@@ -200,7 +200,7 @@ describe.skipIf(!goAvailable)("presence and blobs against the Go server", () => 
       expect(b.ofType("protocol-error")).toEqual([]);
     });
 
-    it("an action authored offline that names a staged blob: the server answers BLOB_MISSING, the engine uploads the same bytes and resends the identical action", async () => {
+    it("an action authored offline that names a staged blob: the engine uploads the bytes before it sends the action (14 [CLI-44]), so the server answers neither BLOB_MISSING nor BLOB_PENDING", async () => {
       const KS = "acme/blob2";
       const net = await env.network();
       const a = await env.client({ sub: "ana", grants: GRANTS, network: net });
@@ -215,14 +215,17 @@ describe.skipIf(!goAvailable)("presence and blobs against the Go server", () => 
       expect(await a.engine.stagedBlobs()).toHaveLength(1);
       net.up();
       await until(a, () => committed(a, w.mutationId), "the action committed after the upload", 40_000);
-      expect(a.calls["createUpload"]).toBeGreaterThanOrEqual(1);
+      // the upload first (CreateUpload, the PUT, CommitBlob), then the one Mutate: no answer of BLOB_MISSING, no resend
+      expect(a.calls["createUpload"]).toBe(1);
+      expect(a.calls["commitBlob"]).toBe(1);
+      expect(a.calls["mutate"]).toBe(1);
       expect(await a.engine.stagedBlobs()).toEqual([]);
       const got = await a.engine.getBlob(KS, ref.blobId);
       expect(Buffer.from(got.bytes).equals(Buffer.from(bytes))).toBe(true);
       expect(a.ofType("held")).toEqual([]);
     });
 
-    it("an action that names a blob that is uploaded and not committed: Retry{BLOB_PENDING}; the engine completes the upload and resends", async () => {
+    it("an action that names a blob that an earlier run left uploaded and not committed: the engine completes the upload before it sends the action, and the server never answers Retry{BLOB_PENDING}", async () => {
       const KS = "acme/blob3";
       const net = await env.network();
       const a = await env.client({ sub: "ana", grants: GRANTS, network: net });
@@ -238,9 +241,40 @@ describe.skipIf(!goAvailable)("presence and blobs against the Go server", () => 
       await other.engine.transport.createUpload(create(CreateUploadRequestSchema, { keyspaceId: KS, blobId: ref.blobId, sha256: ref.sha256, size: BigInt(ref.size) }));
       const w = await a.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("note/pending-blob", "x")], blobRefs: [ref.blobId] });
       net.up();
-      await until(a, () => committed(a, w.mutationId), "the action committed after BLOB_PENDING", 40_000);
+      await until(a, () => committed(a, w.mutationId), "the action committed after the upload was completed", 40_000);
+      expect(a.calls["mutate"]).toBe(1);
+      expect(a.calls["commitBlob"]).toBe(1);
       expect(a.ofType("held")).toEqual([]);
       expect(a.engine.deadLetterEntries()).toEqual([]);
+    });
+
+    it("an upload that fails before the first send does not stop the action: the server answers Retry{BLOB_PENDING} to it, and the repair of 14 [CLI-44] completes the upload and resends", async () => {
+      const KS = "acme/blob5";
+      // the blob store is down for the first round of the upload (the engine sends a PUT four times), and up again after it
+      const real = fetchBlobHttp();
+      let down = 4;
+      const flaky: BlobHttp = { put: (url, headers, body, o) => (down-- > 0 ? Promise.resolve({ status: 503 }) : real.put(url, headers, body, o)), get: (url, o) => real.get(url, o) };
+      const net = await env.network();
+      const a = await env.client({ sub: "ana", grants: GRANTS, network: net, config: { blobs: { http: flaky } } });
+      await a.engine.createKeyspace(KS, "room");
+      await loaded(a, KS);
+      await until(a, () => a.engine.status().connection === "live", "A live");
+      net.down();
+      await until(a, () => a.engine.status().connection !== "live", "A offline");
+      const bytes = bytesOf(777);
+      const ref = await a.engine.stageBlob(KS, bytes);
+      const w = await a.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("note/flaky-blob", "x")], blobRefs: [ref.blobId] });
+      net.up();
+      await until(a, () => committed(a, w.mutationId), "the action committed after the repair", 40_000);
+      expect(down).toBeLessThan(0); // the store was asked more than four times: the first round failed, and a later one went through
+      expect(a.calls["mutate"]).toBe(2); // the first send, which the server answered BLOB_PENDING, and the resend
+      expect(a.calls["createUpload"]).toBe(2);
+      expect(a.calls["commitBlob"]).toBe(1);
+      expect(a.ofType("held")).toEqual([]);
+      expect(a.engine.deadLetterEntries()).toEqual([]);
+      expect(await a.engine.stagedBlobs()).toEqual([]);
+      const got = await a.engine.getBlob(KS, ref.blobId);
+      expect(Buffer.from(got.bytes).equals(Buffer.from(bytes))).toBe(true);
     });
 
     it("a blob that is uploaded by the app's own call is not uploaded twice: the stash serves reads of it, and the cache serves a second reader", async () => {

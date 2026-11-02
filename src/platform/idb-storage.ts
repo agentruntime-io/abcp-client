@@ -19,6 +19,9 @@
 // A connection yields to a request to delete or upgrade the database (`versionchange`): it closes, so that the sign-out of another tab is not kept
 // waiting for it (V19 SHOULD-8); a storage whose connection was closed so refuses every call with a StorageError.
 //
+// The registry database and the partitions' are named `abpc:...`; the provider also names and deletes the database of each partition's staged blobs, `abpc-blobs:...` (`idb-blob-stash.ts`): a
+// `destroy` deletes both, and the failure of either is reported (V19 SHOULD-8, 14 [CLI-65]).
+//
 // Untested against a real IndexedDB (Node has none): `test/platform-idb.test.ts` runs it against a small in-memory double of the API subset that it uses.
 
 import { StorageError } from "../engine/errors.js";
@@ -45,99 +48,38 @@ import {
 } from "../engine/storage.js";
 import type { MemoryStorageOptions } from "../engine/memory-storage.js";
 import { partitionId, sameKey, type PartitionKey, type StorageProvider } from "../engine/tabs.js";
+import type { BlobStash } from "../engine/blob-store.js";
+import { IndexedDbBlobStash } from "./idb-blob-stash.js";
+import {
+  deleteDatabase,
+  done,
+  openDb,
+  wait,
+  type IDBDatabaseLike,
+  type IDBFactoryLike,
+  type IDBTransactionLike,
+  type KeyRangeFactory,
+  type StorageManagerLike,
+} from "./idb.js";
 import type { KeyEntry, Record as RecordMessage } from "../gen/abpc/v2/types_pb.js";
 
-// ---- the part of the IndexedDB API that is used ---------------------------------------------------------------------
-
-export interface IDBRequestLike<T = unknown> {
-  result: T;
-  error: unknown;
-  onsuccess: ((ev?: unknown) => void) | null;
-  onerror: ((ev?: unknown) => void) | null;
-}
-export interface IDBOpenRequestLike extends IDBRequestLike<IDBDatabaseLike> {
-  onupgradeneeded: ((ev?: unknown) => void) | null;
-  onblocked: ((ev?: unknown) => void) | null;
-}
-export interface IDBObjectStoreLike {
-  put(value: unknown, key: string): IDBRequestLike;
-  delete(key: string): IDBRequestLike;
-  clear(): IDBRequestLike;
-  get(key: string): IDBRequestLike;
-  /** `range` is an `IDBKeyRange` (see `KeyRangeFactory`). */
-  getAll(range?: unknown): IDBRequestLike<unknown[]>;
-  getAllKeys(range?: unknown): IDBRequestLike<string[]>;
-}
-/** `IDBKeyRange`, for reading the rows of one keyspace without reading the others'. A platform without it reads the keys and filters. */
-export interface KeyRangeFactory {
-  bound(lower: unknown, upper: unknown): unknown;
-}
-export interface IDBTransactionLike {
-  objectStore(name: string): IDBObjectStoreLike;
-  abort(): void;
-  error: unknown;
-  oncomplete: ((ev?: unknown) => void) | null;
-  onerror: ((ev?: unknown) => void) | null;
-  onabort: ((ev?: unknown) => void) | null;
-}
-export interface IDBDatabaseLike {
-  /** Another connection asks to delete or upgrade the database. */
-  onversionchange?: ((ev?: unknown) => void) | null;
-  createObjectStore(name: string): unknown;
-  objectStoreNames: { contains(name: string): boolean };
-  transaction(names: string[], mode: "readonly" | "readwrite"): IDBTransactionLike;
-  close(): void;
-}
-export interface IDBDeleteRequestLike extends IDBRequestLike {
-  /** Another connection keeps the database open: the deletion waits for it. */
-  onblocked?: ((ev?: unknown) => void) | null;
-}
-export interface IDBFactoryLike {
-  open(name: string, version?: number): IDBOpenRequestLike;
-  deleteDatabase(name: string): IDBDeleteRequestLike;
-}
-/** `navigator.storage`. */
-export interface StorageManagerLike {
-  persist(): Promise<boolean>;
-  persisted?(): Promise<boolean>;
-}
+// The part of the IndexedDB API that is used, and the calls that open and delete a database, are in `idb.ts`, shared with the stash of the blobs (`idb-blob-stash.ts`); the types are
+// re-exported from here, where they always were.
+export type {
+  IDBDatabaseLike,
+  IDBDeleteRequestLike,
+  IDBFactoryLike,
+  IDBObjectStoreLike,
+  IDBOpenRequestLike,
+  IDBRequestLike,
+  IDBTransactionLike,
+  KeyRangeFactory,
+  StorageManagerLike,
+} from "./idb.js";
 
 const STORES = ["entries", "deadLetters", "journal", "exports", "rejections", "drafts", "meta", "replicas", "replicaEntries", "replicaTail"] as const;
 type StoreId = (typeof STORES)[number];
 const REGISTRY = "abpc:registry";
-
-const wait = <T>(r: IDBRequestLike<T>): Promise<T> =>
-  new Promise((resolve, reject) => {
-    r.onsuccess = (): void => resolve(r.result);
-    r.onerror = (): void => reject(r.error instanceof Error ? r.error : new StorageError(`an IndexedDB request failed: ${String(r.error)}`));
-  });
-
-function done(tx: IDBTransactionLike): Promise<void> {
-  return new Promise((resolve, reject) => {
-    tx.oncomplete = (): void => resolve();
-    tx.onabort = (): void => reject(new StorageError(`the transaction was aborted: ${tx.error instanceof Error ? tx.error.message : String(tx.error ?? "")}`));
-    tx.onerror = (): void => reject(new StorageError(`the transaction failed: ${tx.error instanceof Error ? tx.error.message : String(tx.error ?? "")}`));
-  });
-}
-
-async function openDb(factory: IDBFactoryLike, name: string, stores: readonly string[], onClosed?: () => void): Promise<IDBDatabaseLike> {
-  const req = factory.open(name, 1);
-  req.onupgradeneeded = (): void => {
-    const db = req.result;
-    for (const s of stores) if (!db.objectStoreNames.contains(s)) db.createObjectStore(s);
-  };
-  const db = await wait(req);
-  // another tab deletes the database (a sign-out, 14 [CLI-65]) or upgrades it: this connection closes at once, or that tab waits for it for ever
-  db.onversionchange = (): void => {
-    try {
-      db.close();
-    } catch {
-      // closed already
-    }
-    onClosed?.();
-  };
-  return db;
-}
 
 const pad = (n: bigint | number, width: number): string => n.toString().padStart(width, "0");
 const rowKey = (keyspace: string, n: string): string => `${keyspace}\u0000${n}`;
@@ -684,9 +626,10 @@ export interface IndexedDbOptions {
   blockedWaitMs?: number;
 }
 
-/** The `StorageProvider` of a browser: a database for each partition, and the registry of them. */
+/** The `StorageProvider` of a browser: a database for each partition, the database of its staged blobs beside it (`idb-blob-stash.ts`), and the registry of the partitions. */
 export class IndexedDbStorageProvider implements StorageProvider {
   private readonly open_ = new Map<string, { key: PartitionKey; storage: IndexedDbStorage; name: string }>();
+  private readonly stashes = new Map<string, { key: PartitionKey; stash: IndexedDbBlobStash }>();
   private readonly opening = new Map<string, Promise<IndexedDbStorage>>();
   private registry: Promise<IDBDatabaseLike> | undefined;
 
@@ -706,6 +649,24 @@ export class IndexedDbStorageProvider implements StorageProvider {
 
   private nameOf(key: PartitionKey): string {
     return `abpc:${partitionId(key)}`;
+  }
+
+  /** The database of the partition's staged blobs: a prefix of its own, so that no partition's name is another database's. */
+  private blobsNameOf(key: PartitionKey): string {
+    return `abpc-blobs:${partitionId(key)}`;
+  }
+
+  /**
+   * The stash of the bytes that the partition's actions name (09 [READ-94], 14 [CLI-44]): in the database `abpc-blobs:<partition>`, which the first call that needs it creates. The tabs of
+   * the partition share it, and `destroy` deletes it with the partition (14 [CLI-65]).
+   */
+  blobStash(key: PartitionKey): BlobStash {
+    const id = partitionId(key);
+    const have = this.stashes.get(id);
+    if (have !== undefined && !have.stash.isClosed) return have.stash;
+    const stash = new IndexedDbBlobStash(this.factory, this.blobsNameOf(key));
+    this.stashes.set(id, { key: { ...key }, stash });
+    return stash;
   }
 
   open(key: PartitionKey): Promise<OutboxStorage> {
@@ -737,36 +698,25 @@ export class IndexedDbStorageProvider implements StorageProvider {
     return rows.filter((k) => k.origin === origin && k.appId === appId);
   }
 
-  /** Deletes the database; another tab that keeps it open is asked to close it (`versionchange`), and waited for, for a while. */
-  private deleteDatabase(name: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const req = this.factory.deleteDatabase(name);
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      req.onsuccess = (): void => {
-        if (timer !== undefined) clearTimeout(timer);
-        resolve();
-      };
-      req.onerror = (): void => {
-        if (timer !== undefined) clearTimeout(timer);
-        reject(req.error instanceof Error ? req.error : new StorageError(`the database cannot be deleted: ${String(req.error)}`));
-      };
-      req.onblocked = (): void => {
-        // a connection that does not close on `versionchange` (a tab of another build) keeps the data: the sign-out is told, never left waiting
-        timer ??= setTimeout(() => reject(new StorageError(`another tab keeps the database ${name} open: it is deleted when that tab closes it`)), this.extra.blockedWaitMs ?? 10_000);
-      };
-    });
-  }
-
   async destroy(key: PartitionKey): Promise<void> {
     for (const [id, o] of [...this.open_]) {
       if (!sameKey(o.key, key)) continue;
       if (!o.storage.isClosed) o.storage.close();
       this.open_.delete(id);
     }
-    await this.deleteDatabase(this.nameOf(key));
+    for (const [id, o] of [...this.stashes]) {
+      if (!sameKey(o.key, key)) continue;
+      o.stash.close(); // 14 [CLI-65]: the staged bytes go with the partition; this connection must not keep the deletion waiting
+      this.stashes.delete(id);
+    }
+    // the blobs' database goes whether or not the partition's does (a tab that keeps one open must not leave the other's bytes behind), and the failure of either is reported
+    const wait_ = this.extra.blockedWaitMs;
+    const [storage, blobs] = await Promise.allSettled([deleteDatabase(this.factory, this.nameOf(key), wait_), deleteDatabase(this.factory, this.blobsNameOf(key), wait_)]);
+    if (storage.status === "rejected") throw storage.reason;
     const rdb = await this.reg();
     const tx = rdb.transaction(["partitions"], "readwrite");
     tx.objectStore("partitions").delete(partitionId(key));
     await done(tx);
+    if (blobs.status === "rejected") throw blobs.reason;
   }
 }

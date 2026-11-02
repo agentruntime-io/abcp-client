@@ -115,7 +115,7 @@ export class Engine extends TabLayer {
     super(cfg);
     // 14 [CLI-66], [CLI-77]: the purge list of a keyspace holds the blob cache and the presence state: they go with the rest
     this.registerPurgeHook(async (keyspaceId, cause) => {
-      this.blobsPurge(keyspaceId);
+      await this.blobsPurge(keyspaceId);
       await this.run(() => {
         this.presencePurge(keyspaceId, cause);
         for (const [k, p] of [...this.ownPresence]) if (p.keyspaceId === keyspaceId) this.ownPresence.delete(k);
@@ -401,7 +401,7 @@ export class Engine extends TabLayer {
       f.crdt.destroy();
       this.follows.delete(id);
       this.presencePurge(id, "REMOVED"); // 09 [READ-63]: the session's memberships end with the removal; the engine follows the keyspace no more
-      this.blobsPurge(id);
+      await this.blobsPurge(id);
       for (const [k, p] of [...this.ownPresence]) if (p.keyspaceId === id) this.ownPresence.delete(k);
       await this.tx([{ op: "deleteReplica", keyspaceId: id }, ...this.followedOps()]);
       this.touchPersisted();
@@ -835,7 +835,11 @@ export class Engine extends TabLayer {
     }
     if (shared) {
       // the partition of a device is locked, not purged: the next person to use it is another principal
-      if (unsynced > 0) await this.run(() => this.tx([...this.outbox().map((e) => ({ op: "deleteEntry" as const, mutationId: e.mutationId }))]));
+      if (unsynced > 0) {
+        const discarded = this.outbox();
+        await this.run(() => this.tx([...discarded.map((e) => ({ op: "deleteEntry" as const, mutationId: e.mutationId }))]));
+        for (const e of discarded) await this.dropStagedOf(e).catch((err: unknown) => this.noteInternalError(err)); // the actions are gone: so are the bytes that they carried
+      }
       await this.stop();
       return { done: true, outcome: unsynced > 0 ? "discarded" : "locked", unsynced };
     }
@@ -850,7 +854,16 @@ export class Engine extends TabLayer {
     await this.run(() => this.tx([{ op: "purgeAll" }]));
     this.entries.clear();
     await this.stop();
+    // 14 [CLI-65]: what the partition holds goes, the bytes that its actions carried included. The provider deletes the stash of the partition with it where it keeps one (a browser's); an
+    // app's own stash is erased here, and a failure of either is told after the other was tried
+    let erased: unknown;
+    try {
+      await this.blobsPurgeAll();
+    } catch (e) {
+      erased = e;
+    }
     await this.provider?.destroy(this.partition);
+    if (erased !== undefined) throw erased;
     return { done: true, outcome: unsynced > 0 ? "discarded" : "purged", unsynced };
   }
 }

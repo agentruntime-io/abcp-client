@@ -1,5 +1,7 @@
 // C6, blobs: 09 §9.9 ([READ-84] to [READ-94], [READ-102]), 14 [CLI-43], [CLI-44], [CLI-66], [CLI-76], 16 [SEC-7], A.7, A.3. Against the fake server and its blob store (src/fake/blobs.ts), which answer as
 // `server/internal/blob` and `store/blob.go` do on the points that a client's behaviour depends on.
+// C6b: the upload before the first send of an action that names a staged blob (14 [CLI-44]), and the keyspace hold that `HISTORY_DIVERGED` from a blob call starts (14 Table 14.1). The bytes in
+// IndexedDB, a restart and the purge are test/platform-idb-blob-stash.test.ts and test/engine-blobs-idb.test.ts.
 
 import { create, toBinary } from "@bufbuild/protobuf";
 import { describe, expect, it } from "vitest";
@@ -10,6 +12,7 @@ import {
   isBlobId,
   LocalRefusal,
   MAX_UPLOAD_ROUNDS,
+  MemoryBlobStash,
   newBlobId,
   ProtocolViolation,
   set,
@@ -19,7 +22,7 @@ import { FAKE_CHECKSUM_HEADER, FakeServer, ManualClock, reject as mk, SeededRand
 import { CreateUploadRequestSchema, CreateUploadResponseSchema, MutationResultSchema } from "../src/gen/abpc/v2/sync_pb.js";
 import { ChangeKind, Code, KeyChangeSchema, RetryReason, RetrySchema, SystemKind } from "../src/gen/abpc/v2/types_pb.js";
 import { sha256 } from "../src/rules/crypto.js";
-import { goOffline, goOnline, KS, MANIFEST, ofType, types } from "./helpers/engine.js";
+import { goOffline, goOnline, KS, MANIFEST, ofType, rejectResult, retryResult, types } from "./helpers/engine.js";
 import { brig, bytesOf, drive } from "./helpers/presence.js";
 import { FakeRaw } from "./helpers/raw.js";
 import { settleAll, tabsRig } from "./helpers/tabs.js";
@@ -255,7 +258,7 @@ describe("A.7, 14 [CLI-43]: a blob call is resent as its status says", () => {
 });
 
 describe("09 [READ-89], 14 [CLI-44]: an action that names a blob that is not committed", () => {
-  it("BLOB_MISSING (class RETRY): the engine uploads the same bytes, then resends the identical action; the bytes go when the action is confirmed (09 [READ-94])", async () => {
+  it("BLOB_MISSING (class RETRY) to an action that was sent after its upload: the engine uploads the same bytes again, then resends the identical action; the bytes go when the action is confirmed (09 [READ-94])", async () => {
     const r = await brig();
     r.random.fixed = 0;
     await goOffline(r);
@@ -263,12 +266,22 @@ describe("09 [READ-89], 14 [CLI-44]: an action that names a blob that is not com
     expect(calls(r.server, "createUpload")).toBe(0);
     const { mutationId } = await submitWith(r, [ref.blobId]);
     expect(await r.engine.stagedBlobs()).toEqual([{ keyspaceId: KS, blobId: ref.blobId, size: 200 }]);
+    // the store loses the object after the upload (09 [READ-88]): the first send, which comes after the upload, is answered BLOB_MISSING
+    r.server.inject("mutate", {
+      kind: "result",
+      result: (m) => {
+        if (m.mutationId !== mutationId) return undefined;
+        r.server.blobs.rows.delete(`${KS}\u0000${ref.blobId}`);
+        r.server.blobs.objects.delete(`${KS}\u0000${ref.blobId}`);
+        return rejectResult(m, mk(Code.BLOB_MISSING));
+      },
+    });
     await goOnline(r);
     await r.clock.advance(5000);
     await r.engine.settle();
     expect(committed(r, mutationId)).toBe(true);
     expect(r.server.blobs.row(KS, ref.blobId)?.state).toBe("committed");
-    expect(calls(r.server, "createUpload")).toBe(1);
+    expect(calls(r.server, "createUpload")).toBe(2); // before the first send, and for the answer
     // the action went twice, unchanged: the same mutation id and the same blob_refs
     const sent = r.server.calls.filter((c) => c.method === "mutate").flatMap((c) => (c.request as { mutations: { mutationId: string; blobRefs: string[] }[] }).mutations);
     expect(sent.filter((m) => m.mutationId === mutationId).map((m) => m.blobRefs)).toEqual([[ref.blobId], [ref.blobId]]);
@@ -278,19 +291,21 @@ describe("09 [READ-89], 14 [CLI-44]: an action that names a blob that is not com
     expect(calls(r.server, "deleteBlob")).toBe(0); // the engine never deletes server blobs
   });
 
-  it("BLOB_PENDING: the upload is completed, and the action is resent after the larger of after_ms and the backoff", async () => {
+  it("BLOB_PENDING to an action that was sent after its upload: the upload is completed again, and the action is resent after the larger of after_ms and the backoff", async () => {
     const r = await brig();
     r.random.fixed = 0; // the backoff draws 0: the wait is after_ms, 1,000 ms
     await goOffline(r);
     const ref = await r.engine.stageBlob(KS, bytesOf(200));
-    // a CreateUpload that no PUT followed: the row is pending
-    r.server.blobs.createUpload("ana", create(CreateUploadRequestSchema, { keyspaceId: KS, blobId: ref.blobId, sha256: ref.sha256, size: 200n }));
     const { mutationId } = await submitWith(r, [ref.blobId]);
+    // a server that has not seen the commit when the action reaches it answers the first send BLOB_PENDING
+    r.server.inject("mutate", { kind: "result", result: (m) => (m.mutationId === mutationId ? retryResult(m, RetryReason.BLOB_PENDING, 1000) : undefined) });
     await r.clock.advance(1); // the engine subscribes again and sends the action: the reconnect has no wait (the backoff draws 0)
     await r.engine.settle();
     const mutates = (): number => calls(r.server, "mutate");
     expect(mutates()).toBe(1);
     expect(r.server.blobs.row(KS, ref.blobId)?.state).toBe("committed"); // completed by the engine
+    expect(calls(r.server, "createUpload")).toBe(2); // before the first send, and for the answer (already_committed)
+    expect(putCount(r.server)).toBe(1);
     await r.clock.advance(900);
     expect(mutates()).toBe(1);
     await r.clock.advance(200);
@@ -355,6 +370,247 @@ describe("09 [READ-89], 14 [CLI-44]: an action that names a blob that is not com
   });
 });
 
+
+describe("14 [CLI-44], 09 [READ-89]: an action that names a staged blob that is not committed is not sent before the upload", () => {
+  const order = (r: { server: { calls: { method: string }[] } }, ...names: string[]): string[] => r.server.calls.map((c) => c.method).filter((m) => names.includes(m));
+
+  it("offline stage and submit, then online: CreateUpload, the PUT and CommitBlob come before the first Mutate, the action is sent once, and the server never answers BLOB_MISSING or BLOB_PENDING", async () => {
+    const r = await brig();
+    r.random.fixed = 0;
+    await goOffline(r);
+    const ref = await r.engine.stageBlob(KS, bytesOf(300));
+    const { mutationId } = await submitWith(r, [ref.blobId]);
+    expect(calls(r.server, "mutate")).toBe(0);
+    await goOnline(r);
+    expect(committed(r, mutationId)).toBe(true); // no wait for a resend: there was none
+    expect(order(r, "createUpload", "commitBlob", "mutate")).toEqual(["createUpload", "commitBlob", "mutate"]);
+    expect(putCount(r.server)).toBe(1);
+    expect(r.server.blobs.row(KS, ref.blobId)?.state).toBe("committed");
+    expect(r.engine.status().holds).toEqual([]);
+    expect(await r.engine.stagedBlobs()).toEqual([]); // confirmed: the bytes go (09 [READ-94])
+  });
+
+  it("a blob that an earlier run left pending (a CreateUpload, no PUT) is completed before the first send", async () => {
+    const r = await brig();
+    r.random.fixed = 0;
+    await goOffline(r);
+    const ref = await r.engine.stageBlob(KS, bytesOf(200));
+    r.server.blobs.createUpload("ana", create(CreateUploadRequestSchema, { keyspaceId: KS, blobId: ref.blobId, sha256: ref.sha256, size: 200n }));
+    const { mutationId } = await submitWith(r, [ref.blobId]);
+    await goOnline(r);
+    expect(committed(r, mutationId)).toBe(true);
+    expect(calls(r.server, "mutate")).toBe(1);
+    expect(r.server.blobs.row(KS, ref.blobId)?.state).toBe("committed");
+  });
+
+  it("an action that is submitted while the background upload of its blob is under way waits for that upload, and starts none of its own", async () => {
+    const r = await brig();
+    r.random.fixed = 0;
+    const ref = await r.engine.stageBlob(KS, bytesOf(400)); // online: the engine starts the upload
+    const { mutationId } = await submitWith(r, [ref.blobId]);
+    await r.engine.settle();
+    expect(committed(r, mutationId)).toBe(true);
+    expect(calls(r.server, "createUpload")).toBe(1);
+    expect(calls(r.server, "commitBlob")).toBe(1);
+    expect(putCount(r.server)).toBe(1);
+    expect(calls(r.server, "mutate")).toBe(1);
+  });
+
+  it("an action that names a blob that the app uploaded and waited for is sent at once: no blob call is made for it", async () => {
+    const r = await brig();
+    const ref = await drive(r, r.engine.uploadBlob(KS, bytesOf(100)));
+    expect(calls(r.server, "createUpload")).toBe(1);
+    const { mutationId } = await submitWith(r, [ref.blobId]);
+    await r.engine.settle();
+    expect(committed(r, mutationId)).toBe(true);
+    expect(order(r, "createUpload", "commitBlob", "mutate")).toEqual(["createUpload", "commitBlob", "mutate"]);
+  });
+
+  it("after a restart that keeps the bytes, the blob that the server has committed is found committed by CreateUpload (already_committed): no second PUT, and the action is sent once", async () => {
+    const stash = new MemoryBlobStash(); // stands for a stash that outlives the engine
+    const first = await brig({ cfg: { blobs: { stash } } });
+    first.random.fixed = 0;
+    const ref = await drive(first, first.engine.uploadBlob(KS, bytesOf(100)));
+    await goOffline(first);
+    const { mutationId } = await submitWith(first, [ref.blobId]);
+    await first.engine.stop();
+    const second = await brig({ server: first.server, clock: first.clock, manifests: first.manifests, storage: first.storage, seed: 12, cfg: { blobs: { stash } } });
+    second.random.fixed = 0;
+    await second.clock.advance(1000);
+    await second.engine.settle();
+    expect(committed(second, mutationId)).toBe(true);
+    expect(calls(first.server, "createUpload")).toBe(2);
+    expect(putCount(first.server)).toBe(1);
+    expect(calls(first.server, "commitBlob")).toBe(1);
+    expect(calls(first.server, "mutate")).toBe(1);
+  });
+
+  it("an action that names a blob that the engine holds no bytes of is sent at once, with no blob call of its own (another device uploaded it)", async () => {
+    const a = await brig();
+    const ref = await drive(a, a.engine.uploadBlob(KS, bytesOf(60)));
+    const b = await brig({ server: a.server, clock: a.clock, manifests: a.manifests, sub: "bob", seed: 31 });
+    const { mutationId } = await submitWith(b, [ref.blobId]);
+    await b.engine.settle();
+    expect(committed(b, mutationId)).toBe(true);
+    expect(a.server.calls.filter((c) => c.sub === "bob" && (c.method === "createUpload" || c.method === "commitBlob"))).toEqual([]);
+  });
+
+  it("only the action that waits for its upload waits: an unrelated action is sent meanwhile (14 [CLI-33])", async () => {
+    const r = await brig();
+    r.random.fixed = 0;
+    await goOffline(r);
+    const ref = await r.engine.stageBlob(KS, bytesOf(100));
+    const a = await submitWith(r, [ref.blobId], "settings/a");
+    const b = await submitWith(r, [], "settings/b");
+    r.server.inject("createUpload", { kind: "delay", ms: 10_000 }); // the server is slow to answer the upload
+    await goOnline(r);
+    expect(committed(r, b.mutationId)).toBe(true);
+    expect(committed(r, a.mutationId)).toBe(false);
+    expect(calls(r.server, "mutate")).toBe(1); // the action of the blob was not sent
+    await r.clock.advance(10_000);
+    await r.engine.settle();
+    expect(committed(r, a.mutationId)).toBe(true);
+    expect(calls(r.server, "mutate")).toBe(2);
+  });
+
+  it("a blob that is committed and withheld (12 [ADM-103]) does not hold the action: the server accepts the action, so the engine gives up the upload that the withholding refuses and sends it (14 [CLI-44])", async () => {
+    const stash = new MemoryBlobStash();
+    const first = await brig({ cfg: { blobs: { stash } } });
+    first.random.fixed = 0;
+    const ref = await drive(first, first.engine.uploadBlob(KS, bytesOf(100)));
+    await goOffline(first);
+    const { mutationId } = await submitWith(first, [ref.blobId]);
+    await first.engine.stop();
+    first.server.blobs.withhold(KS, ref.blobId); // a redaction's deferred part withholds it
+    const second = await brig({ server: first.server, clock: first.clock, manifests: first.manifests, storage: first.storage, seed: 12, cfg: { blobs: { stash } } });
+    await second.engine.settle(); // the clock does not move: nothing waits for a Retry
+    expect(committed(second, mutationId)).toBe(true);
+    expect(calls(first.server, "createUpload")).toBe(2); // the app's upload, and the one call of the engine, answered Retry{BLOB_WITHHELD} and not asked again
+    expect(calls(first.server, "mutate")).toBe(1);
+    expect(second.engine.status().holds).toEqual([]);
+  });
+
+  it("the upload that the app waits for keeps asking while the blob is withheld: the app decides when to stop (14 [CLI-44])", async () => {
+    const r = await brig();
+    const bytes = bytesOf(50);
+    const ref = await drive(r, r.engine.uploadBlob(KS, bytes));
+    r.server.blobs.withhold(KS, ref.blobId);
+    const waits: string[] = [];
+    const ac = new AbortController();
+    const p = r.engine.uploadBlob(KS, bytes, { blobId: ref.blobId, signal: ac.signal, onWait: (w) => waits.push(w.reason) }).catch((e: unknown) => e);
+    for (let i = 0; i < 100 && waits.length < 2; i++) {
+      await r.clock.yield(); // the digest of the bytes is the platform's, and the clock does not wait for it
+      await r.engine.settle();
+      await r.clock.advance(1000);
+    }
+    expect(waits.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(waits)).toEqual(new Set(["BLOB_WITHHELD"]));
+    ac.abort();
+    expect(await drive(r, p)).toMatchObject({ code: "ABORTED" });
+    expect(r.engine.status().holds).toEqual([]);
+  });
+
+  it("an upload that fails does not wedge the action: it is sent, the answer of the server starts the repair with its backoff, and the action commits", async () => {
+    const r = await brig();
+    r.random.fixed = 0.5;
+    await goOffline(r);
+    const ref = await r.engine.stageBlob(KS, bytesOf(100));
+    const { mutationId } = await submitWith(r, [ref.blobId]);
+    r.server.inject("createUpload", { kind: "status", status: "ResourceExhausted", reject: mk(Code.QUOTA_EXCEEDED, { details: { quota: "bytes_per_app" } }) }); // final: the row is never made
+    await goOnline(r);
+    for (let i = 0; i < 6 && !committed(r, mutationId); i++) {
+      await r.clock.advance(1000);
+      await r.engine.settle();
+    }
+    expect(committed(r, mutationId)).toBe(true);
+    // the refused upload came first; the action was sent all the same, and the server, which had no row, answered BLOB_MISSING; the repair uploaded, and the resend committed
+    expect(order(r, "createUpload", "commitBlob", "mutate")).toEqual(["createUpload", "mutate", "createUpload", "commitBlob", "mutate"]);
+    expect(r.engine.status().holds).toEqual([]);
+    expect(r.engine.deadLetterEntries()).toEqual([]);
+  });
+});
+
+describe("14 Table 14.1, 09 [READ-4]: HISTORY_DIVERGED from a blob call holds the keyspace", () => {
+  const diverged = { kind: "status", status: "FailedPrecondition", reject: mk(Code.HISTORY_DIVERGED) } as const;
+  const holds = (r: Awaited<ReturnType<typeof brig>>): string[] => r.engine.status().holds.map((h) => `${h.scope}:${h.keyspaceId}:${h.code}`);
+  const heldEvents = (r: Awaited<ReturnType<typeof brig>>): string[] => ofType(r, "held").map((e) => `${e.state}:${e.code}`);
+
+  for (const call of ["createUpload", "commitBlob", "deleteBlob"] as const) {
+    it(`${call}: the call fails with HISTORY_DIVERGED, final; the keyspace is held, nothing is sent to it, and the hold ends when the LoadState of its probe finds the keyspace open`, async () => {
+      const r = await brig();
+      r.random.fixed = 0.5;
+      const doomed = call === "deleteBlob" ? await drive(r, r.engine.uploadBlob(KS, bytesOf(10))) : undefined;
+      const before = calls(r.server, call);
+      r.server.inject(call, diverged);
+      const p: Promise<unknown> = doomed !== undefined ? r.engine.deleteBlob(KS, doomed.blobId, "why") : r.engine.uploadBlob(KS, bytesOf(20));
+      await expect(drive(r, p)).rejects.toMatchObject({ code: "HISTORY_DIVERGED", status: "FailedPrecondition" });
+      expect(calls(r.server, call)).toBe(before + 1); // final: not resent
+      expect(holds(r)).toEqual([`keyspace:${KS}:HISTORY_DIVERGED`]);
+      expect(heldEvents(r)).toEqual(["start:HISTORY_DIVERGED"]);
+      // 14 Table 14.1: "The client sends nothing to the keyspace"
+      const a = await r.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/a", 1)] });
+      await r.engine.settle();
+      expect(calls(r.server, "mutate")).toBe(0);
+      // the keyspace is open: the LoadState that the hold repeats with its backoff (09 [READ-70]) ends the hold, and the action goes
+      for (let i = 0; i < 4 && !committed(r, a.mutationId); i++) {
+        await r.clock.advance(30_000);
+        await r.engine.settle();
+      }
+      expect(committed(r, a.mutationId)).toBe(true);
+      expect(holds(r)).toEqual([]);
+      expect(heldEvents(r)).toEqual(["start:HISTORY_DIVERGED", "stop:HISTORY_DIVERGED"]);
+    });
+  }
+
+  it("the upload before the first send meets it: the keyspace is held and the action stays unsent; when the hold ends the action goes, and the answer of the server repairs the blob", async () => {
+    const r = await brig();
+    r.random.fixed = 0.5;
+    await goOffline(r);
+    const ref = await r.engine.stageBlob(KS, bytesOf(100));
+    const { mutationId } = await submitWith(r, [ref.blobId]);
+    r.server.inject("createUpload", diverged);
+    await goOnline(r);
+    expect(holds(r)).toEqual([`keyspace:${KS}:HISTORY_DIVERGED`]);
+    expect(calls(r.server, "mutate")).toBe(0);
+    for (let i = 0; i < 8 && !committed(r, mutationId); i++) {
+      await r.clock.advance(30_000);
+      await r.engine.settle();
+    }
+    expect(committed(r, mutationId)).toBe(true);
+    expect(r.server.blobs.row(KS, ref.blobId)?.state).toBe("committed");
+    expect(holds(r)).toEqual([]);
+  });
+
+  it("a frozen keyspace: the hold that the session's drop started is the one hold; the blob call that is refused for it starts no second", async () => {
+    const r = await brig();
+    r.random.fixed = 0.5;
+    r.server.freeze(KS);
+    await r.engine.settle();
+    expect(holds(r)).toEqual([`keyspace:${KS}:HISTORY_DIVERGED`]);
+    await expect(drive(r, r.engine.uploadBlob(KS, bytesOf(10)))).rejects.toMatchObject({ code: "HISTORY_DIVERGED" });
+    expect(holds(r)).toEqual([`keyspace:${KS}:HISTORY_DIVERGED`]);
+    expect(heldEvents(r)).toEqual(["start:HISTORY_DIVERGED"]);
+  });
+
+  it("a keyspace that the engine does not follow is held by no call; and a withheld blob (Retry{BLOB_WITHHELD}) is never the HISTORY_DIVERGED of the table (14 [CLI-44])", async () => {
+    const r = await brig();
+    r.server.createKeyspaceNow("other");
+    r.server.inject("createUpload", diverged);
+    await expect(drive(r, r.engine.uploadBlob("other", bytesOf(10)))).rejects.toMatchObject({ code: "HISTORY_DIVERGED" });
+    expect(holds(r)).toEqual([]);
+    const ref = await drive(r, r.engine.uploadBlob(KS, bytesOf(10)));
+    r.server.blobs.withhold(KS, ref.blobId);
+    const waits: string[] = [];
+    const ac = new AbortController();
+    const p = r.engine.deleteBlob(KS, ref.blobId, "why", { signal: ac.signal, onWait: (w) => waits.push(w.reason) }).catch((e: unknown) => e);
+    await r.engine.settle();
+    await r.clock.advance(10_000);
+    ac.abort();
+    expect(await drive(r, p)).toMatchObject({ code: "ABORTED" });
+    expect(waits.length).toBeGreaterThan(0);
+    expect(holds(r)).toEqual([]);
+  });
+});
 
 describe("09 [READ-90], 16 [SEC-7]: GetBlob and its download", () => {
   it("downloads the bytes, checks them against the digest and the size, caches them, and reads the declared content type", async () => {
@@ -577,6 +833,52 @@ describe("14 [CLI-76], [CLI-66]: what the log and the loads say of the cached by
   });
 });
 
+
+describe("14 [CLI-65], [CLI-66], [CLI-77], 09 [READ-94]: the staged bytes of the engine's own stash are erased with the copy of a keyspace and with the partition", () => {
+  it("a sign-out that purges the partition erases every staged blob of the app's stash", async () => {
+    const stash = new MemoryBlobStash();
+    const r = await brig({ cfg: { blobs: { stash } } });
+    await r.engine.stageBlob(KS, bytesOf(10));
+    await r.engine.stageBlob(KS, bytesOf(20), { blobId: "k".repeat(22) });
+    expect(await stash.list()).toHaveLength(2);
+    expect(await r.engine.signOut()).toMatchObject({ done: true, outcome: "purged" });
+    expect(await stash.list()).toEqual([]);
+  });
+
+  it("a stash that cannot erase its bytes makes the sign-out fail: it is told, and nothing is called purged", async () => {
+    const stash = Object.assign(new MemoryBlobStash(), { clear: (): Promise<void> => Promise.reject(new Error("the disk refused")) });
+    const r = await brig({ cfg: { blobs: { stash } } });
+    await r.engine.stageBlob(KS, bytesOf(10));
+    await expect(r.engine.signOut()).rejects.toThrow(/disk refused/);
+    expect(await stash.list()).toHaveLength(1);
+  });
+
+  it("removing a keyspace (14 [CLI-70]) erases the bytes staged in it that no action names", async () => {
+    const stash = new MemoryBlobStash();
+    const r = await brig({ cfg: { blobs: { stash } } });
+    await goOffline(r);
+    await r.engine.stageBlob(KS, bytesOf(10));
+    expect(await r.engine.removeKeyspace(KS)).toBe(true);
+    expect(await stash.list()).toEqual([]);
+  });
+
+  it("a deleted keyspace (14 [CLI-77]) takes the bytes staged in it with its copy; an action that was dead-lettered by the deletion keeps the bytes that it names", async () => {
+    const stash = new MemoryBlobStash();
+    const r = await brig({ cfg: { blobs: { stash } } });
+    await goOffline(r);
+    const unnamed = await r.engine.stageBlob(KS, bytesOf(10));
+    const named = await r.engine.stageBlob(KS, bytesOf(20));
+    const { mutationId } = await submitWith(r, [named.blobId]);
+    r.server.inject("createUpload", { kind: "delay", ms: 3_600_000 }); // the upload that comes before the first send is slow: the action is never sent
+    await goOnline(r);
+    r.server.deleteKeyspace(KS);
+    await r.engine.settle();
+    expect(r.engine.deadLetterEntries().map((d) => [d.mutationId, d.reason])).toEqual([[mutationId, "KEYSPACE_DELETED"]]);
+    for (let i = 0; i < 10 && (await stash.list()).length > 1; i++) await r.engine.settle();
+    expect((await stash.list()).map((s) => s.blobId)).toEqual([named.blobId]);
+    expect(await stash.get(KS, unnamed.blobId)).toBeUndefined();
+  });
+});
 
 describe("02 [ARC-61], 16 [SEC-1]: what the server sends in the blob calls is decoded strictly and bounded", () => {
   const upload = (n: number, extra: Record<string, string> = {}): Uint8Array => {

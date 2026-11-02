@@ -8,7 +8,9 @@
 //    request leaves; a slot is consumed when the lane's watermark says so, never by a result's code;
 //  - [CLI-31], [CLI-33] an action waits for what it depends on, and for nothing else; [CLI-32] a GATED action carries
 //    `after_client_seq`;
-//  - [CLI-24], [CLI-50] an action with no definitive result is resent unchanged, never rebased, dead-lettered or dropped.
+//  - [CLI-24], [CLI-50] an action with no definitive result is resent unchanged, never rebased, dead-lettered or dropped;
+//  - [CLI-44] an action that names a staged blob that is not committed is not sent before the blob is uploaded and committed (`blobsReady`), so that the server does not first answer
+//    `BLOB_PENDING` or `BLOB_MISSING`; it waits for its upload as it waits for a dependency, and unrelated actions go on ([CLI-33]).
 
 import { create } from "@bufbuild/protobuf";
 import { MutateRequestSchema, type MutateResponse, type MutationResult, type Mutation } from "../gen/abpc/v2/sync_pb.js";
@@ -27,6 +29,12 @@ import type { OutboxEntry, StoredOutcome } from "./storage.js";
 import type { ActionInput, SubmitOptions, SubmitResult } from "./types.js";
 
 export abstract class SenderLayer extends ReactionLayer {
+  /**
+   * 14 [CLI-44]: whether the blobs that the action names are uploaded, or need not be (`blobs.ts`). Asked when nothing else holds the action back; false while the engine uploads them, and the
+   * pump runs again when it is done.
+   */
+  protected abstract blobsReady(e: OutboxEntry): boolean;
+
   /** The keyspaces with a SEQUENCED request in flight ([CLI-26]). */
   private readonly seqInflight = new Set<string>();
   /** Whether authoring of a SEQUENCED action may follow a dependency on the same lane without its result ([CLI-31], exception). */
@@ -202,7 +210,8 @@ export abstract class SenderLayer extends ReactionLayer {
       const others = blocking.filter((h) => !(h.probeDue === true && h.probeId === e.mutationId && (h.scope === "lane" || h.scope === "keyspace")));
       if (others.length > 0) return false;
     }
-    return this.unresolvedDeps(e).length === 0;
+    if (this.unresolvedDeps(e).length > 0) return false;
+    return this.blobsReady(e); // 14 [CLI-44]: last, so that the upload is made for an action that would be sent now
   }
 
   protected async pumpKeyspace(f: Follow): Promise<void> {

@@ -43,6 +43,24 @@ describe("09 [READ-94]: FileBlobStash keeps the bytes in files, checked on every
     await s.delete(KS, b.blobId); // nothing to delete
   });
 
+  it("14 [CLI-65]: has answers from the facts; clear erases the files that the stash wrote and leaves the others alone", async () => {
+    const dir = tmp();
+    const s = new FileBlobStash(dir);
+    const a = await blob("a".repeat(22), 100);
+    expect(await s.has(KS, a.blobId)).toBe(false);
+    await s.put(a);
+    await s.put(await blob("b".repeat(22), 5));
+    expect(await s.has(KS, a.blobId)).toBe(true);
+    const own = fs.readdirSync(dir);
+    fs.writeFileSync(path.join(dir, `${own[0]?.slice(0, 64)}.bin.tmp`), "left by a crash");
+    fs.writeFileSync(path.join(dir, "notes.txt"), "the app's");
+    await s.clear();
+    expect(fs.readdirSync(dir)).toEqual(["notes.txt"]);
+    expect(await s.list()).toEqual([]);
+    expect(await s.has(KS, a.blobId)).toBe(false);
+    await s.clear(); // nothing to erase
+  });
+
   it("a damaged file is a blob that is not staged: never a wrong upload", async () => {
     const dir = tmp();
     const s = new FileBlobStash(dir);
@@ -55,6 +73,19 @@ describe("09 [READ-94]: FileBlobStash keeps the bytes in files, checked on every
     expect(await s.get(KS, b.blobId)).toBeUndefined();
     fs.writeFileSync(path.join(dir, bin), buf.subarray(0, 100)); // a short file
     expect(await s.get(KS, b.blobId)).toBeUndefined();
+  });
+});
+
+describe("14 [CLI-65]: a sign-out erases the files of the stash with the partition", () => {
+  it("every staged file goes, and the files of the directory that are not the stash's stay", async () => {
+    const dir = tmp();
+    fs.writeFileSync(path.join(dir, "keep.txt"), "x");
+    const r = await brig({ cfg: { blobs: { stash: new FileBlobStash(dir) } } });
+    await r.engine.stageBlob(KS, bytesOf(300));
+    await r.engine.stageBlob(KS, bytesOf(400));
+    expect(fs.readdirSync(dir).filter((x) => /\.(bin|json)$/.test(x))).toHaveLength(4);
+    expect(await r.engine.signOut()).toMatchObject({ done: true, outcome: "purged" });
+    expect(fs.readdirSync(dir)).toEqual(["keep.txt"]);
   });
 });
 

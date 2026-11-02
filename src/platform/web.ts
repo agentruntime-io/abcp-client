@@ -10,6 +10,9 @@
 // (`ready` resolves when the id is settled, and the engine waits for it). A reload is the same tab: no live page answers for the id, and it is kept. A page that is
 // frozen and cannot answer in time is not told apart: that is the limit of asking.
 //
+// The host's storage provider also keeps the stash of the bytes that the partition's actions name, in a database of its own (`idb-blob-stash.ts`), and the engine takes it as its default: an action
+// that names a staged blob finds its bytes after a reload (09 [READ-94], 14 [CLI-44]), and a sign-out deletes them with the partition (14 [CLI-65]). An app's own stash goes before it.
+//
 // Untested in a browser (nothing here runs in Node but the lock and the channel, against Node's own `navigator.locks` and `BroadcastChannel`).
 
 import type { MemoryStorageOptions } from "../engine/memory-storage.js";

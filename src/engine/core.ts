@@ -177,6 +177,11 @@ export interface Runtime {
   polling: boolean;
   /** The entry is sent alone in its request (14 [CLI-50], a request split). */
   alone: boolean;
+  /**
+   * The upload that comes before the first send of an action that names a staged blob (14 [CLI-44]): `unchecked` until the entry could be sent, `checking` while the engine finds
+   * its staged blobs and uploads them, `ready` when the send may go (`blobs.ts`).
+   */
+  blobs: "unchecked" | "checking" | "ready";
   /** How often a request that carried it got `Unauthenticated` (14 [CLI-50]). */
   authTries: number;
 }
@@ -187,7 +192,7 @@ export abstract class EngineCore {
   readonly transport: Transport;
   readonly manifests: Manifests;
   /** Where the bytes that actions name are kept (09 [READ-94]). */
-  readonly blobStash: BlobStash;
+  private blobStashIn: BlobStash;
   /** The most octets of downloaded blobs that the cache holds. */
   protected readonly blobCacheBytes: number;
   private blobHttpGiven: BlobHttp | undefined;
@@ -263,7 +268,7 @@ export abstract class EngineCore {
     this.author = { issuer: cfg.principal.issuer, sub: cfg.principal.sub, deviceId: cfg.principal.deviceId };
     this.transport = cfg.transport;
     this.manifests = cfg.manifests;
-    this.blobStash = cfg.blobs?.stash ?? new MemoryBlobStash();
+    this.blobStashIn = cfg.blobs?.stash ?? new MemoryBlobStash();
     this.blobCacheBytes = cfg.blobs?.cacheBytes ?? DEFAULT_BLOB_CACHE_BYTES;
     this.blobHttpGiven = cfg.blobs?.http;
     this.storage = cfg.storage ?? new MemoryStorage();
@@ -275,6 +280,16 @@ export abstract class EngineCore {
     this.predictors = cfg.predictors ?? {};
     this.features = cfg.features ?? DEFAULT_FEATURES;
     this.mintClientId = cfg.newClientId ?? ((): string => newUuid(this.random));
+  }
+
+  /** Where the bytes that actions name are kept (09 [READ-94]): the app's stash, else the platform's for the partition (`useBlobStash`), else one in memory. */
+  get blobStash(): BlobStash {
+    return this.blobStashIn;
+  }
+
+  /** The stash of the partition that the platform's storage provider gives (a browser's IndexedDB, 09 [READ-94]); called once, when the partition is opened, and never over the app's own. */
+  protected useBlobStash(stash: BlobStash): void {
+    this.blobStashIn = stash;
   }
 
   /** The HTTP of the blob store: the app's, or the platform's `fetch` (09 §9.9). */
@@ -687,7 +702,7 @@ export abstract class EngineCore {
   protected rt(id: string): Runtime {
     let r = this.runtimes.get(id);
     if (r === undefined) {
-      r = { inflight: false, nextAttemptAt: 0, timer: undefined, polling: false, alone: false, authTries: 0 };
+      r = { inflight: false, nextAttemptAt: 0, timer: undefined, polling: false, alone: false, blobs: "unchecked", authTries: 0 };
       this.runtimes.set(id, r);
     }
     return r;

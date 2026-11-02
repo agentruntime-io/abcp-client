@@ -12,6 +12,7 @@
 // simulates two tabs (or processes) on one device. A browser implementation (Web Locks, BroadcastChannel, IndexedDB) and a Node one
 // (a lock file, a directory of rows) come later (C5): they implement these interfaces.
 
+import type { BlobStash } from "./blob-store.js";
 import type { OutboxStorage } from "./storage.js";
 
 /** What keys all local storage (14 [CLI-74]). */
@@ -50,8 +51,14 @@ export interface StorageProvider {
   open(key: PartitionKey): Promise<OutboxStorage>;
   /** The partitions that exist for an origin and an app, locked ones included (14 [CLI-59]: the app may offer to flush or discard them). */
   list(origin: string, appId: string): Promise<PartitionKey[]>;
-  /** Removes the partition and everything in it (14 [CLI-65]: a sign-out in personal mode, a discard of a locked partition). */
+  /** Removes the partition and everything in it (14 [CLI-65]: a sign-out in personal mode, a discard of a locked partition), the staged bytes of its blobs included. */
   destroy(key: PartitionKey): Promise<void>;
+  /**
+   * The stash of the bytes that the partition's actions name (09 [READ-94]), as durable as the partition's storage is: a restart finds the bytes of an action that was never uploaded
+   * (14 [CLI-44]). The tabs of one partition share it, as they share its outbox (14 [CLI-61]). A provider that has none leaves the engine its in-memory default; the app's own stash
+   * (`EngineConfig.blobs.stash`) goes before it.
+   */
+  blobStash?(key: PartitionKey): BlobStash;
 }
 
 /** The exclusive lock of one partition, as its holder has it. */

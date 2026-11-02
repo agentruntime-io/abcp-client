@@ -11,6 +11,12 @@
 //  - [READ-89], 14 [CLI-44] An action that names a blob that is not committed gets `Retry{BLOB_PENDING}` (the upload is completed) or `Reject{BLOB_MISSING}` (the upload is
 //    repeated); the engine does it with the bytes that it kept for the action (`BlobStash`), then resends the identical action after the larger of `after_ms` and its backoff
 //    (`repairBlobs`, called by the reactions). A withheld blob never stops an action: the server accepts it (no `Retry{BLOB_WITHHELD}` for a mutation).
+//  - [CLI-44] "the client completes or repeats the upload of the same blob bytes (09 §9.9), then resends": the engine does not wait for the answer to do the first upload. An action whose
+//    `blob_refs` name a blob that it holds the bytes of, and does not know to be committed, is not sent until the upload is done (`blobsReady`, asked by the sender): the server then never
+//    has to answer `BLOB_PENDING` or `BLOB_MISSING` for the first send. The upload is the call that `repairBlobs` makes, and an upload that fails does not stop the action: it is sent, and the
+//    answer of the server starts the repair above, with its backoff. Only that action waits: unrelated actions are sent meanwhile (14 [CLI-33]). A blob that is committed and withheld answers
+//    the upload `Retry{BLOB_WITHHELD}`, and the upload of an action gives up at it ([CLI-44]: the server accepts the action, and "holds no lane, keyspace or action for it"); the upload that
+//    an app asks for keeps asking.
 //  - [READ-90] `GetBlob` gives a short-lived `download_url`, the digest, the size and the declared content type. A pending blob answers `Retry{BLOB_PENDING}` and a withheld one
 //    `Retry{BLOB_WITHHELD}`: the call is asked again after the larger of `after_ms` and the client backoff, holding no lane, keyspace or action, with no bound of its own ("the
 //    app decides when to stop asking": the `signal` of the call, and `onWait` for what it shows meanwhile). `BLOB_MISSING` and `BLOB_DELETED` are final.
@@ -22,7 +28,9 @@
 //    covers its own cache only: it MUST NOT delete server blobs to clean up": the engine never calls `DeleteBlob` on its own.
 //  - [CLI-76] "On a `BLOB_DELETED` record (06 [LOG-79]), a client MUST drop its cached bytes of that blob"; a load with `resumed = false` "MUST drop its cache of the keyspace's downloaded
 //    blob bytes, never the bytes that an unsent action still carries (09 [READ-94])". The downloaded-bytes cache is in memory, so no cursor is persisted over a purge that is not done.
-//  - [CLI-66] The blob cache is on the purge list of `ACCESS_REVOKED`: `blobsPurge`.
+//  - [CLI-66] The blob cache is on the purge list of `ACCESS_REVOKED`: `blobsPurge`. The bytes that the engine staged are the principal's own, kept for actions that it authored: the purge of a
+//    keyspace erases them too, but for those that an action that the engine still holds names (an outbox entry, a quarantined or dead-lettered one, an export-hook entry: [CLI-28], [CLI-66]
+//    keep these, and `resubmitExport` names the same blobs again); and a sign-out that purges the partition erases all of them (`blobsPurgeAll`, [CLI-65]).
 //  - [CLI-43], A.7 Every call is resent, unchanged, after `Unavailable`, `DeadlineExceeded`, `Aborted` and the statuses of a proxy, and after `Retry{RATE_LIMITED}`, with the client
 //    backoff; `Unauthenticated` is resent once after a refresh of the token; `QUOTA_EXCEEDED`, `IDEMPOTENCY_KEY_REUSED` and every `Reject` are final.
 //
@@ -31,6 +39,16 @@
 // `UPLOAD_FAILED`. An action that names the blob goes on with `Reject{BLOB_MISSING}` and the client backoff, as a `RETRY` result does (14 [CLI-43]).
 //
 // SPEC-QUESTION (09 [READ-86]): the text gives no count for `CreateUploadResponse.upload_headers`. Taken: at most `MAX_UPLOAD_HEADERS` (counts.ts).
+//
+// SPEC-QUESTION (14 [CLI-66], [CLI-76], 09 [READ-94]): [CLI-66] lists "blob cache" on the purge list of a keyspace, and [CLI-76] speaks of "downloaded blob bytes" and says never "the bytes that
+// an unsent action still carries (09 [READ-94])"; no rule names the bytes that a client staged. Reading A (taken): staged bytes are the principal's data and part of the local copy, so the
+// purge of a keyspace erases the staged bytes of the keyspace that no action held by the engine names, and a sign-out of a personal partition erases them all; the bytes that a held action
+// names are the action's ([READ-94]: kept until it is confirmed) and stay with it. Reading B: the purge list never touches staged bytes, which stay until their action is confirmed. Reading C:
+// the purge erases every staged byte of the keyspace, and an action that was quarantined and is re-submitted (`resubmitExport`) meets `BLOB_MISSING` for good.
+//
+// SPEC-QUESTION (14 Table 14.1, 09 [READ-4]): a blob call that a frozen keyspace refuses answers FailedPrecondition with `Reject{HISTORY_DIVERGED}`; the row of the table for `HISTORY_DIVERGED` says
+// "as a code" and holds the keyspace, without saying that a call of the blob family is one that does. Taken: yes, as any call is (a `BlobError` `HISTORY_DIVERGED` is final for the call, and the
+// keyspace is held as for a load or an action that gets it). Not taken for `Retry{BLOB_WITHHELD}`, which [CLI-44] says is never the `HISTORY_DIVERGED` of the table.
 
 import { create } from "@bufbuild/protobuf";
 import {
@@ -44,6 +62,7 @@ import {
 import { Code, RecordKind, RetryReason, SystemKind, type Record as RecordMessage } from "../gen/abpc/v2/types_pb.js";
 import { parse, getMember } from "../rules/jsonv1/index.js";
 import { fullJitter, HOLD_BACKOFF, resendDelay } from "./backoff.js";
+import type { Runtime } from "./core.js";
 import {
   BlobCache,
   BlobError,
@@ -63,10 +82,20 @@ import {
 } from "./blob-store.js";
 import { codeName, retryReasonName } from "./codes.js";
 import { decodeContent, CanonError } from "./entry.js";
-import { LocalRefusal, ProtocolViolation, RpcError } from "./errors.js";
+import { LocalRefusal, ProtocolViolation, RpcError, storageCauseOf } from "./errors.js";
 import type { Follow } from "./follow.js";
 import { PresenceLayer } from "./presence.js";
 import type { OutboxEntry } from "./storage.js";
+
+/** What a call of the engine takes besides the app's options. */
+interface CallOptions extends BlobCallOptions {
+  /**
+   * A `Retry{BLOB_WITHHELD}` ends the call with `BLOB_WITHHELD` instead of being asked again. [CLI-44]: the server accepts an action that names a withheld blob, "so that the client sends it, and
+   * every action behind it on its lane", and "holds no lane, keyspace or action for it": the upload that the engine makes for an action does not wait for a blob that is committed and withheld.
+   * The calls that an app makes keep asking: "the app decides when to stop asking".
+   */
+  giveUpWhenWithheld?: boolean;
+}
 
 type Classified =
   | { kind: "retry"; reason: string; afterMs: number | undefined; hold?: boolean }
@@ -130,6 +159,11 @@ export abstract class BlobLayer extends PresenceLayer {
   private readonly cache = new BlobCache(this.blobCacheBytes);
   /** Uploads of staged blobs that are under way, by blob: a second caller shares the first one's work. */
   private readonly uploads = new Map<string, Promise<void>>();
+  /**
+   * The staged blobs that this run knows to be committed (its own `CommitBlob` was answered, or `CreateUpload` said `already_committed`), by blob: an action that names only these is sent at once
+   * (14 [CLI-44]). A fact of the server that the engine may hold stale (a restore, a sweep), so it is memory only, and the server's answer to an action is still the last word.
+   */
+  private readonly committed = new Set<string>();
   private readonly sleepers = new Set<() => void>();
 
   /** 14 [CLI-61] and the sleepers: a call that waits for time stops when the engine does. */
@@ -141,6 +175,7 @@ export abstract class BlobLayer extends PresenceLayer {
   protected resetRuntime(): void {
     super.resetRuntime();
     this.uploads.clear();
+    this.committed.clear();
   }
 
   // ---------------------------------------------------------------------------------------------------------------------
@@ -171,7 +206,7 @@ export abstract class BlobLayer extends PresenceLayer {
   }
 
   /** One call, resent as A.7 says (see the header). `keyspaceId` is the keyspace that a protocol violation holds. */
-  private async rpc<T>(keyspaceId: string, o: BlobCallOptions | undefined, fn: () => Promise<T>): Promise<T> {
+  private async rpc<T>(keyspaceId: string, o: CallOptions | undefined, fn: () => Promise<T>): Promise<T> {
     let n = 0;
     let refreshed = false;
     for (;;) {
@@ -193,16 +228,26 @@ export abstract class BlobLayer extends PresenceLayer {
             if (!(await this.refreshToken())) throw new BlobError("NO_TOKEN", "the app gave no valid token");
             break;
           case "retry": {
+            if (o?.giveUpWhenWithheld === true && c.reason === "BLOB_WITHHELD") throw new BlobError("BLOB_WITHHELD", "the blob is withheld (12 [ADM-103]); an action that names it is sent all the same (14 [CLI-44])", { status: e instanceof RpcError ? e.status : "Unavailable" });
             const delayMs = c.hold === true ? fullJitter(n++, HOLD_BACKOFF, this.random) : resendDelay(n++, c.afterMs, this.random);
             o?.onWait?.({ reason: c.reason, delayMs });
             await this.blobSleep(delayMs, o?.signal);
             break;
           }
           default:
+            // 14 Table 14.1: `HISTORY_DIVERGED` "as a code" holds the keyspace, from a blob call as from any other (09 [READ-4]: a frozen keyspace refuses `CreateUpload`, `CommitBlob` and `DeleteBlob`)
+            if (c.error.code === "HISTORY_DIVERGED") this.post(() => this.holdDiverged(keyspaceId));
             throw c.error;
         }
       }
     }
+  }
+
+  /** The keyspace is held (14 Table 14.1): the engine sends nothing to it, and learns of its reopening from a `LoadState` that it repeats with the hold backoff (09 [READ-70]). */
+  private holdDiverged(keyspaceId: string): void {
+    // a keyspace that the engine does not follow has no copy to load again, and nothing of it to send: nothing is held
+    if (this.follows.get(keyspaceId) === undefined || this.holds.has("HISTORY_DIVERGED", keyspaceId)) return;
+    this.holdKeyspace("HISTORY_DIVERGED", codeName(Code.HISTORY_DIVERGED), keyspaceId);
   }
 
   // ---------------------------------------------------------------------------------------------------------------------
@@ -231,14 +276,19 @@ export abstract class BlobLayer extends PresenceLayer {
     const sha256 = await digestSha256(bytes);
     const copy = new Uint8Array(bytes); // the app may reuse its buffer
     const staged: StagedBlob = { keyspaceId, blobId, bytes: copy, sha256, size: copy.length, contentType, stagedAtMs: this.clock.now() };
-    await this.blobStash.put(staged);
+    try {
+      await this.blobStash.put(staged);
+    } catch (e) {
+      // a durable stash can fail (a quota, a database that another tab closed): nothing was staged, and the app is told as for an action that cannot be stored (14 [CLI-21])
+      throw new LocalRefusal("STORAGE", `the bytes of the blob could not be kept: ${e instanceof Error ? e.message : String(e)}`, storageCauseOf(e));
+    }
     return { keyspaceId, blobId, sha256, size: staged.size, contentType };
   }
 
   /** Starts the upload of a staged blob in the background, when the engine can reach the server; a failure leaves the blob staged for the repair of 14 [CLI-44]. */
   protected backgroundUpload(ref: BlobRef): void {
     if (!this.online()) return;
-    this.detach(this.shareUpload(ref.keyspaceId, ref.blobId).catch(() => undefined));
+    this.detach(this.shareUpload(ref.keyspaceId, ref.blobId, true).catch(() => undefined));
   }
 
   /** Stages the bytes and uploads them: CreateUpload, the PUT, CommitBlob (09 [READ-86], [READ-88]). Resolves when the blob is committed. */
@@ -250,26 +300,32 @@ export abstract class BlobLayer extends PresenceLayer {
     return ref;
   }
 
-  /** A shared upload of a staged blob: the call of the repair and the call of the app wait for the same work. */
-  private shareUpload(keyspaceId: string, blobId: string): Promise<void> {
-    const key = this.blobKey(keyspaceId, blobId);
+  /**
+   * A shared upload of a staged blob: the call of the repair, the upload before the first send and the call of the app wait for the same work. `forAction`: it is for an action, and gives up
+   * when the blob is withheld (see `CallOptions`); an upload that the app waits for is not shared with it, since it asks again.
+   */
+  private shareUpload(keyspaceId: string, blobId: string, forAction = false): Promise<void> {
+    const key = this.blobKey(keyspaceId, blobId) + (forAction ? "\u0000action" : "");
     let p = this.uploads.get(key);
     if (p === undefined) {
-      p = this.uploadStaged(keyspaceId, blobId, undefined).finally(() => this.uploads.delete(key));
+      p = this.uploadStaged(keyspaceId, blobId, forAction ? { giveUpWhenWithheld: true } : undefined).finally(() => this.uploads.delete(key));
       this.uploads.set(key, p);
     }
     return p;
   }
 
   /** The rounds of the upload of one staged blob (see the SPEC-QUESTION in the header). */
-  private async uploadStaged(keyspaceId: string, blobId: string, o: BlobCallOptions | undefined): Promise<void> {
+  private async uploadStaged(keyspaceId: string, blobId: string, o: CallOptions | undefined): Promise<void> {
     const staged = await this.blobStash.get(keyspaceId, blobId);
     if (staged === undefined) throw new BlobError("BLOB_MISSING", `the engine holds no bytes of the blob ${blobId} to upload (09 [READ-94])`);
     let last = "";
     for (let round = 0; round < MAX_UPLOAD_ROUNDS; round++) {
       this.check(o);
       const up = await this.rpc(keyspaceId, o, () => this.transport.createUpload(create(CreateUploadRequestSchema, { keyspaceId, blobId, sha256: staged.sha256, size: BigInt(staged.size), contentType: staged.contentType })));
-      if (up.alreadyCommitted) return; // 09 [READ-86]: committed with the same digest and size: nothing to send
+      if (up.alreadyCommitted) {
+        this.committed.add(this.blobKey(keyspaceId, blobId));
+        return; // 09 [READ-86]: committed with the same digest and size: nothing to send
+      }
       const sent = await this.put(up, staged, o);
       if (sent === "expired") {
         last = "the signed URL was refused as expired";
@@ -277,6 +333,7 @@ export abstract class BlobLayer extends PresenceLayer {
       }
       try {
         await this.rpc(keyspaceId, o, () => this.transport.commitBlob(create(CommitBlobRequestSchema, { keyspaceId, blobId })));
+        this.committed.add(this.blobKey(keyspaceId, blobId));
         return;
       } catch (e) {
         if (e instanceof BlobError && e.code === "BLOB_MISSING") {
@@ -330,31 +387,91 @@ export abstract class BlobLayer extends PresenceLayer {
       if (err instanceof CanonError) return;
       throw err;
     }
+    // the server says that a blob is not committed: what this run knew of it is stale
+    for (const id of refs) for (const ks of this.stashKeyspaces(e)) this.committed.delete(this.blobKey(ks, id));
+    await this.uploadNamed(e, refs, false);
+  }
+
+  /** The keyspaces in which the bytes of the blobs of an action may be staged: the one that it is in now, and the one that it was authored in, when a split moved it (14 [CLI-52]). */
+  private stashKeyspaces(e: OutboxEntry): Set<string> {
+    return new Set([e.keyspaceId, ...(e.authoredIn !== undefined ? [e.authoredIn] : [])]);
+  }
+
+  /**
+   * Completes or repeats the upload of each blob that `refs` names and the engine holds the bytes of (09 [READ-89], 14 [CLI-44]): for each, the first keyspace of the action that has them.
+   * `skipCommitted`: a blob that this run knows to be committed is not asked about again. A blob that the engine holds no bytes of is left to the server's answer, and an upload that fails is
+   * too: the action meets `BLOB_MISSING` again, and its backoff applies.
+   */
+  private async uploadNamed(e: OutboxEntry, refs: Iterable<string>, skipCommitted: boolean): Promise<void> {
     for (const id of new Set(refs)) {
-      for (const ks of new Set([e.keyspaceId, ...(e.authoredIn !== undefined ? [e.authoredIn] : [])])) {
-        if ((await this.blobStash.get(ks, id)) === undefined) continue;
+      for (const ks of this.stashKeyspaces(e)) {
+        if (!(await this.blobStash.has(ks, id))) continue;
+        if (skipCommitted && this.committed.has(this.blobKey(ks, id))) break;
         try {
-          await this.shareUpload(ks, id);
+          await this.shareUpload(ks, id, true);
         } catch {
-          // the resend meets BLOB_MISSING again; its backoff applies
+          // the send meets BLOB_MISSING or BLOB_PENDING again; its backoff applies
         }
         break;
       }
     }
   }
 
+  /**
+   * 14 [CLI-44], 09 [READ-89]: whether the action may be sent now as far as its blobs go (asked by the sender when everything else lets the action go). An action that names a blob that the
+   * engine holds the bytes of, and does not know to be committed, is first uploaded: the engine finds the staged blobs, completes or repeats each upload, and sends the action after that, so
+   * that the server does not first answer `BLOB_PENDING` or `BLOB_MISSING`. It is the upload that the answer would have caused, made before the first send; the repair of the answer stays for the
+   * action that gets one all the same (a store that lost the object, a blob that a restore took, an upload that failed here). An action that names no blob, or none that is staged here, or only
+   * blobs that are committed, is not delayed.
+   */
+  protected blobsReady(e: OutboxEntry): boolean {
+    const rt = this.rt(e.mutationId);
+    if (rt.blobs === "ready") return true;
+    if (rt.blobs === "checking") return false;
+    const refs = this.content(e)?.blobRefs ?? [];
+    if (refs.every((id) => this.committed.has(this.blobKey(e.keyspaceId, id)))) {
+      rt.blobs = "ready"; // no blob, or the blobs that this run uploaded or found committed
+      return true;
+    }
+    rt.blobs = "checking";
+    this.detach(this.gateBlobs(e, rt, refs));
+    return false;
+  }
+
+  /** The upload before the first send (`blobsReady`): outside the queue, as the calls of the engine are; the entry is sent after it, whatever came of it, by a task of the queue. */
+  private async gateBlobs(e: OutboxEntry, rt: Runtime, refs: readonly string[]): Promise<void> {
+    try {
+      await this.uploadNamed(e, refs, true);
+    } catch (err) {
+      if (this.stopped) return;
+      this.noteInternalError(err); // the stash failed (a database that another tab closed): the action is sent, and the server's answer is the repair's to act on
+    }
+    if (this.stopped) return;
+    await this.run(() => {
+      if (this.runtimes.get(e.mutationId) !== rt) return; // the runtime was reset (a handover): the new one checks again
+      rt.blobs = "ready";
+      this.schedulePump();
+    });
+  }
+
   /** The action retired: "A client keeps a blob's bytes locally until the action that references it is confirmed" (09 [READ-94]): the bytes it staged go. */
   protected onActionRetiredBlobs(e: OutboxEntry): void {
+    this.detach(this.dropStagedOf(e));
+  }
+
+  /** Erases the staged bytes of the blobs that an action names, and what this run knew of their uploads. */
+  protected async dropStagedOf(e: OutboxEntry): Promise<void> {
     let refs: readonly string[];
     try {
       refs = decodeContent(e.content).blobRefs;
     } catch {
       return;
     }
-    if (refs.length === 0) return;
-    const stash = this.blobStash;
     for (const id of new Set(refs)) {
-      for (const ks of new Set([e.keyspaceId, ...(e.authoredIn !== undefined ? [e.authoredIn] : [])])) this.detach(stash.delete(ks, id));
+      for (const ks of this.stashKeyspaces(e)) {
+        this.committed.delete(this.blobKey(ks, id));
+        await this.blobStash.delete(ks, id);
+      }
     }
   }
 
@@ -431,6 +548,7 @@ export abstract class BlobLayer extends PresenceLayer {
     if (reason === "" || new TextEncoder().encode(reason).length > 1024 || reason.includes("\u0000")) throw new LocalRefusal("INVALID", "a DeleteBlob reason is required, at most 1,024 octets, with no U+0000 (09 [READ-91])");
     await this.rpc(keyspaceId, o, () => this.transport.deleteBlob(create(DeleteBlobRequestSchema, { keyspaceId, blobId, reason })));
     this.cache.delete(keyspaceId, blobId);
+    this.committed.delete(this.blobKey(keyspaceId, blobId));
     await this.blobStash.delete(keyspaceId, blobId);
   }
 
@@ -448,8 +566,10 @@ export abstract class BlobLayer extends PresenceLayer {
     } catch {
       id = undefined;
     }
-    if (id !== undefined) this.cache.delete(f.id, id);
-    else this.cache.dropKeyspace(f.id); // a body that names no blob: what the client cannot judge it drops (a download that is needed again is one call)
+    if (id !== undefined) {
+      this.cache.delete(f.id, id);
+      this.committed.delete(this.blobKey(f.id, id));
+    } else this.cache.dropKeyspace(f.id); // a body that names no blob: what the client cannot judge it drops (a download that is needed again is one call)
   }
 
   /** A load with `resumed = false` installed confirmed state: it passed over the `BLOB_DELETED` records below its checkpoint, so the cache of the keyspace goes (14 [CLI-76]). */
@@ -457,9 +577,51 @@ export abstract class BlobLayer extends PresenceLayer {
     this.cache.dropKeyspace(f.id);
   }
 
-  /** The purge list (14 [CLI-66]): the downloaded bytes of the keyspace go. */
-  protected blobsPurge(keyspaceId: string): void {
+  /**
+   * The purge list (14 [CLI-66], [CLI-77]): the downloaded bytes of the keyspace go, and so do the bytes that the engine staged in it for actions, but those that an action held by the engine
+   * still names (see the SPEC-QUESTION in the header, reading A). A stash that fails leaves its bytes where they are and the failure is recorded: it purges nothing more, and stops no other
+   * purge.
+   */
+  protected async blobsPurge(keyspaceId: string): Promise<void> {
     this.cache.dropKeyspace(keyspaceId);
+    for (const k of [...this.committed]) if (k.startsWith(`${keyspaceId}\u0000`)) this.committed.delete(k);
+    try {
+      const named = this.namedByHeldActions();
+      for (const s of await this.blobStash.list()) {
+        if (s.keyspaceId === keyspaceId && !named.has(this.blobKey(s.keyspaceId, s.blobId))) await this.blobStash.delete(s.keyspaceId, s.blobId);
+      }
+    } catch (e) {
+      this.noteInternalError(e);
+    }
+  }
+
+  /** The blobs (as `blobKey`) that an action held by the engine names: the outbox (the locked entries of other principals too), the dead-letter store and the export-hook entries (14 [CLI-28], [CLI-83]). */
+  private namedByHeldActions(): Set<string> {
+    const named = new Set<string>();
+    const add = (keyspaces: Iterable<string>, content: Uint8Array): void => {
+      let refs: readonly string[];
+      try {
+        refs = decodeContent(content).blobRefs;
+      } catch {
+        return;
+      }
+      for (const ks of keyspaces) for (const id of refs) named.add(this.blobKey(ks, id));
+    };
+    for (const e of [...this.entries.values(), ...this.lockedEntries]) add(this.stashKeyspaces(e), e.content);
+    for (const d of this.deadLetters.values()) add([d.keyspaceId], d.content);
+    for (const x of this.exports.values()) add([x.keyspaceId], x.content);
+    return named;
+  }
+
+  /**
+   * 14 [CLI-65]: the sign-out of a personal partition purges what the partition holds, and the bytes that its actions carried are the principal's data: every staged blob goes, and the
+   * downloaded bytes of every keyspace. Fails when the stash could not erase them.
+   */
+  protected async blobsPurgeAll(): Promise<void> {
+    this.uploads.clear();
+    this.committed.clear();
+    this.cache.clear();
+    await this.blobStash.clear();
   }
 
   /** The downloaded blobs that the engine holds, for the sync status and for a test. */
