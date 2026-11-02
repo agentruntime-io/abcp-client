@@ -62,3 +62,80 @@ describe("the model corpora of server/internal/crdt/testdata", () => {
     });
   }
 });
+
+// ---- the document length of 05 [STATE-74] (round 17, D-AP (a)), against a real Yjs store ----
+//
+// yjs-doclen.json (made by testdata/gen: the twin of the server's test over it) holds histories of updates and, after each, the length of the
+// document that a real Yjs 13.6.33 store gives, its structs cut and merged as [STATE-74] says and each content counted in its canonical form.
+// Yjs integrates what the spec does not (a no-op for good), so a history is compared up to its first such update, as the Go test does.
+
+interface DocLenCorpus {
+  histories: { roots: Record<string, string>; updates: string[]; lengths: number[] }[];
+}
+
+describe("05 [STATE-74] document length: histories measured on a real Yjs store (server/internal/crdt/testdata/yjs-doclen.json)", () => {
+  const path = dir + "yjs-doclen.json";
+  const rootsOf = (h: { roots: Record<string, string> }): Roots => new Map(Object.entries(h.roots) as [string, RootType][]);
+  const load = (): DocLenCorpus => JSON.parse(readFileSync(path, "utf8")) as DocLenCorpus;
+
+  it("is there", () => {
+    expect(existsSync(path)).toBe(true);
+    const corpus = load();
+    expect(corpus.histories.length).toBeGreaterThanOrEqual(100);
+    for (const h of corpus.histories) expect(h.lengths.length).toBe(h.updates.length);
+  });
+
+  it("the document length after every update of every history is the one that Yjs's store gives", () => {
+    let compared = 0;
+    let stopped = 0;
+    let largest = 0;
+    corpus: for (const [hi, h] of load().histories.entries()) {
+      const roots = rootsOf(h);
+      const doc = new Doc();
+      expect(doc.documentLength(), `history ${hi}: the empty key`).toBe(2);
+      for (let i = 0; i < h.updates.length; i++) {
+        const res = doc.apply(fromHex(h.updates[i] as string), roots);
+        if (res.verdict === "SCHEMA_INVALID") throw new Error(`history ${hi} update ${i}: ${res.reason}`);
+        if (res.verdict === "NOOP_FOR_GOOD") {
+          stopped++;
+          continue corpus; // stock Yjs integrates what the spec does not: only the prefix is compared
+        }
+        expect(doc.documentLength(), `history ${hi} update ${i} (${h.updates[i]})`).toBe(h.lengths[i]);
+        compared++;
+        largest = Math.max(largest, doc.documentLength());
+      }
+    }
+    expect(compared).toBeGreaterThan(7000);
+    expect(stopped).toBeGreaterThan(0);
+    expect(largest).toBeGreaterThan(500);
+  });
+
+  it("a clone that takes the update and the Doc that was cloned keep their own lengths (02 [ARC-28]): the Doc, the clone, and the one that goes on, by turns", () => {
+    let compared = 0;
+    corpus: for (const [hi, h] of load().histories.entries()) {
+      const roots = rootsOf(h);
+      let doc = new Doc();
+      for (let i = 0; i < h.updates.length; i++) {
+        const bytes = fromHex(h.updates[i] as string);
+        const before = doc.documentLength();
+        // the fold clones the Doc of a key before it applies an update to it, and a reader keeps the Doc that it holds
+        const fork = doc.clone();
+        const res = fork.apply(bytes, roots);
+        if (res.verdict === "NOOP_FOR_GOOD") continue corpus;
+        expect(res.verdict, `history ${hi} update ${i}`).not.toBe("SCHEMA_INVALID");
+        expect(doc.documentLength(), `history ${hi} update ${i}: the length of the Doc that was cloned`).toBe(before);
+        expect(fork.documentLength(), `history ${hi} update ${i} (${h.updates[i]}): the clone that took the update`).toBe(h.lengths[i]);
+        // the Doc that was cloned takes the same update, in place, and is measured as the clone is, and the clone does not move
+        const again = doc.clone();
+        again.apply(bytes, roots);
+        expect(again.documentLength(), `history ${hi} update ${i}: a second clone`).toBe(h.lengths[i]);
+        expect(fork.documentLength(), `history ${hi} update ${i}: the first clone, after the second took the update`).toBe(h.lengths[i]);
+        expect(doc.documentLength(), `history ${hi} update ${i}: the Doc, after its clones took the update`).toBe(before);
+        compared++;
+        // the history goes on from one of them, by turns: the clones share what the Doc that they came from made
+        doc = i % 2 === 0 ? fork : again;
+      }
+    }
+    expect(compared).toBeGreaterThan(7000);
+  });
+});

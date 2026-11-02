@@ -14,6 +14,7 @@ export type RefusalReason =
   | "any-limits" // Values: depth over 32 or more than 1,024 members
   | "any-int-range" // Values: an integer above 2^53-1 in magnitude
   | "any-float" // Values: NaN or ±Infinity
+  | "any-duplicate" // Values: a lib0 object that holds a member name twice (round 17)
   | "content-ref" // Parse: a content ref that is unknown
   | "content-json" // Parse: a ContentJSON (2)
   | "content-doc" // Parse: a ContentDoc (9)

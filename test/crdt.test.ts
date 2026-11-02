@@ -187,6 +187,13 @@ describe("05 [STATE-71], [STATE-76], [STATE-41] CRDT fold (crdt-fold vectors)", 
       expect(svPairs(doc)).toEqual(v.expect.state_vector);
       expect(dsEntries(doc)).toEqual(v.expect.delete_set);
       expect(toHex(doc.canonical())).toBe(v.expect.canonical);
+      // 05 [STATE-74] (round 17, D-AP (a)): the length in octets of the key's document, when the vector states it (crdt-doclen-001 to -005)
+      if (v.expect.document_length !== undefined) {
+        expect(doc.documentLength(), `${v.id}: the document length`).toBe(v.expect.document_length);
+        // it is a function of the key's state: a clone has it, and the Doc that was cloned keeps it when the clone goes on
+        const copy = doc.clone();
+        expect(copy.documentLength(), `${v.id}: the length of a clone`).toBe(v.expect.document_length);
+      }
       // the per-key state hash of the key at its version, a CRDT key hashing its canonical form
       const ks = { key: v.key as string, state: StateValue as KeyValueState, encoding: "yjs/v1", content: doc.canonical(), version: f.seq };
       expect(toHex(keyStatePreimage(ks))).toBe(v.expect.state_hash_preimage);
@@ -195,6 +202,40 @@ describe("05 [STATE-71], [STATE-76], [STATE-41] CRDT fold (crdt-fold vectors)", 
       if (v.expect.content) expectDocument(v.id, v.crdt_roots, yDocOf(v.crdt_roots, f.integrated), v.expect.content);
     });
   }
+});
+
+describe("05 [STATE-74] document length (crdt-doclen vectors, expect.document_length)", () => {
+  const withLength = ofKind("crdt-fold").filter((v) => v.expect?.document_length !== undefined);
+  it("the vectors that state it are crdt-doclen-001 to -005, and every one is a crdt-fold vector that the loop above checks", () => {
+    expect(withLength.map((v) => v.id)).toEqual(["crdt-doclen-001", "crdt-doclen-002", "crdt-doclen-003", "crdt-doclen-004", "crdt-doclen-005"]);
+    expect(all.filter((v) => v.expect?.document_length !== undefined).length).toBe(withLength.length);
+  });
+  for (const v of withLength) {
+    it(`${v.id}: ${v.expect.document_length} octets, at the end of the steps and after each step that has a length of its own`, () => {
+      const doc = new Doc();
+      const f = runSteps(doc, toRoots(v.crdt_roots), v.steps, 0);
+      expect(doc.documentLength()).toBe(v.expect.document_length);
+      // the Doc folded at once from the integrated updates (as a rebuild of the key does) has the same length
+      const again = new Doc();
+      for (const b of f.integrated) again.fold(b);
+      expect(again.documentLength()).toBe(v.expect.document_length);
+      // a Doc that is cloned before each update (as the fold does) has it too
+      let cur = new Doc();
+      for (const b of f.integrated) {
+        const next = cur.clone();
+        next.fold(b);
+        cur = next;
+      }
+      expect(cur.documentLength()).toBe(v.expect.document_length);
+    });
+  }
+  it("the empty key has the empty document, 0x00 0x00, of length 2, and a key whose only update is a no-op for good has it too", () => {
+    const doc = new Doc();
+    expect(doc.documentLength()).toBe(2);
+    // client 5 inserts "a" with origin 9:0, which nothing defines: a no-op for good
+    expect(doc.fold(fromHex("01010500" + "84" + "0900" + "0161" + "00")).verdict).toBe("NOOP_FOR_GOOD");
+    expect(doc.documentLength()).toBe(2);
+  });
 });
 
 describe("05 [STATE-74] base validity (crdt-base vectors)", () => {

@@ -509,3 +509,473 @@ describe("02 [ARC-46]: the walk that reads the parent of an item through its nei
     expect(hiddenIn(e, n, 0)).toBe(true);
   });
 });
+
+// ---- 05 [STATE-71] (Values), round 17: a lib0 object holds each member name once (the twin of TestSTATE71_AnyObjectMemberNamesOccurOnce) ----
+//
+// No conformance vector covers it (the two reference models count a duplicate once; the text rejects it: a recorded spec question), so these are the tests.
+
+describe("05 [STATE-71] (Values, round 17): the member names of a lib0 any object occur once", () => {
+  /** One ContentAny item of one value under the root a, as the Go test builds it: info 0x08, parent-info 1, the root name, a count of 1, the value. */
+  const anyItem = (...vals: number[][]): Uint8Array => update([group(5, 0, cat([0x08, 1], lstr("a"), uv(1), ...vals))]);
+  /** An object whose members are the names, each with the integer 1. */
+  const obj = (...members: string[]): number[] => cat([118], uv(members.length), ...members.map((m) => cat(lstr(m), [125, 1])));
+  const reasonOf = (b: Uint8Array): string => {
+    try {
+      parseUpdate(b);
+      return "";
+    } catch (e) {
+      return (e as { reason?: string }).reason ?? String(e);
+    }
+  };
+
+  for (const [name, members, ok] of [
+    ["none", [], true],
+    ["one", ["a"], true],
+    ["two", ["a", "b"], true],
+    ["the same twice", ["a", "a"], false],
+    ["apart", ["a", "b", "c", "a"], false],
+    ["nine, the last twice", ["a", "b", "c", "d", "e", "f", "g", "h", "h"], false],
+    ["nine, the ninth the first", ["a", "b", "c", "d", "e", "f", "g", "h", "a"], false],
+    ["ten distinct", ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"], true],
+    ["names of other lengths", ["a", "ab", "abc", "b", "ba"], true],
+    ["empty names twice", ["", ""], false],
+    ["a name that is not ASCII, twice", ["é", "x", "é"], false],
+    ["two names that differ only in the case", ["a", "A"], true],
+  ] as [string, string[], boolean][]) {
+    it(`${name}: ${ok ? "well formed" : "any-duplicate"}`, () => {
+      const b = anyItem(obj(...members));
+      expect(reasonOf(b)).toBe(ok ? "" : "any-duplicate");
+      const r = new Doc().fold(b);
+      if (ok) expect(r.verdict).toBe("APPLIED");
+      else expect(r).toMatchObject({ verdict: "SCHEMA_INVALID", reason: "any-duplicate" });
+    });
+  }
+
+  it("1,024 distinct names are within the member limit, a duplicate among 1,024 is a duplicate, and 1,025 are over the limit", () => {
+    const names = Array.from({ length: 1024 }, (_, i) => `k${i}`);
+    expect(reasonOf(anyItem(obj(...names)))).toBe("");
+    expect(reasonOf(anyItem(obj(...names.slice(0, 1023), "k0")))).toBe("any-duplicate");
+    expect(reasonOf(anyItem(obj(...names, "k1024")))).toBe("any-limits");
+  });
+
+  it("a nested object has its own names, and a duplicate inside a nested object or an array is found", () => {
+    const outer = (a: number[], b: number[]): number[] => cat([118, 2], lstr("a"), a, lstr("b"), b);
+    expect(reasonOf(anyItem(outer(obj("a"), obj("a", "a"))))).toBe("any-duplicate");
+    expect(reasonOf(anyItem(outer(obj("a"), obj("a"))))).toBe("");
+    expect(reasonOf(anyItem(cat([117, 2], obj("a", "a"), obj("a"))))).toBe("any-duplicate");
+    expect(reasonOf(anyItem(cat([117, 2], obj("a"), obj("a"))))).toBe("");
+  });
+
+  it("the check runs in the order of the octets: a duplicate name before a fault of the same object, and a fault before a later duplicate", () => {
+    // {a: 1, a: <tag 99>}: the second name is the duplicate, and its value is never read
+    expect(reasonOf(anyItem(cat([118, 2], lstr("a"), [125, 1], lstr("a"), [99])))).toBe("any-duplicate");
+    // {a: <tag 99>, a: 1}: the first value is the fault
+    expect(reasonOf(anyItem(cat([118, 2], lstr("a"), [99], lstr("a"), [125, 1])))).toBe("any-tag");
+  });
+});
+
+// ---- 05 [STATE-74] (round 17, D-AP (a)): the document length, beyond the vectors and the Yjs store (the twin of server/internal/crdt/measure_test.go) ----
+
+describe("05 [STATE-74] document length: each content in its one canonical form", () => {
+  const roots: Roots = new Map([
+    ["a", "array"],
+    ["t", "text"],
+  ]);
+  const lengthOf = (...updates: Uint8Array[]): number => {
+    const d = new Doc();
+    for (const b of updates) {
+      const r = d.apply(b, roots);
+      expect(r.verdict, `${r.reason ?? ""} ${r.error?.message ?? ""}`).toBe("APPLIED");
+    }
+    return d.documentLength();
+  };
+  /** The lib0 varInt of a number: 6 bits in the first octet and the sign in 0x40, then 7 in each. */
+  const varInt = (mag: number, neg = false): number[] => {
+    const out: number[] = [];
+    let first = mag % 64;
+    mag = Math.floor(mag / 64);
+    if (neg) first |= 0x40;
+    if (mag > 0) first |= 0x80;
+    out.push(first);
+    while (mag > 0) {
+      let b = mag % 128;
+      mag = Math.floor(mag / 128);
+      if (mag > 0) b |= 0x80;
+      out.push(b);
+    }
+    return out;
+  };
+  const f64 = (x: number): number[] => [...new Uint8Array(new Float64Array([x]).buffer)].reverse();
+  const f32 = (x: number): number[] => [...new Uint8Array(new Float32Array([x]).buffer)].reverse();
+  /** An update of one ContentAny item under the root a: a header of 4 (info, parent-info, the name "a"), the count and the values. */
+  const anyOf = (...vals: number[][]): Uint8Array => update([group(5, 0, cat([0x08, 1], lstr("a"), uv(vals.length), ...vals))]);
+  /** The document of one client's group of one struct of `struct` octets: the count of clients, the group's count, id and first clock, the struct, the empty delete set. */
+  const docOf = (struct: number): number => 1 + 3 + struct + 1;
+
+  it("the empty document is of 2 octets, and a GC is a byte and a varUint of its length", () => {
+    expect(new Doc().documentLength()).toBe(2);
+    expect(lengthOf(update([group(5, 0, gcOf(1))]))).toBe(docOf(2));
+    expect(lengthOf(update([group(5, 0, gcOf(300))]))).toBe(docOf(1 + 2));
+  });
+
+  const values: [string, number[], number][] = [
+    ["an integer 1 under tag 125", [125, 1], 2],
+    ["a negative zero under tag 125", [125, 0x40], 2],
+    ["64, which takes two octets as a varInt", [125, ...varInt(64)], 3],
+    ["-64", [125, ...varInt(64, true)], 3],
+    ["8191, two octets", [125, ...varInt(8191)], 3],
+    ["8192, three octets", [125, ...varInt(8192)], 4],
+    ["2^31-1, five octets as a varInt", [125, ...varInt(2147483647)], 6],
+    ["-(2^31-1)", [125, ...varInt(2147483647, true)], 6],
+    ["2^31 under tag 125: another number, which a float32 holds", [125, ...varInt(2147483648)], 5],
+    ["3000000001 under tag 125: no float32 holds it", [125, ...varInt(3000000001)], 9],
+    ["2^53-1 under tag 125", [125, ...varInt(9007199254740991)], 9],
+    ["1 under tag 123 (a float64): an integer goes under 125", [123, ...f64(1)], 2],
+    ["-0 under tag 123", [123, ...f64(-0)], 2],
+    ["0.5 under tag 123: a float32 holds it", [123, ...f64(0.5)], 5],
+    ["0.1 under tag 123", [123, ...f64(0.1)], 9],
+    ["1e300", [123, ...f64(1e300)], 9],
+    ["2^32 under tag 123: a float32 holds it", [123, ...f64(2 ** 32)], 5],
+    ["2^32+256 under tag 123: a float32 does not", [123, ...f64(2 ** 32 + 256)], 9],
+    ["16777217.5, which no float32 holds", [123, ...f64(16777217.5)], 9],
+    ["3 under tag 124 (a float32): an integer goes under 125", [124, ...f32(3)], 2],
+    ["0.5 under tag 124", [124, ...f32(0.5)], 5],
+    ["an int64 of 5 under tag 122 stays under 122", [122, 0, 0, 0, 0, 0, 0, 0, 5], 9],
+    ["a string of two octets", [119, 2, 104, 105], 4],
+    ["a string that is not ASCII: the octets of its UTF-8", [119, ...lstr("é€")], 1 + 1 + 5],
+    ["null", [126], 1],
+    ["undefined", [127], 1],
+    ["true", [120], 1],
+    ["false", [121], 1],
+    ["a Uint8Array of two octets", [116, 2, 1, 2], 4],
+    ["an array of an integer and a string", [117, 2, 125, 1, 119, 1, 120], 1 + 1 + 2 + 3],
+    ["an object with one member", cat([118, 1], lstr("k"), [125, 1]), 1 + 1 + 2 + 2],
+    ["an empty object", [118, 0], 2],
+  ];
+  for (const [name, enc, size] of values) {
+    it(`a ContentAny value is counted by its value: ${name}: ${size} octets`, () => {
+      expect(lengthOf(anyOf(enc))).toBe(docOf(4 + 1 + size));
+    });
+  }
+
+  it("a ContentAny of several values counts their octets and its count", () => {
+    const some = values.slice(0, 12);
+    expect(lengthOf(anyOf(...some.map(([, enc]) => enc)))).toBe(docOf(4 + 1 + some.reduce((n, [, , size]) => n + size, 0)));
+  });
+
+  it("a ContentString is its UTF-8, and a count of more than 127 octets takes two", () => {
+    expect(lengthOf(update([group(5, 0, rootText("t", "abc"))]))).toBe(docOf(4 + 1 + 3));
+    expect(lengthOf(update([group(5, 0, rootText("t", "é€😀"))]))).toBe(docOf(4 + 1 + 2 + 3 + 4)); // 9 octets
+    expect(lengthOf(update([group(5, 0, rootText("t", "a".repeat(200)))]))).toBe(docOf(4 + 2 + 200));
+  });
+
+  it("a ContentEmbed and a ContentFormat count the RFC 8785 form of their JSON text, whatever the update holds", () => {
+    // {"b": 1, "a": [1.0, "x"]} is {"a":[1,"x"],"b":1}, 19 octets
+    const embed = update([group(5, 0, cat([0x05, 1], lstr("t"), lstr('{"b": 1, "a":  [1.0, "x"]}')))]);
+    expect(lengthOf(embed)).toBe(docOf(4 + 1 + 19));
+    const sorted = update([group(5, 0, cat([0x05, 1], lstr("t"), lstr('{"a":[1,"x"],"b":1}')))]);
+    expect(lengthOf(sorted)).toBe(docOf(4 + 1 + 19));
+    // the key "bold" and the value " true " (canonical: true)
+    const format = update([group(5, 0, cat([0x06, 1], lstr("t"), lstr("bold"), lstr(" true ")))]);
+    expect(lengthOf(format)).toBe(docOf(4 + 5 + 5));
+    // 1e2 is 100, 1.50 is 1.5, and an escape that has a shorter form is written as that
+    const num = update([group(5, 0, cat([0x05, 1], lstr("t"), lstr('[1e2, 1.50, "\\u0041"]')))]);
+    expect(lengthOf(num)).toBe(docOf(4 + 1 + '[100,1.5,"A"]'.length));
+  });
+
+  it("a ContentBinary and a ContentType count their own octets, and the name of a type that has one", () => {
+    expect(lengthOf(update([group(5, 0, cat([0x03, 1], lstr("a"), [2, 1, 2]))]))).toBe(docOf(4 + 3));
+    expect(lengthOf(update([group(5, 0, cat([0x07, 1], lstr("a"), uv(0)))]))).toBe(docOf(4 + 1)); // a YArray
+    expect(lengthOf(update([group(5, 0, cat([0x07, 1], lstr("a"), uv(3), lstr("div")))]))).toBe(docOf(4 + 1 + 4)); // an XmlElement named div
+  });
+
+  it("the groups are in descending order of client, and the counts of clients and of delete-set clients are varUints", () => {
+    // 130 clients of one GC each: clients 1 to 127 have a one-octet id and 128 to 130 a two-octet one
+    const groups: number[][] = [];
+    for (let c = 130; c >= 1; c--) groups.push(group(c, 0, gcOf(1)));
+    // the count of clients (130: two octets), 130 groups of (a count, the id, the clock, a GC of 2), and the empty delete set
+    expect(lengthOf(update(groups))).toBe(2 + 127 * 5 + 3 * 6 + 1);
+    // with every id deleted a GC stays a GC, and the delete set holds 130 groups of (client, one range, clock, length)
+    const dsGroups: number[][] = [];
+    for (let c = 130; c >= 1; c--) dsGroups.push(ds(c, 0, 1));
+    expect(lengthOf(update(groups, ...dsGroups))).toBe(2 + 127 * 5 + 3 * 6 + 2 + 127 * 4 + 3 * 5);
+  });
+});
+
+describe("05 [STATE-74] document length: Cuts, Merges and the cover of a hidden parent", () => {
+  const roots: Roots = new Map([
+    ["t", "text"],
+    ["a", "array"],
+  ]);
+
+  it("deleting a ContentType item hides what has it as its parent, in every client: the children are GCs (the twin of the Go test)", () => {
+    const typ = cat([0x07, 1], lstr("a"), uv(0)); // 5:0, an array type under the root a
+    const child = textIn(5, 0, "ab"); // 5:1..2, text whose parent is the type 5:0
+    const other = textIn(5, 0, "xyz"); // 6:0..2
+    const doc = new Doc();
+    expect(doc.apply(update([group(6, 0, other), group(5, 0, typ, child)]), roots).verdict).toBe("APPLIED");
+    // 2 clients; group 6: (1 + 1 + 1) + (header 4 + count 1 + 3); group 5: (1 + 1 + 1) + (the type: 4 + 1) + (the child: 4 + 1 + 2); the empty delete set
+    const before = 1 + (3 + 8) + (3 + 5 + 7) + 1;
+    expect(doc.documentLength()).toBe(before);
+    const next = doc.clone();
+    expect(next.apply(update([], ds(5, 0, 1)), roots).verdict).toBe("APPLIED");
+    // 5:0 is a ContentDeleted (header 4, length 1), 5:1..2 and 6:0..2 are GCs (2 octets each); the delete set: 1 client, 1 range
+    const after = 1 + (3 + 2) + (3 + 5 + 2) + (1 + 4);
+    expect(next.documentLength()).toBe(after);
+    expect(doc.documentLength(), "the Doc that was cloned does not move under its clone").toBe(before);
+    expect(next.clone().documentLength()).toBe(after);
+  });
+
+  it("a type that is deleted after a dozen clients have put text under it, on Docs that a reader measured at each step", () => {
+    const typ = cat([0x07, 1], lstr("a"), uv(0));
+    let doc = new Doc();
+    doc.apply(update([group(5, 0, typ)]), roots);
+    for (let c = 0; c < 12; c++) {
+      const next = doc.clone();
+      expect(next.apply(update([group(100 + c, 0, textIn(5, 0, "k".repeat(c + 1)))]), roots).verdict).toBe("APPLIED");
+      doc = next;
+      doc.documentLength(); // a reader measures every Doc
+    }
+    const live = doc.documentLength();
+    const hidden = doc.clone();
+    hidden.apply(update([], ds(5, 0, 1)), roots);
+    // each child is a GC of its own client's group (a count, the id, the clock, 2 octets); the type is a ContentDeleted; the delete set has one range
+    expect(hidden.documentLength()).toBe(1 + 12 * (3 + 2) + (3 + 5) + (1 + 4));
+    expect(doc.documentLength()).toBe(live);
+    expect(live).toBeGreaterThan(hidden.documentLength());
+  });
+
+  it("a text typed one character at a time is one struct, however many updates and clones it took (Merges)", () => {
+    const n = 3000;
+    let doc = new Doc();
+    for (let i = 0; i < n; i++) {
+      const next = doc.clone();
+      const b = i === 0 ? update([group(7, 0, rootText("t", "a"))]) : update([group(7, i, textAfter(7, i - 1, "a"))]);
+      expect(next.apply(b, roots).verdict).toBe("APPLIED");
+      doc = next;
+    }
+    // one struct: a header of 4, the count of 3000 octets (two octets), the text; the group's count, client 7 and first clock
+    const one = 1 + (1 + 1 + 1 + 4 + 2 + n) + 1;
+    expect(doc.documentLength()).toBe(one);
+    expect(doc.defs.get(7)).toHaveLength(1);
+    // another client puts one character between the 2nd and the 3rd: [STATE-74] cuts only where the cover changes, so client 7 stays one struct
+    const mid = doc.clone();
+    expect(mid.apply(update([group(8, 0, cat([0xc4], uv(7), uv(1), uv(7), uv(2), lstr("b")))]), roots).verdict).toBe("APPLIED");
+    const eight = 1 + 2 + 2 + 1 + 1; // the info byte, the origin 7:1, the right origin 7:2, the text "b" (a count and an octet)
+    expect(mid.documentLength()).toBe(1 + (1 + 1 + 1 + eight) + (1 + 1 + 1 + 4 + 2 + n) + 1);
+    expect(doc.documentLength(), "the Doc that was cloned").toBe(one);
+  });
+
+  it("a clone that extends a run of GCs, or a chained text, in place leaves the Doc that it was cloned from as it was (02 [ARC-28])", () => {
+    const d = new Doc();
+    expect(d.apply(update([group(1, 0, gcOf(2))]), roots).verdict).toBe("APPLIED");
+    expect(d.apply(update([group(2, 0, rootText("t", "ab"))]), roots).verdict).toBe("APPLIED");
+    // clients 2; group 2: (1+1+1) + (header 4 + count 1 + 2); group 1: (1+1+1) + a GC of 2; the empty delete set
+    const before = 1 + (3 + 7) + (3 + 2) + 1;
+    expect(d.documentLength()).toBe(before);
+    // 130 GCs of one id each, in one group: they are one run, and join the GC that the Doc has; "c" and "d" typed one by one join "ab"
+    const gcs = Array.from({ length: 130 }, () => gcOf(1));
+    const c = d.clone();
+    expect(c.apply(update([group(2, 2, textAfter(2, 1, "c"), textAfter(2, 2, "d")), group(1, 2, ...gcs)]), roots).verdict).toBe("APPLIED");
+    // the GC is of 132 ids (a varUint of two octets: 3); the text is of 4 octets
+    const after = 1 + (3 + 4 + 1 + 4) + (3 + 3) + 1;
+    expect(c.documentLength()).toBe(after);
+    expect(d.documentLength(), "the Doc that was cloned").toBe(before);
+    // a clone of the clone does it again, and neither of the two before it moves
+    const e = c.clone();
+    expect(e.apply(update([group(2, 4, textAfter(2, 3, "e")), group(1, 132, gcOf(200))]), roots).verdict).toBe("APPLIED");
+    expect(e.documentLength()).toBe(1 + (3 + 4 + 1 + 5) + (3 + 3) + 1);
+    expect(c.documentLength()).toBe(after);
+    expect(d.documentLength()).toBe(before);
+  });
+
+  it("a text that is deleted in the middle is three structs: the text, a ContentDeleted whose origin is the last id before it, the text again", () => {
+    const d = new Doc();
+    expect(d.apply(update([group(7, 0, rootText("t", "abcdefghij"))], ds(7, 3, 4)), roots).verdict).toBe("APPLIED");
+    // "abc" (header 4, count 1, 3), a ContentDeleted of 4 (info, origin 7:2 = 2, length 1 = 4), "hij" (info, origin 7:6 = 2, count 1, 3 = 7)
+    // the group: a count of 3, the client, the clock; the delete set: a count of 1 and (client, 1 range, clock 3, length 4)
+    expect(d.documentLength()).toBe(1 + (3 + (4 + 1 + 3) + (1 + 2 + 1) + (1 + 2 + 1 + 3)) + (1 + 4));
+  });
+});
+
+// ---- the document length against a count made id by id: a text and a ContentAny of one client, cut at random ----
+
+describe("05 [STATE-74] document length: a text and a ContentAny cut by random deletions, against a count made id by id", () => {
+  const roots: Roots = new Map([
+    ["t", "text"],
+    ["a", "array"],
+  ]);
+  const client = 300; // a two-octet client id
+  const uvl = (n: number): number => uv(n).length;
+
+  let seed = 20260511;
+  const rnd = (n: number): number => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    return Math.floor((seed / 2 ** 32) * n);
+  };
+
+  /**
+   * The length that the steps of 05 [STATE-74] give for the ids of one client, typed as one struct (its header is `hdr0`) of which `deleted`
+   * are deleted, counted one id at a time: one struct for each run of ids of one cover, a struct after the first has an info byte and the last
+   * id before it as its origin; a live run counts its octets (and for a ContentAny its count), a deleted one its length; then the delete set.
+   */
+  function perId(octets: number[], deleted: boolean[], hdr0: number, isAny: boolean): number {
+    let structs = 0;
+    let sum = 0;
+    const ranges: [number, number][] = [];
+    for (let i = 0; i < octets.length; ) {
+      let j = i;
+      while (j < octets.length && deleted[j] === deleted[i]) j++;
+      const hdr = i === 0 ? hdr0 : 1 + uvl(client) + uvl(i - 1);
+      if (deleted[i]) {
+        sum += hdr + uvl(j - i);
+        ranges.push([i, j - i]);
+      } else {
+        let b = 0;
+        for (let k = i; k < j; k++) b += octets[k] as number;
+        sum += isAny ? hdr + uvl(j - i) + b : hdr + uvl(b) + b;
+      }
+      structs++;
+      i = j;
+    }
+    const group = uvl(structs) + uvl(client) + 1 + sum;
+    let dsn = 0;
+    if (ranges.length > 0) dsn = uvl(client) + uvl(ranges.length) + ranges.reduce((n, [c, l]) => n + uvl(c) + uvl(l), 0);
+    return 1 + group + 1 + dsn; // one client, its group, the count of delete-set clients (0 or 1: one octet), its group
+  }
+
+  /** Applies one to three updates of deletions, each on a clone, to doc: the Doc that has them, and the ids that they hold. */
+  function deleteSome(doc: Doc, bounds: number[], n: number): { doc: Doc; deleted: boolean[] } {
+    const deleted = new Array<boolean>(n).fill(false);
+    let cur = doc;
+    for (let k = 1 + rnd(3); k > 0; k--) {
+      const ranges: number[] = [];
+      for (let r = 1 + rnd(4); r > 0; r--) {
+        const a = rnd(bounds.length - 1); // a boundary between code points, or between values
+        const b = a + 1 + rnd(Math.min(6, bounds.length - 1 - a));
+        const lo = bounds[a] as number;
+        const hi = bounds[b] as number;
+        ranges.push(lo, hi - lo);
+        for (let i = lo; i < hi; i++) deleted[i] = true;
+      }
+      const next = cur.clone();
+      const res = next.apply(update([], ds(client, ...ranges)), roots);
+      expect(["APPLIED", "NO_EFFECT"], `${res.reason ?? ""} ${res.error?.message ?? ""}`).toContain(res.verdict);
+      cur = next;
+    }
+    return { doc: cur, deleted };
+  }
+
+  const none = (n: number): boolean[] => new Array<boolean>(n).fill(false);
+  const flags = (d: boolean[]): string => d.map((x) => (x ? 1 : 0)).join("");
+  /** The octets of each UTF-16 unit of a string, and the unit offset of each code point boundary. */
+  function unitsOf(chars: string[]): { octets: number[]; bounds: number[] } {
+    const octets: number[] = [];
+    const bounds: number[] = [0];
+    for (const ch of chars) {
+      const cp = ch.codePointAt(0) as number;
+      if (cp >= 0x10000) octets.push(2, 2);
+      else octets.push(cp < 0x80 ? 1 : cp < 0x800 ? 2 : 3);
+      bounds.push(octets.length);
+    }
+    return { octets, bounds };
+  }
+
+  it("a text of characters of one to four octets: 1, 2, 3, and a pair of surrogates (two units of two octets each)", () => {
+    const alphabet = ["a", "b", "é", "ß", "€", "中", "😀", "𝒳"];
+    for (let n = 0; n < 400; n++) {
+      const chars = Array.from({ length: 1 + rnd(30) }, () => alphabet[rnd(alphabet.length)] as string);
+      const { octets, bounds } = unitsOf(chars);
+      const text = chars.join("");
+      const base = new Doc();
+      expect(base.apply(update([group(client, 0, rootText("t", text))]), roots).verdict).toBe("APPLIED");
+      expect(base.documentLength(), JSON.stringify(text)).toBe(perId(octets, none(octets.length), 4, false));
+      const { doc, deleted } = deleteSome(base, bounds, octets.length);
+      expect(doc.documentLength(), `${JSON.stringify(text)} deleted ${flags(deleted)}`).toBe(perId(octets, deleted, 4, false));
+      expect(base.documentLength(), "the Doc that was cloned").toBe(perId(octets, none(octets.length), 4, false));
+    }
+  });
+
+  it("a ContentAny of values of different sizes", () => {
+    const vals: [number[], number][] = [
+      [[125, 1], 2],
+      [[125, 0x80, 0x01], 3],
+      [[123, 0x3f, 0xb9, 0x99, 0x99, 0x99, 0x99, 0x99, 0x9a], 9],
+      [[124, 0x3f, 0, 0, 0], 5],
+      [[119, 3, 97, 98, 99], 5],
+      [[126], 1],
+      [[116, 2, 1, 2], 4],
+      [[118, 1, 1, 107, 125, 1], 6],
+    ];
+    for (let n = 0; n < 400; n++) {
+      const picked = Array.from({ length: 1 + rnd(24) }, () => vals[rnd(vals.length)] as [number[], number]);
+      const octets = picked.map(([, size]) => size);
+      const bounds = octets.map((_, i) => i).concat([octets.length]);
+      const base = new Doc();
+      const item = cat([0x08, 1], lstr("a"), uv(picked.length), ...picked.map(([enc]) => enc));
+      expect(base.apply(update([group(client, 0, item)]), roots).verdict).toBe("APPLIED");
+      expect(base.documentLength()).toBe(perId(octets, none(octets.length), 4, true));
+      const { doc, deleted } = deleteSome(base, bounds, octets.length);
+      expect(doc.documentLength(), `deleted ${flags(deleted)}`).toBe(perId(octets, deleted, 4, true));
+    }
+  });
+
+  it("a text typed in pieces by several updates, whose characters are of different widths (the pieces chain), and cut across the pieces", () => {
+    const alphabet = ["a", "é", "€", "😀"];
+    for (let n = 0; n < 200; n++) {
+      const pieces: string[] = [];
+      for (let p = 1 + rnd(5); p > 0; p--) pieces.push(Array.from({ length: 1 + rnd(5) }, () => alphabet[rnd(alphabet.length)] as string).join(""));
+      let doc = new Doc();
+      let clock = 0;
+      for (const piece of pieces) {
+        const b = clock === 0 ? update([group(client, 0, rootText("t", piece))]) : update([group(client, clock, textAfter(client, clock - 1, piece))]);
+        const next = doc.clone();
+        expect(next.apply(b, roots).verdict).toBe("APPLIED");
+        doc = next;
+        clock += unitsOf(Array.from(piece)).octets.length;
+      }
+      const { octets, bounds } = unitsOf(Array.from(pieces.join("")));
+      // the pieces are one struct, as one update of the whole text would be (the header of the first piece, the octets of all)
+      expect(doc.documentLength(), JSON.stringify(pieces)).toBe(perId(octets, none(octets.length), 4, false));
+      const { doc: cut, deleted } = deleteSome(doc, bounds, octets.length);
+      expect(cut.documentLength(), `${JSON.stringify(pieces)} deleted ${flags(deleted)}`).toBe(perId(octets, deleted, 4, false));
+    }
+  });
+});
+
+describe("05 [STATE-74] document length: its cost follows the shape of the document, not the number of its updates", () => {
+  const roots: Roots = new Map([["t", "text"]]);
+
+  it("a text of 20,000 characters typed by two clients in turns (no two chain), then every third id of one client deleted", () => {
+    const n = 20_000;
+    let doc = new Doc();
+    const next: [number, number] = [0, 0]; // the next clock of clients 1 and 2
+    let prev: [number, number] | null = null; // the id of the character before
+    for (let i = 0; i < n; i++) {
+      const c = i % 2 === 0 ? 2 : 1; // client 2 types the first character (the root's), then 1, 2, 1, ...
+      const clock = next[c - 1] as number;
+      const body = prev === null ? rootText("t", "a") : textAfter(prev[0], prev[1], i % 3 === 0 ? "é" : "a");
+      const cl = doc.clone();
+      expect(cl.apply(update([group(c, clock, body)]), roots).verdict).toBe("APPLIED");
+      doc = cl;
+      next[c - 1] = clock + 1;
+      prev = [c, clock];
+    }
+    const t0 = performance.now();
+    const len = doc.documentLength();
+    const ms = performance.now() - t0;
+    // each character is its own struct (a header, an origin of the other client), so the document is about 7 octets for each
+    expect(len).toBeGreaterThan(n * 5);
+    expect(ms, `${ms} ms for the document length of ${n} structs`).toBeLessThan(1000);
+    // a delete of every third id of client 1 changes the cover at each of them
+    const ranges: number[] = [];
+    for (let k = 0; k < 9000; k += 3) ranges.push(k, 1);
+    const d2 = doc.clone();
+    expect(d2.apply(update([], ds(1, ...ranges)), roots).verdict).toBe("APPLIED");
+    const t1 = performance.now();
+    const len2 = d2.documentLength();
+    expect(performance.now() - t1).toBeLessThan(1000);
+    expect(len2).not.toBe(len);
+    expect(doc.documentLength(), "the Doc that was cloned").toBe(len);
+  });
+});

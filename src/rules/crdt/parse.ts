@@ -6,8 +6,10 @@
 // nesting could drive (a lib0 any value, a JSON text) is cut at the depth limit of 05 [STATE-7].
 
 import { utf8DecodeValid } from "../bytes.js";
-import { checkJsonText } from "../jsonv1/parse.js";
+import { canonical } from "../jsonv1/canonical.js";
+import { checkJsonText, parseDocument } from "../jsonv1/parse.js";
 import { fail } from "./errors.js";
+import { anyNumberSize, appendRun, strSize, type SizeRuns, uvSize, utf8Profile } from "./measure.js";
 import { Reader } from "./reader.js";
 
 /** 05 [STATE-71] (Integers). */
@@ -67,6 +69,16 @@ export interface Struct {
   hasSub: boolean;
   /** the UTF-16 units of a ContentString, kept only when the text holds a surrogate pair */
   units: Uint16Array | null;
+  /**
+   * What the document length of 05 [STATE-74] counts of the item. `hdr`: the octets of its header (the info byte, the origin, the right origin
+   * and, when it has neither, the parent and the parentSub; the content follows). `bytes`: a ContentString's UTF-8 octets, a ContentAny's values
+   * in their canonical forms, a ContentEmbed's and a ContentFormat's content with its JSON text in the RFC 8785 form, a ContentType's and a
+   * ContentBinary's whole content, and 0 for a ContentDeleted. `prof`: for a ContentString whose characters are not all one octet, and for a
+   * ContentAny, the octets of each id, as pairs (count of ids, octets of each) (SizeRuns). A GC and a Skip have 0, 0 and null.
+   */
+  hdr: number;
+  bytes: number;
+  prof: SizeRuns | null;
   /** position in Update.all */
   idx: number;
   /** position of the struct's group in Update.groups */
@@ -207,6 +219,9 @@ class BareStruct implements Struct {
   declare readonly root: string;
   declare readonly hasSub: boolean;
   declare readonly units: Uint16Array | null;
+  declare readonly hdr: number;
+  declare readonly bytes: number;
+  declare readonly prof: SizeRuns | null;
   idx = 0;
   grp = 0;
   off = 0;
@@ -230,6 +245,9 @@ Object.assign(BareStruct.prototype, {
   root: "",
   hasSub: false,
   units: null,
+  hdr: 0,
+  bytes: 0,
+  prof: null,
 });
 
 /**
@@ -333,6 +351,9 @@ function readStruct(r: Reader, client: number, clock: number): Struct {
     root: "",
     hasSub: false,
     units: null,
+    hdr: 0,
+    bytes: 0,
+    prof: null,
     idx: 0,
     grp: 0,
     off: 0,
@@ -369,6 +390,7 @@ function readStruct(r: Reader, client: number, clock: number): Struct {
       r.strBytes();
     }
   }
+  s.hdr = r.p - start;
   readContent(r, s);
   if (s.len === 0) throw fail("zero-length", `struct of client ${client} at clock ${clock} has length 0`);
   if (s.len > MAX_CLOCK - clock) throw fail("int-range", "struct clock + length above 2^32-1");
@@ -377,8 +399,9 @@ function readStruct(r: Reader, client: number, clock: number): Struct {
   return s;
 }
 
-/** Reads the content of the item s and sets its length. */
+/** Reads the content of the item s and sets its length and what the document length counts of it (`bytes`, `prof`). */
 function readContent(r: Reader, s: Struct): void {
+  const c0 = r.p;
   switch (s.content) {
     case ContentRef.Deleted:
       s.len = r.varUint();
@@ -387,12 +410,16 @@ function readContent(r: Reader, s: Struct): void {
       const n = r.varUint();
       r.take(n);
       s.len = 1;
+      s.bytes = r.p - c0; // a length and the octets, as Yjs v1 writes them (a varUint is read in its shortest form only)
       return;
     }
     case ContentRef.String: {
       const raw = r.strBytes();
       const text = utf8DecodeValid(raw);
       s.len = text.length; // UTF-16 code units
+      s.bytes = raw.length;
+      // a text whose characters are not all one octet and one unit keeps the octets of each unit (05 [STATE-74]: a cut inside it is measured)
+      if (raw.length !== text.length) s.prof = utf8Profile(raw);
       // keep the units only when the text holds a surrogate pair (no unit of any other text is a surrogate)
       if (/[\ud800-\udfff]/.test(text)) {
         const units = new Uint16Array(text.length);
@@ -405,13 +432,15 @@ function readContent(r: Reader, s: Struct): void {
       const raw = r.strBytes();
       s.len = 1;
       checkJSON(raw);
+      s.bytes = strSize(canonicalJsonLength(raw));
       return;
     }
     case ContentRef.Format: {
-      r.strBytes(); // the key
+      const key = r.strBytes(); // the key
       const raw = r.strBytes();
       s.len = 1;
       checkJSON(raw);
+      s.bytes = strSize(key.length) + strSize(canonicalJsonLength(raw));
       return;
     }
     case ContentRef.Type: {
@@ -419,13 +448,22 @@ function readContent(r: Reader, s: Struct): void {
       if (t > 6) throw fail("type-ref", `contentType ref ${t}`);
       if (t === 3 || t === 5) r.strBytes(); // XmlElement and XmlHook carry a node or hook name
       s.len = 1;
+      s.bytes = r.p - c0; // the type ref and the name, as Yjs v1 writes them
       return;
     }
     case ContentRef.Any: {
       const n = r.varUint();
       if (n > r.remaining()) throw fail("truncated", "contentAny holds more values than the update has bytes"); // every value takes at least one byte
-      for (let i = 0; i < n; i++) readAny(r, 0);
+      const prof: SizeRuns = [];
+      let total = 0;
+      for (let i = 0; i < n; i++) {
+        const size = readAny(r, 0);
+        total += size;
+        appendRun(prof, 1, size);
+      }
       s.len = n;
+      s.bytes = total;
+      s.prof = prof;
       return;
     }
     default:
@@ -440,69 +478,98 @@ function checkJSON(text: Uint8Array): void {
   throw fail(err.reason === "json-limits" ? "json-limits" : "json", err.message);
 }
 
-/** Reads one lib0 any value (05 [STATE-71], Values); depth is the depth of the container that holds it. */
-function readAny(r: Reader, depth: number): void {
+/**
+ * The length in octets of the RFC 8785 form of the JSON text of an embed or a format value (05 [STATE-74], Content), which `checkJSON` has
+ * passed. A text that does not read as a document (it should not happen) counts as the octets that the update holds.
+ */
+function canonicalJsonLength(text: Uint8Array): number {
+  try {
+    return canonical(parseDocument(text)).length;
+  } catch {
+    return text.length;
+  }
+}
+
+/**
+ * Reads one lib0 any value (05 [STATE-71], Values); depth is the depth of the container that holds it. It returns the octets that Yjs's
+ * writeAny writes for the value (05 [STATE-74], Content): a number by its value, and not by the tag that the update used.
+ */
+function readAny(r: Reader, depth: number): number {
   const tag = r.u8();
   switch (tag) {
     case 127: // undefined
     case 126: // null
     case 121: // false
     case 120: // true
-      return;
+      return 1;
     case 125: {
       // integer, a varInt
-      const { mag } = r.varInt();
+      const { neg, mag } = r.varInt();
       if (mag > MAX_ANY_INT) throw fail("any-int-range", "varInt above 2^53-1");
-      return;
+      return anyNumberSize(neg ? -mag : mag);
     }
     case 124: {
       // float32
       const b = r.take(4);
       const bits = (((b[0] as number) << 24) | ((b[1] as number) << 16) | ((b[2] as number) << 8) | (b[3] as number)) >>> 0;
       if ((bits & 0x7f800000) >>> 0 === 0x7f800000) throw fail("any-float", "float32 NaN or infinite");
-      return;
+      return anyNumberSize(new DataView(b.buffer, b.byteOffset, 4).getFloat32(0, false));
     }
     case 123: {
       // float64
       const b = r.take(8);
       if ((((b[0] as number) & 0x7f) << 4 | ((b[1] as number) >> 4)) === 0x7ff) throw fail("any-float", "float64 NaN or infinite");
-      return;
+      return anyNumberSize(new DataView(b.buffer, b.byteOffset, 8).getFloat64(0, false));
     }
     case 122: {
-      // bigint, an int64
+      // bigint, an int64: it stays under tag 122
       const b = r.take(8);
       const v = new DataView(b.buffer, b.byteOffset, 8).getBigInt64(0, false);
       const max = BigInt(MAX_ANY_INT);
       if (v > max || v < -max) throw fail("any-int-range", "bigint above 2^53-1");
-      return;
+      return 9;
     }
     case 119: // string
-      r.strBytes();
-      return;
+      return 1 + strSize(r.strBytes().length);
     case 118: {
       // object
       if (depth + 1 > MAX_DEPTH) throw fail("any-limits", "depth over 32");
       const n = r.varUint();
       if (n > MAX_MEMBERS) throw fail("any-limits", "more than 1,024 members");
+      // 05 [STATE-71] (Values), round 17: a lib0 object holds each member name once (I-JSON, RFC 7493, as a JSON text does). The names are
+      // compared as strings, which is as octets for valid UTF-8; a small object compares them pairwise, a large one by a set.
+      const names: string[] = [];
+      let seen: Set<string> | null = null;
+      let size = 1 + uvSize(n);
       for (let i = 0; i < n; i++) {
-        r.strBytes();
-        readAny(r, depth + 1);
+        const raw = r.strBytes();
+        const name = utf8DecodeValid(raw);
+        if (seen === null) {
+          if (names.includes(name)) throw fail("any-duplicate", `a lib0 object holds the member name ${JSON.stringify(name)} twice`);
+          names.push(name);
+          if (names.length >= 8) seen = new Set(names);
+        } else {
+          if (seen.has(name)) throw fail("any-duplicate", `a lib0 object holds the member name ${JSON.stringify(name)} twice`);
+          seen.add(name);
+        }
+        size += strSize(raw.length) + readAny(r, depth + 1);
       }
-      return;
+      return size;
     }
     case 117: {
       // array
       if (depth + 1 > MAX_DEPTH) throw fail("any-limits", "depth over 32");
       const n = r.varUint();
       if (n > r.remaining()) throw fail("truncated", "array longer than the update");
-      for (let i = 0; i < n; i++) readAny(r, depth + 1);
-      return;
+      let size = 1 + uvSize(n);
+      for (let i = 0; i < n; i++) size += readAny(r, depth + 1);
+      return size;
     }
     case 116: {
       // Uint8Array
       const n = r.varUint();
       r.take(n);
-      return;
+      return 1 + strSize(n);
     }
     default:
       throw fail("any-tag", `lib0 any tag ${tag}`);

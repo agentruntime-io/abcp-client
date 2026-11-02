@@ -1,5 +1,6 @@
 // CRDT keys (05 §5.10): the strict reader of a Yjs update in format v1 (05 [STATE-71]), the fold of the integrated updates with
-// its verdicts (05 [STATE-76]), the canonical form SV || DS of 05 [STATE-41], and the validity of a base (05 [STATE-74]).
+// its verdicts (05 [STATE-76]), the canonical form SV || DS of 05 [STATE-41], the validity of a base and the document length of a key
+// (`Doc.documentLength`, 05 [STATE-74], round 17).
 //
 // Nothing here runs Yjs. A client that shows a CRDT key keeps a Yjs document of its own (14 [CLI-13]); this module is what
 // the per-key state hash and the version-gated apply of the confirmed state read.

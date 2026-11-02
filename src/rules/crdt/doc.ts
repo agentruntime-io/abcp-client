@@ -3,10 +3,13 @@
 //
 // Nothing here reads a document's content: no root name, no text and no JSON form of a document enters the canonical form,
 // so the state hash of a key is the same whatever base holds it. A client that shows the document keeps a Yjs document of
-// its own (14 [CLI-13]); this fold is what the per-key state hash and the version-gated apply read.
+// its own (14 [CLI-13]); this fold is what the per-key state hash and the version-gated apply read. The one thing that it keeps of
+// the content is its size in octets in the canonical forms of 05 [STATE-74], for `documentLength` (measure.ts): the length of the key's
+// document at the seq, which the commit limit of 05 [STATE-72] and the serving limit of 05 [STATE-75] read.
 
 import { ByteWriter } from "../bytes.js";
 import { CrdtError, type Reason } from "./errors.js";
+import { CellFold, chains, DsCursor, dsTermOf, joined, MKind, type MRun, type Profile, pushRuns, uvSize } from "./measure.js";
 import { checkRoots, type Roots } from "./roots.js";
 import {
   type ClientClock,
@@ -93,6 +96,58 @@ function sameId(a: Id | null, b: Id | null): boolean {
   return a === null || b === null ? a === b : a.client === b.client && a.clock === b.clock;
 }
 
+/**
+ * What a Doc keeps of one client for the document length of 05 [STATE-74] (measure.ts): the first definitions as the document sees them
+ * (`runs`, in ascending order of clock; the structs that the Merges step joins are one run) and the profile of the ids that take different
+ * numbers of octets. A record is replaced, never edited, by a Doc that did not make it, so a clone shares it.
+ */
+interface Measure {
+  runs: MRun[];
+  prof: Profile | null;
+}
+
+/** The additions of one `applyUpdate` to the runs of the clients (`Doc.addStruct`). */
+interface RunAdder {
+  client: number;
+  /** the owned record of `client`, which the call extends */
+  rec: Measure | null;
+  /** the last run of `rec` is one that this call made: it may change it in place */
+  own: boolean;
+}
+
+/** The run of the document for the struct s, whose parent is p (05 [STATE-74]). */
+function runOf(s: Struct, p: ParentRef): MRun {
+  if (s.kind !== "item") {
+    return { start: s.clock, end: s.clock + s.len, kind: MKind.GC, origin: null, right: null, parentId: null, gcParent: false, bytes: 0, hdr: 0, prof: false };
+  }
+  let kind: MKind;
+  switch (s.content) {
+    case 4:
+      kind = MKind.Str;
+      break;
+    case 8:
+      kind = MKind.Any;
+      break;
+    case 1:
+      kind = MKind.Del;
+      break;
+    default:
+      kind = MKind.Other;
+  }
+  return {
+    start: s.clock,
+    end: s.clock + s.len,
+    kind,
+    origin: s.hasOrigin ? s.origin : null,
+    right: s.hasRight ? s.right : null,
+    parentId: p.hasId ? p.id : null,
+    gcParent: p.gc,
+    bytes: s.bytes,
+    hdr: s.hdr,
+    prof: s.prof !== null,
+  };
+}
+
 export class Doc {
   /** Whether the key has received a committed update, a no-op for good included (05 [STATE-76]). */
   present = false;
@@ -104,6 +159,10 @@ export class Doc {
   readonly defs: Map<number, Def[]>;
   /** The clients whose `defs` array this Doc made, and may change in place; the arrays of the others are shared with a clone and are copied before a write. */
   private owned = new Set<number>();
+  /** client → what the document length reads of the client's first definitions (05 [STATE-74]) */
+  private readonly meas = new Map<number, Measure>();
+  /** The clients whose `meas` record this Doc made, and may change in place, as `owned` says of `defs`. */
+  private ownedMeas = new Set<number>();
 
   constructor() {
     this.sv = new Map();
@@ -124,7 +183,9 @@ export class Doc {
     for (const [client, next] of this.sv) c.sv.set(client, next);
     for (const [client, rs] of this.ds) c.ds.set(client, rs);
     for (const [client, ds] of this.defs) c.defs.set(client, ds);
+    for (const [client, m] of this.meas) c.meas.set(client, m);
     this.owned = new Set(); // the arrays that the clone shares are no longer this Doc's to change in place
+    this.ownedMeas = new Set();
     return c;
   }
 
@@ -143,6 +204,96 @@ export class Doc {
     const last = list[list.length - 1];
     if (last !== undefined && sameRun(last, d)) list[list.length - 1] = { ...last, end: d.end };
     else list.push(d);
+  }
+
+  /** The record of what the document length reads of the client, made this Doc's to change in place (it copies one that a clone shares). */
+  private ownedMeasure(client: number): Measure {
+    let rec = this.meas.get(client);
+    if (rec === undefined) {
+      rec = { runs: [], prof: null };
+      this.meas.set(client, rec);
+      this.ownedMeas.add(client);
+    } else if (!this.ownedMeas.has(client)) {
+      rec = { runs: rec.runs.slice(), prof: rec.prof === null ? null : { segs: rec.prof.segs.slice(), end: rec.prof.end } };
+      this.meas.set(client, rec);
+      this.ownedMeas.add(client);
+    }
+    return rec;
+  }
+
+  /**
+   * Adds the first definition of the struct s, whose parent is p, at the end of the client's list for the document length: it joins the
+   * run before it when they chain (Merges, 05 [STATE-74]), a GC that follows a GC without making an object. `ad` is the state of the
+   * call's additions: the record that it extends, and whether the last run of that record is one that this call made, which it may change
+   * in place (a run that an earlier call made may be shared with a clone, and is replaced by a copy).
+   */
+  private addStruct(ad: RunAdder, s: Struct, p: ParentRef): void {
+    if (ad.rec === null || ad.client !== s.client) {
+      ad.client = s.client;
+      ad.rec = this.ownedMeasure(s.client);
+      ad.own = false;
+    }
+    const rec = ad.rec;
+    const runs = rec.runs;
+    const last = runs[runs.length - 1];
+    if (s.kind !== "item" && last !== undefined && last.kind === MKind.GC && last.end === s.clock) {
+      if (ad.own) last.end += s.len;
+      else runs[runs.length - 1] = { ...last, end: last.end + s.len };
+      ad.own = true;
+      return;
+    }
+    const m = runOf(s, p);
+    if (last !== undefined && chains(s.client, last, m)) {
+      if (ad.own) {
+        last.end = m.end;
+        last.bytes += m.bytes;
+      } else {
+        runs[runs.length - 1] = joined(last, m);
+      }
+    } else {
+      runs.push(m);
+    }
+    ad.own = true;
+    if (s.prof !== null) {
+      rec.prof ??= { segs: [], end: 0 };
+      pushRuns(rec.prof, s.clock, s.prof);
+    }
+  }
+
+  /**
+   * The document length of the key (05 [STATE-74], round 17, D-AP (a)): the length in octets of the Yjs v1 update that gives the key's
+   * integrated updates one struct for each run of ids that the Cuts and Merges say, each content in its one canonical form, and the
+   * canonical delete set. It is a function of the key's state, whatever base the key holds. A key with no integrated update has the empty
+   * document, `0x00 0x00`, of length 2. It costs a step for each run of first definitions of the key, and no more is kept for it.
+   */
+  documentLength(): number {
+    let a: Analysis | null = null;
+    let clients = 0;
+    let structs = 0;
+    for (const [client, next] of this.sv) {
+      const rec = this.meas.get(client);
+      if (next === 0 || rec === undefined) continue; // every client of the state vector has a struct and a record
+      clients++;
+      const f = new CellFold(client);
+      const ds = new DsCursor(this.ds.get(client) ?? []);
+      for (const m of rec.runs) {
+        let cover = m.kind === MKind.GC || m.gcParent;
+        if (!cover && m.parentId !== null) {
+          a ??= new Analysis(this, null);
+          cover = a.hidden(m.parentId);
+        }
+        f.feed(m, cover, ds, rec.prof);
+      }
+      structs += f.term();
+    }
+    let dsClients = 0;
+    let dsSum = 0;
+    for (const [client, rs] of this.ds) {
+      if (rs.length === 0) continue;
+      dsClients++;
+      dsSum += dsTermOf(client, rs);
+    }
+    return uvSize(clients) + structs + uvSize(dsClients) + dsSum;
   }
 
   /** The next clock of a client: the highest clock that a struct of the client in an integrated update covers, plus 1. */
@@ -248,6 +399,7 @@ export class Doc {
     // The first definitions, with the parents resolved against the state before the update. Adjacent structs of a client that agree
     // are one definition, so a run of GCs is one entry however many structs it has.
     const news: { client: number; def: Def }[] = [];
+    const adder: RunAdder = { client: -1, rec: null, own: false };
     for (const s of u.all) {
       if (s.clock + s.len <= this.next(s.client)) continue; // wholly below the next clock: the ids keep their earlier definition
       const p = a.parentOf(s);
@@ -265,6 +417,7 @@ export class Doc {
       const last = news[news.length - 1];
       if (last !== undefined && last.client === s.client && sameRun(last.def, def)) last.def.end = def.end; // last.def is this call's own
       else news.push({ client: s.client, def });
+      this.addStruct(adder, s, p); // for the document length: nothing in the analysis reads it
     }
     for (const n of news) this.addDef(n.client, n.def);
 
