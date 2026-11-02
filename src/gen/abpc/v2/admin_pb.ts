@@ -612,7 +612,8 @@ export type AppConfig = Message<"abpc.v2.AppConfig"> & {
    * At least two and at most 10 (spec/04 Table 4.10a), of at least two different kinds. RegisterApp sets them; then only app admins change
    * them, and a change takes effect after the longer of 72 h and the recovery wait in force before the call, notifying the old and the
    * new contacts. When a contact is in force, and when the change takes effect, are spec/04 [MAN-87]'s. Frozen while
-   * the app is suspended, except in recovery mode (spec/04 [MAN-87], spec/12 §12.2.3, spec/16 [SEC-44]).
+   * the app is suspended, except in recovery mode and except the adoption of spec/12 [ADM-17] (spec/04 [MAN-87],
+   * spec/12 §12.2.3, spec/16 [SEC-44]).
    *
    * @generated from field: repeated abpc.v2.OwnerContact owner_contacts = 16;
    */
@@ -731,8 +732,8 @@ export type GetAppConfigResponse = Message<"abpc.v2.GetAppConfigResponse"> & {
   quotasInForce: { [key: string]: bigint };
 
   /**
-   * The max_offline the server applies now (spec/07 [MUT-88]): after a raise, the old value until bindings are kept for
-   * the new one. config.max_offline_seconds holds the stored value; AppLimits.max_offline_seconds advertises this one.
+   * The max_offline the server applies now (spec/07 [MUT-88] says which value is in force after a raise).
+   * config.max_offline_seconds holds the stored value; AppLimits.max_offline_seconds advertises this one.
    *
    * @generated from field: uint32 max_offline_seconds_in_force = 10;
    */
@@ -813,8 +814,9 @@ export const GetAppConfigResponseSchema: GenMessage<GetAppConfigResponse> = /*@_
  * whose masked fields already hold the given values succeeds and changes nothing, config_version included, whatever its
  * expected_config_version, so a retry after an unknown outcome succeeds; one whose mask names owner_contacts still
  * adopts the provisional contacts and sends new challenges (spec/12 [ADM-13], spec/04 [MAN-69]).
- * While the app is suspended, an update may change only user issuers (admin: false), except in recovery mode after a
- * break-glass change, when any field but the admin-issuer entry may change (spec/12 §12.2.3, spec/16 [SEC-44]).
+ * While the app is suspended, an update may change only user issuers (admin: false), except the adoption of spec/12
+ * [ADM-17] and except in recovery mode after a break-glass change, when any field but the admin-issuer entry may
+ * change (spec/12 §12.2.3, spec/16 [SEC-44]).
  *
  * @generated from message abpc.v2.UpdateAppConfigRequest
  */
@@ -2331,13 +2333,15 @@ export type ListAuditEntriesRequest = Message<"abpc.v2.ListAuditEntriesRequest">
   /**
    * listing the time at which its first call was processed
    *
-   * filter by `call`; empty = all
+   * filter by `call`; empty = all; at most 100 entries (a repeated name counts each time), 101 or more fail with
    *
    * @generated from field: repeated string calls = 4;
    */
   calls: string[];
 
   /**
+   * InvalidArgument and Reject{INVALID_ENVELOPE} (spec/12 [ADM-93])
+   *
    * an id pattern (spec/03 §3.7); empty = every entry, app-level ones included
    *
    * @generated from field: string keyspace_pattern = 5;

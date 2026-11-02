@@ -269,7 +269,7 @@ describe("17 [CONF-9], Q33: no vector hides a difference between the documents o
   // at draft 14 the text follows Yjs (Y9, Z3, Q33): the vectors list yrs differences only, and 76 give a document
   it("the vectors with a document are all checked, and the known library differences are exactly those that the vectors list", () => {
     const withContent = all.filter((v) => v.expect?.content !== undefined && v.expect.content !== null);
-    expect(withContent.length, "vectors that give an expected document at draft 14").toBe(76);
+    expect(withContent.length, "vectors that give an expected document at draft 15").toBe(80);
     const listed = all.filter((v) => v.library?.known !== undefined).map((v) => [v.id, Object.keys(v.library.known as object).sort()] as const);
     expect(listed.map(([id]) => id).sort()).toEqual(Object.keys(KNOWN_LIBRARY_DIFFERENCES).sort());
     for (const [id, libs] of listed) expect(libs, id).toEqual([(KNOWN_LIBRARY_DIFFERENCES[id] as { library: string }).library]);

@@ -360,13 +360,16 @@ export type Reject = Message<"abpc.v2.Reject"> & {
   code: Code;
 
   /**
-   * always the code's class in Appendix A (spec/07 [MUT-22])
+   * always the code's class in Appendix A (spec/07 [MUT-22]). A client that does not know the
    *
    * @generated from field: abpc.v2.ErrorClass error_class = 2;
    */
   errorClass: ErrorClass;
 
   /**
+   * class handles it as HOLD, except the reject of a REJECTED decision, which is handled as
+   * DEAD_LETTER (spec/15 [COMPAT-39])
+   *
    * namespaced app code, e.g. "tracker.KEY_SPACE_EXHAUSTED"
    *
    * @generated from field: string app_code = 3;
@@ -528,7 +531,7 @@ export type Decision = Message<"abpc.v2.Decision"> & {
    * of the requested changes' own checks (STALE, STALE{REDACTED} included, and STALE{LEASE} of an owner-keeping or
    * owner-setting change that fails its re-check against a revocation, spec/08 [GATE-24] step 6; TOMBSTONED,
    * RANGE_EXCEEDED, QUOTA_EXCEEDED, and PAYLOAD_TOO_LARGE of a CRDT update that would take its key's stored size
-   * over the limit in force, spec/05 [STATE-72]), or, for a gate effect, one of the checks that are final for an effect, with the
+   * or document length over the limit in force, spec/05 [STATE-72]), or, for a gate effect, one of the checks that are final for an effect, with the
    * codes that spec/08 [GATE-24] step 8 and [GATE-28] give them (STALE, STALE{MOVING}, POLICY_CHANGED, RANGE_EXCEEDED);
    * for a possible owner-authorized write, such a failure that reads the keyspace is PERMISSION_DENIED instead,
    * with no Stale and no details that name a key (spec/11 [COORD-94]).
@@ -1258,14 +1261,15 @@ export const LaneSchema: GenEnum<Lane> = /*@__PURE__*/
  */
 export enum ErrorClass {
   /**
-   * never sent; a client handles it, and any class it does not know, as HOLD (spec/15 [COMPAT-39]),
+   * never sent; a client handles it, and any class it does not know, as HOLD, except the reject of a REJECTED
    *
    * @generated from enum value: ERROR_CLASS_UNSPECIFIED = 0;
    */
   UNSPECIFIED = 0,
 
   /**
-   * and ends the hold at its bound as spec/14 [CLI-45] says
+   * decision, which is handled as DEAD_LETTER (spec/15 [COMPAT-39]), and ends the hold at its
+   * bound as spec/14 [CLI-45] says
    *
    * resend the same action later, unchanged
    *
@@ -1694,7 +1698,9 @@ export enum RetryReason {
   CONTENTION = 3,
 
   /**
-   * reached its limit (spec/13 [PLC-10]), or a GATED intent's decision commit
+   * reached its limit (spec/13 [PLC-10]), a stale config_version, a wait for the
+   * app's config lock past its lease, or a create that finds it held alone or awaited by an UpdateAppConfig or a reset run (spec/12 [ADM-10]), a B or D commit call
+   * refused by the version row (spec/13 [PLC-79]), or a GATED intent's decision commit
    * conflicted fewer than N consecutive times; at N it ends CONTENDED (spec/08 §8.4).
    * A lock timeout at the decision commit is not a conflict: the intent stays
    * PENDING and the server re-runs the commit. Only attempts that reach the conflict
