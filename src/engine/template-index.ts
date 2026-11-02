@@ -104,17 +104,21 @@ export class TemplateIndex<T> {
   }
 
   /**
-   * The template that holds the longest proper prefix of `tpl`, by segments and by shape, among those that `accept` (04 [MAN-20]: the parent of a template is its
-   * longest proper prefix that is an entity template); the first one added when several of that length do. Undefined when none does.
+   * The template that holds the longest proper prefix of `tpl`, by segments, among those that `accept` (04 [MAN-20]: the parent of a template is its longest
+   * proper prefix that is an entity template). The prefix is compared as text, variable names included, as a template is identified by its text (04 [MAN-63],
+   * draft 15): `crate/{y}/part/{id}` has no parent beside the entity `crate/{x}`, though the two match by shape (03 §3.3.2). The walk goes by shape, so that it
+   * costs by the segments of `tpl`; a template that it finds there is the answer only when its text is the prefix's. Undefined when none is.
    */
   nearestAncestor(tpl: KeyTemplate, accept: (value: T) => boolean): IndexedTemplate<T> | undefined {
     let best: IndexedTemplate<T> | undefined;
     let node: Node<T> | undefined = this.root;
+    const pieces = tpl.text.split("/");
     for (let i = 0; i < tpl.segments.length - 1 && node !== undefined; i++) {
       this.steps++;
       const seg = tpl.segments[i] as KeyTemplate["segments"][number];
       node = "literal" in seg ? node.literal?.get(seg.literal) : node.variable;
-      const hit = node?.here.find((e) => accept(e.value));
+      const prefix = pieces.slice(0, i + 1).join("/");
+      const hit = node?.here.find((e) => e.tpl.text === prefix && accept(e.value));
       if (hit !== undefined) best = hit;
     }
     return best;

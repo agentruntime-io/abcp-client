@@ -4,7 +4,7 @@
 //
 // What the client reads of a manifest (not a validator: the server judged it at publish, 04 §4.11):
 //  - for the fold (`fold.Rules`): for each key template (`keys`) its merge rule, whether it is an entity marker, and its parent, which is the
-//    longest proper prefix of the template that is an entity template (04 [MAN-20]). The templates are indexed by their segments (`TemplateIndex`): a lookup, a
+//    longest proper prefix of the template that is an entity template, the prefix compared as text, variable names included (04 [MAN-20], draft 15). The templates are indexed by their segments (`TemplateIndex`): a lookup, a
 //    parent and a `writes` selection cost by the segments that they name, however many templates the manifest has (V19 N4);
 //  - for the engine: for each op type its dispatch, `optimistic`, `barrier`, `offline_mode`, whether it is a spend op type (`escrow`), the
 //    declared templates that its `writes` select (03 [ID-21]); the `crdt_roots` of a CRDT template; the range of a counter; the owning key of a
@@ -82,7 +82,7 @@ export class ParsedManifest implements EngineManifest {
         compiled.push(c);
       }
     }
-    // 04 [MAN-20]: the parent of a template is the longest proper prefix of it, by segments, that is an entity template: read after every template is indexed
+    // 04 [MAN-20]: the parent of a template is the longest proper prefix of it, by segments, that is an entity template, compared as text: read after every template is indexed
     for (const c of compiled) c.template.parent = this.index.nearestAncestor(c.tpl, (x) => x.template.entity)?.tpl.text ?? "";
     // 04 [MAN-15]: the presence section of a kind: its topic templates (the client does not read the schema: the server judges a state against it)
     const kinds = getMember(doc, "keyspace_kinds");

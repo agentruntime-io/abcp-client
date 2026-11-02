@@ -21,6 +21,8 @@ const DOC = {
     "issue/{id}/comment/{cid}/body": { merge: "cas" },
     "count/{id}": { merge: "counter", value_schema: { type: "int", min: 0, max: 100 } },
     "seq/number": { merge: "counter" },
+    "crate/{x}": { merge: "cas", entity: true },
+    "crate/{y}/part/{id}": { merge: "lww" },
     "doc/{id}": { merge: "crdt:yjs/v1", crdt_roots: { t: "text", m: "map", odd: "something-new" } },
   },
   op_types: {
@@ -40,9 +42,13 @@ function answer(doc: unknown, version = 1, over: Omit<Partial<GetManifestRespons
 describe("what the client reads of a manifest", () => {
   const m = readManifest(answer(DOC), 1, "tracker");
 
-  it("gives the fold the merge rule, the entity marker and the parent of each template, the parent being the longest entity prefix whatever its variables are called (04 [MAN-20])", () => {
+  it("gives the fold the merge rule, the entity marker and the parent of each template, the parent being the longest entity prefix compared as text, variable names included (04 [MAN-20], draft 15)", () => {
     expect(m.template(1, "issue/7")).toEqual({ rule: "lww", entity: true, parent: "" });
-    expect(m.template(1, "issue/7/title")).toEqual({ rule: "lww", entity: false, parent: "issue/{id}" });
+    // `issue/{x}/title` spells the enclosing entity's variable otherwise: its prefix `issue/{x}` is no entity template's text, so it has no parent
+    expect(m.template(1, "issue/7/title")).toEqual({ rule: "lww", entity: false, parent: "" });
+    expect(m.template(1, "issue/7/flag")).toEqual({ rule: "lww", entity: false, parent: "issue/{id}" });
+    // fold-parent-014: `crate/{y}/part/{id}` has no parent beside the entity `crate/{x}`
+    expect(m.template(1, "crate/c1/part/p1")).toEqual({ rule: "lww", entity: false, parent: "" });
     expect(m.template(1, "issue/7/comment/c1")).toEqual({ rule: "lww", entity: true, parent: "issue/{id}" });
     expect(m.template(1, "issue/7/comment/c1/body")).toEqual({ rule: "cas", entity: false, parent: "issue/{id}/comment/{cid}" });
     expect(m.template(1, "count/x")).toEqual({ rule: "counter", entity: false, parent: "" });
@@ -90,9 +96,17 @@ describe("what the client reads of a manifest", () => {
   it("agrees with the static description that the fake server and the tests use, for what the fold needs", () => {
     const s = new StaticManifests({
       version: 1,
-      templates: { "issue/{id}": { rule: "lww", entity: true }, "issue/{id}/title": { rule: "lww" }, "count/{id}": { rule: "counter" }, "doc/{id}": { rule: "crdt", roots: { t: "text" } } },
+      templates: {
+        "issue/{id}": { rule: "lww", entity: true },
+        "issue/{x}/title": { rule: "lww" }, // no parent: its prefix is no entity template's text (04 [MAN-20])
+        "issue/{id}/flag": { rule: "lww" },
+        "crate/{x}": { rule: "cas", entity: true },
+        "crate/{y}/part/{id}": { rule: "lww" },
+        "count/{id}": { rule: "counter" },
+        "doc/{id}": { rule: "crdt", roots: { t: "text" } },
+      },
     });
-    for (const key of ["issue/1", "issue/1/title", "count/q", "doc/z"]) expect(m.template(1, key)).toEqual(s.template(1, key));
+    for (const key of ["issue/1", "issue/1/title", "issue/1/flag", "crate/c1", "crate/c1/part/p1", "count/q", "doc/z"]) expect(m.template(1, key)).toEqual(s.template(1, key));
   });
 });
 

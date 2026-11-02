@@ -122,7 +122,7 @@ describe("V19 N4: what the client does with a manifest costs by the length of a 
       expect(m.template(1, `g${g}/k${i}/note/n${i}/body`)?.parent).toBe(`g${g}/{id}/note/{nid}`);
     }
     const ms = performance.now() - started;
-    expect(ms).toBeLessThan(2000); // the plain scan of the templates needs about ten seconds here
+    expect(ms).toBeLessThan(5000); // the plain scan needs about ten seconds here; the step counts below are the cost bound, this only catches a scan (5 s: a loaded run took 2.1 s)
     expect(m.opType("A")?.writes).toEqual(new Naive(keys).selected(writes));
     expect(m.opType("A")?.writes).toHaveLength(2 + 7 + 1);
   });
