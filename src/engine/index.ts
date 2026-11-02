@@ -12,6 +12,13 @@ export {
   BlobCache,
   BlobError,
   DEFAULT_BLOB_CACHE_BYTES,
+  DRAIN_BUDGET_BYTES,
+  DEFAULT_MAX_DOWNLOAD_BYTES,
+  DEFAULT_MAX_STAGED_BYTES,
+  DEFAULT_TRANSFER_TIMEOUT,
+  STAGED_GRACE_MS,
+  STAGED_SWEEP_MS,
+  blobUrlAllowed,
   MAX_UPLOAD_ROUNDS,
   MemoryBlobStash,
   digestSha256,
@@ -71,10 +78,11 @@ export { makeReject } from "./endings.js";
 export { newUuid } from "./ids.js";
 export { DEFAULT_HORIZON_WARNING } from "./horizon.js";
 export { TOKEN_REFRESH_LEAD_MS, type CopyPolicy, type PurgeHook } from "./revocation.js";
-export { COMMAND_TIMEOUT_MS, HANDOVER_PROBE_MS, type RuntimeSnapshot } from "./tab-layer.js";
+export { COMMAND_TIMEOUT_MS, HANDOVER_PROBE_MS, type CommandContext, type CommandOptions, type RuntimeSnapshot } from "./tab-layer.js";
 export { checkInterest, inInterest } from "./replica-store.js";
 export {
   lockName,
+  tabLockName,
   partitionId,
   sameKey,
   type CrossTabLocks,

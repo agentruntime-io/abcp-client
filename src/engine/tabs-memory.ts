@@ -208,6 +208,7 @@ export class MemoryTab implements TabHost {
   readonly storage: StorageProvider;
   private visible_: boolean;
   private readonly visibilityListeners = new Set<(v: boolean) => void>();
+  private readonly pageListeners = new Set<(e: "hide" | "show") => void>();
   private readonly channels = new Set<MemoryChannel>();
   crashed = false;
 
@@ -241,6 +242,16 @@ export class MemoryTab implements TabHost {
   onVisibility(fn: (visible: boolean) => void): () => void {
     this.visibilityListeners.add(fn);
     return () => this.visibilityListeners.delete(fn);
+  }
+
+  onPageHide(fn: (event: "hide" | "show") => void): () => void {
+    this.pageListeners.add(fn);
+    return () => this.pageListeners.delete(fn);
+  }
+
+  /** The page is going away (`pagehide`), or comes back from the back-forward cache (`pageshow`): a test's tool. */
+  pageEvent(event: "hide" | "show"): void {
+    for (const l of [...this.pageListeners]) l(event);
   }
 
   /** The tab becomes visible or hidden. */

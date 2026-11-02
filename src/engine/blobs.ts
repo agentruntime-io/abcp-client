@@ -40,6 +40,13 @@
 //
 // SPEC-QUESTION (09 [READ-86]): the text gives no count for `CreateUploadResponse.upload_headers`. Taken: at most `MAX_UPLOAD_HEADERS` (counts.ts).
 //
+// SPEC-QUESTION (09 [READ-94], 14 [CLI-44], [CLI-45], V21 MUST-1): "re-uploads on `BLOB_MISSING`" needs the bytes. When the server answers `BLOB_MISSING` to an action, and no stash of the engine
+// holds the bytes of a blob that the action names (a memory stash after a restart, a cleared storage), no upload can mend it and a resend meets the same answer for ever, holding the action's slot
+// and every later action of its lane. Table 14.1 has no row for it. Taken: a client condition that holds the action alone (scope `action`, code `BLOB_MISSING`, `BLOB_BYTES_LOST` in the engine), with
+// the `held` event and the blob ids in the sync status, no resend while it holds; it clears when the app stages the bytes again under the same blob id (`stageBlob`), and at the bound of every hold
+// (14 [CLI-45]) the action ends as the table says. The app may also cancel the action (nothing was recorded: `Reject{BLOB_MISSING}` records nothing, 09 [READ-89]). `Retry{BLOB_PENDING}` with no
+// bytes is resent as before.
+//
 // SPEC-QUESTION (14 [CLI-66], [CLI-76], 09 [READ-94]): [CLI-66] lists "blob cache" on the purge list of a keyspace, and [CLI-76] speaks of "downloaded blob bytes" and says never "the bytes that
 // an unsent action still carries (09 [READ-94])"; no rule names the bytes that a client staged. Reading A (taken): staged bytes are the principal's data and part of the local copy, so the
 // purge of a keyspace erases the staged bytes of the keyspace that no action held by the engine names, and a sign-out of a personal partition erases them all; the bytes that a held action
@@ -66,6 +73,7 @@ import type { Runtime } from "./core.js";
 import {
   BlobCache,
   BlobError,
+  blobUrlAllowed,
   digestSha256,
   isBlobId,
   MAX_TRANSFER_ATTEMPTS,
@@ -73,10 +81,14 @@ import {
   PLATFORM_HEADERS,
   sameBytes,
   newBlobId,
+  STAGED_GRACE_MS,
+  STAGED_SWEEP_MS,
   type BlobCallOptions,
   type BlobData,
   type BlobErrorCode,
   type BlobRef,
+  type BlobStash,
+  type RepairResult,
   type StagedBlob,
   type StageOptions,
 } from "./blob-store.js";
@@ -86,6 +98,22 @@ import { LocalRefusal, ProtocolViolation, RpcError, storageCauseOf } from "./err
 import type { Follow } from "./follow.js";
 import { PresenceLayer } from "./presence.js";
 import type { OutboxEntry } from "./storage.js";
+
+/** The part of an action that names blobs: an outbox entry, a dead letter, an export-hook entry. */
+export interface HeldContent {
+  keyspaceId: string;
+  content: Uint8Array;
+  /** The keyspace that the action was authored in, when a split moved it (14 [CLI-52]). */
+  authoredIn?: string;
+}
+
+/** A transfer that took longer than the engine allows it (`EngineConfig.blobs.transferTimeoutMs`): counted as a failed attempt. */
+class TransferTimeout extends Error {
+  constructor(readonly ms: number) {
+    super(`the transfer took longer than ${ms} ms`);
+    this.name = "TransferTimeout";
+  }
+}
 
 /** What a call of the engine takes besides the app's options. */
 interface CallOptions extends BlobCallOptions {
@@ -165,17 +193,108 @@ export abstract class BlobLayer extends PresenceLayer {
    */
   private readonly committed = new Set<string>();
   private readonly sleepers = new Set<() => void>();
+  /** The PUTs and GETs of the engine that are under way: they end when the engine stops (a browser's `fetch` has no timeout, and a hung one would hold a call for ever). */
+  private readonly transferAborts = new Set<AbortController>();
+  /** What the stash holds, by blob (`blobKey`) with the octets: loaded from `list()` once, and kept as the engine puts and deletes. Undefined until it is loaded (or when the stash fails). */
+  private stashIndex: Map<string, number> | undefined;
+  private stashIndexLoading: Promise<Map<string, number> | undefined> | undefined;
+  /** The octets of blobs that are being put (the cap of `maxStagedBytes` counts them before they are in the index). */
+  private stagingBytes = 0;
+  private sweepTimer: (() => void) | undefined;
 
-  /** 14 [CLI-61] and the sleepers: a call that waits for time stops when the engine does. */
+  /** 14 [CLI-61] and the sleepers: a call that waits for time stops when the engine does; so do the transfers that are under way. */
   protected cancelTimers(): void {
     super.cancelTimers();
     for (const s of [...this.sleepers]) s();
+    for (const c of [...this.transferAborts]) c.abort();
+    this.sweepTimer = undefined; // an engine timer: `super.cancelTimers` cancelled it
   }
 
   protected resetRuntime(): void {
     super.resetRuntime();
     this.uploads.clear();
     this.committed.clear();
+    this.sweepTimer?.();
+    this.sweepTimer = undefined;
+  }
+
+  protected useBlobStash(stash: BlobStash): void {
+    super.useBlobStash(stash);
+    this.stashIndex = undefined;
+    this.stashIndexLoading = undefined;
+  }
+
+  // ---------------------------------------------------------------------------------------------------------------------
+  // The stash, with its count (09 [READ-94]): every change of it by the engine goes through these, so that the sync status can say how much is staged and the cap can hold
+
+  /** Whether the bytes of the stash outlive the process (`BlobStash.durable`; a stash that does not say is the app's, and taken as durable). */
+  blobStashMode(): "memory" | "durable" {
+    return this.blobStash.durable === false ? "memory" : "durable";
+  }
+
+  /** The staged blobs and octets, as the engine counts them (0 until the stash has been read once). */
+  protected stashStats(): { count: number; bytes: number } {
+    let bytes = 0;
+    for (const n of this.stashIndex?.values() ?? []) bytes += n;
+    return { count: this.stashIndex?.size ?? 0, bytes };
+  }
+
+  /** Reads what the stash holds, once; a stash that fails leaves the engine without a count (and without the cap), and the failure is recorded. */
+  protected stashIndexNow(): Promise<Map<string, number> | undefined> {
+    if (this.stashIndex !== undefined) return Promise.resolve(this.stashIndex);
+    this.stashIndexLoading ??= this.blobStash.list().then(
+      (rows) => {
+        const m = new Map<string, number>();
+        for (const r of rows) m.set(this.blobKey(r.keyspaceId, r.blobId), r.size);
+        this.stashIndex = m;
+        this.onRuntimeChanged();
+        return m;
+      },
+      (e: unknown) => {
+        this.stashIndexLoading = undefined;
+        this.noteInternalError(e);
+        return undefined;
+      },
+    );
+    return this.stashIndexLoading;
+  }
+
+  /** Forgets the count and reads it again: the flusher that took the role finds what the one before it staged. */
+  protected stashIndexReload(): void {
+    this.stashIndex = undefined;
+    this.stashIndexLoading = undefined;
+    this.detach(this.stashIndexNow().then(() => undefined));
+  }
+
+  private async stashPut(staged: StagedBlob): Promise<void> {
+    const idx = await this.stashIndexNow();
+    const key = this.blobKey(staged.keyspaceId, staged.blobId);
+    if (idx !== undefined) {
+      let bytes = 0;
+      for (const [k, n] of idx) if (k !== key) bytes += n;
+      if (bytes + this.stagingBytes + staged.size > this.blobMaxStaged) {
+        throw new LocalRefusal("STORAGE", `the stash holds ${bytes} octets of staged bytes, and ${staged.size} more would pass maxStagedBytes (${this.blobMaxStaged}, 09 [READ-94])`, "QUOTA");
+      }
+    }
+    this.stagingBytes += staged.size;
+    try {
+      await this.blobStash.put(staged);
+    } finally {
+      this.stagingBytes -= staged.size;
+    }
+    this.stashIndex?.set(key, staged.size);
+    this.onRuntimeChanged();
+  }
+
+  private async stashDelete(keyspaceId: string, blobId: string): Promise<void> {
+    await this.blobStash.delete(keyspaceId, blobId);
+    if (this.stashIndex?.delete(this.blobKey(keyspaceId, blobId)) === true) this.onRuntimeChanged();
+  }
+
+  private async stashClear(): Promise<void> {
+    await this.blobStash.clear();
+    this.stashIndex = new Map();
+    this.onRuntimeChanged();
   }
 
   // ---------------------------------------------------------------------------------------------------------------------
@@ -198,6 +317,46 @@ export abstract class BlobLayer extends PresenceLayer {
       this.sleepers.add(stop);
       signal?.addEventListener("abort", stop, { once: true });
     });
+  }
+
+  /**
+   * One PUT or GET under the engine's bounds (14 [CLI-44], 16 [SEC-1]): it ends when the app aborts the call (`ABORTED`), when the engine stops (`ABORTED`), and when it has taken longer than
+   * `blobTransferTimeout(octets)` on the engine's clock (a `TransferTimeout`, which the caller counts as a failed attempt). A `BlobHttp` that ignores its signal is raced against it, so a hung one
+   * never holds the call.
+   */
+  private async bounded<T>(o: BlobCallOptions | undefined, octets: number, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const ctl = new AbortController();
+    this.transferAborts.add(ctl);
+    const onAbort = (): void => ctl.abort();
+    o?.signal?.addEventListener("abort", onAbort, { once: true });
+    if (o?.signal?.aborted === true) ctl.abort();
+    const ms = Math.max(1, Math.floor(this.blobTransferTimeout(octets)));
+    let timedOut = false;
+    const cancelTimer = this.clock.setTimer(ms, () => {
+      timedOut = true;
+      ctl.abort();
+    });
+    try {
+      const call = run(ctl.signal);
+      call.catch(() => undefined); // the failure of a call that was given up on is nobody's
+      return await Promise.race([
+        call,
+        new Promise<never>((_, reject) => {
+          const fail = (): void => reject(new Error("the transfer was aborted"));
+          if (ctl.signal.aborted) fail();
+          else ctl.signal.addEventListener("abort", fail, { once: true });
+        }),
+      ]);
+    } catch (e) {
+      if (o?.signal?.aborted === true) throw new BlobError("ABORTED", "the call was aborted");
+      if (this.stopped) throw new BlobError("ABORTED", "the engine stopped");
+      if (timedOut) throw new TransferTimeout(ms);
+      throw e;
+    } finally {
+      cancelTimer();
+      o?.signal?.removeEventListener("abort", onAbort);
+      this.transferAborts.delete(ctl);
+    }
   }
 
   private check(o: BlobCallOptions | undefined): void {
@@ -267,6 +426,10 @@ export abstract class BlobLayer extends PresenceLayer {
    * again when an action that names the blob gets `BLOB_PENDING` or `BLOB_MISSING` (14 [CLI-44]). Refused locally for a blob over `limits.max_blob_bytes` (09 [READ-86]).
    */
   protected async stageBlobNow(keyspaceId: string, bytes: Uint8Array, o: StageOptions = {}): Promise<BlobRef> {
+    // 14 [CLI-21]: "A client MUST NOT fall back to memory-only storage silently": the bytes that a durable outbox's actions name are not kept in memory only (09 [READ-94]); nothing is staged
+    if (this.storage.mode !== "memory" && this.blobStash.durable === false) {
+      throw new LocalRefusal("REFUSED", `the outbox is ${this.storage.mode} and the stash of blob bytes is memory only: an action that names the blob would lose its bytes at a restart (09 [READ-94], 14 [CLI-21]); give the engine a durable stash (the platform's, or EngineConfig.blobs.stash)`);
+    }
     if (bytes.length > this.limits.maxBlobBytes) throw new LocalRefusal("INVALID", `a blob of ${bytes.length} octets, over max_blob_bytes (${this.limits.maxBlobBytes}, 09 [READ-86])`);
     const contentType = o.contentType ?? "";
     // 09 [READ-86]: at most 255 octets of printable US-ASCII (%x20-7E)
@@ -274,14 +437,24 @@ export abstract class BlobLayer extends PresenceLayer {
     const blobId = o.blobId ?? this.mintBlobId();
     if (!isBlobId(blobId)) throw new LocalRefusal("INVALID", `"${blobId}" is not a blob id: [A-Za-z0-9_-]{21,64} (09 [READ-84])`);
     const sha256 = await digestSha256(bytes);
+    // a blob id that the caller supplies and an action that this engine holds already names, with other bytes: the action's bytes are not replaced (09 [READ-94]); the same bytes are staged again
+    if (o.blobId !== undefined) {
+      const have = await this.blobStash.get(keyspaceId, blobId).catch(() => undefined);
+      if (have !== undefined && !sameBytes(have.sha256, sha256) && this.namedByHeldActions().has(this.blobKey(keyspaceId, blobId))) {
+        throw new LocalRefusal("REFUSED", `the blob ${blobId} is staged with other bytes, and an action that the engine holds names it (09 [READ-94])`);
+      }
+    }
     const copy = new Uint8Array(bytes); // the app may reuse its buffer
     const staged: StagedBlob = { keyspaceId, blobId, bytes: copy, sha256, size: copy.length, contentType, stagedAtMs: this.clock.now() };
     try {
-      await this.blobStash.put(staged);
+      await this.stashPut(staged);
     } catch (e) {
+      if (e instanceof LocalRefusal) throw e;
       // a durable stash can fail (a quota, a database that another tab closed): nothing was staged, and the app is told as for an action that cannot be stored (14 [CLI-21])
       throw new LocalRefusal("STORAGE", `the bytes of the blob could not be kept: ${e instanceof Error ? e.message : String(e)}`, storageCauseOf(e));
     }
+    // an action that was held because the engine had lost these bytes is sent again (see the SPEC-QUESTION in the header)
+    this.post(() => this.bytesStagedAgain(keyspaceId, blobId));
     return { keyspaceId, blobId, sha256, size: staged.size, contentType };
   }
 
@@ -349,7 +522,7 @@ export abstract class BlobLayer extends PresenceLayer {
   /** The PUT of the bytes with exactly the headers of the call (09 [READ-86]); returns `expired` for a URL that the store refuses as invalid or expired. */
   private async put(up: CreateUploadResponse, staged: StagedBlob, o: BlobCallOptions | undefined): Promise<"sent" | "expired"> {
     const url = up.uploadUrl;
-    if (!/^https?:\/\//i.test(url)) throw new BlobError("PROTOCOL_ERROR", "the upload URL is not an http(s) URL");
+    if (!blobUrlAllowed(url, this.blobAllowInsecure)) throw new BlobError("PROTOCOL_ERROR", "the upload URL is not an https URL (http only on the loopback, 02 note after [ARC-56], 16 [SEC-45])");
     const headers: Record<string, string> = {};
     for (const [k, v] of Object.entries(up.uploadHeaders)) if (!PLATFORM_HEADERS.has(k.toLowerCase())) headers[k] = v; // 03 [ID-27]: the values go as they are
     const http = this.blobHttp;
@@ -357,11 +530,11 @@ export abstract class BlobLayer extends PresenceLayer {
       this.check(o);
       let status: number | undefined;
       try {
-        status = (await http.put(url, headers, staged.bytes, o?.signal !== undefined ? { signal: o.signal } : undefined)).status;
+        // 14 [CLI-44]: a PUT that never answers is a failed attempt after its time (a browser's `fetch` has none), and ends with the call or the engine
+        status = (await this.bounded(o, staged.size, (signal) => http.put(url, headers, staged.bytes, { signal }))).status;
       } catch (e) {
-        if (o?.signal?.aborted === true) throw new BlobError("ABORTED", "the call was aborted");
-        status = undefined; // the connection failed: resent
-        void e;
+        if (e instanceof BlobError) throw e;
+        status = undefined; // the connection failed, or timed out: resent
       }
       if (status !== undefined && status >= 200 && status < 300) return "sent";
       if (status === 403 || status === 401) return "expired"; // the URL stopped serving (04 Table 4.11): a repeated `CreateUpload` returns a new one
@@ -379,17 +552,17 @@ export abstract class BlobLayer extends PresenceLayer {
    * repeated (an upload that is committed answers `already_committed`, and costs the one call). A blob that the engine holds no bytes of is left to the resend. The result of an
    * upload that fails is the resend's: the action meets `BLOB_MISSING` again and the backoff applies.
    */
-  protected async repairBlobs(e: OutboxEntry): Promise<void> {
+  protected async repairBlobs(e: OutboxEntry): Promise<RepairResult> {
     let refs: readonly string[];
     try {
       refs = decodeContent(e.content).blobRefs;
     } catch (err) {
-      if (err instanceof CanonError) return;
+      if (err instanceof CanonError) return { uploaded: 0, lacking: [] };
       throw err;
     }
     // the server says that a blob is not committed: what this run knew of it is stale
     for (const id of refs) for (const ks of this.stashKeyspaces(e)) this.committed.delete(this.blobKey(ks, id));
-    await this.uploadNamed(e, refs, false);
+    return this.uploadNamed(e, refs, false);
   }
 
   /** The keyspaces in which the bytes of the blobs of an action may be staged: the one that it is in now, and the one that it was authored in, when a split moved it (14 [CLI-52]). */
@@ -402,11 +575,16 @@ export abstract class BlobLayer extends PresenceLayer {
    * `skipCommitted`: a blob that this run knows to be committed is not asked about again. A blob that the engine holds no bytes of is left to the server's answer, and an upload that fails is
    * too: the action meets `BLOB_MISSING` again, and its backoff applies.
    */
-  private async uploadNamed(e: OutboxEntry, refs: Iterable<string>, skipCommitted: boolean): Promise<void> {
+  private async uploadNamed(e: OutboxEntry, refs: Iterable<string>, skipCommitted: boolean): Promise<RepairResult> {
+    let uploaded = 0;
+    const lacking: string[] = [];
     for (const id of new Set(refs)) {
+      let held = false;
       for (const ks of this.stashKeyspaces(e)) {
         if (!(await this.blobStash.has(ks, id))) continue;
+        held = true;
         if (skipCommitted && this.committed.has(this.blobKey(ks, id))) break;
+        uploaded++;
         try {
           await this.shareUpload(ks, id, true);
         } catch {
@@ -414,6 +592,28 @@ export abstract class BlobLayer extends PresenceLayer {
         }
         break;
       }
+      if (!held) lacking.push(id);
+    }
+    return { uploaded, lacking };
+  }
+
+  /**
+   * The bytes of blobs that a held action names are staged again (`stageBlob` under the same blob id): an action that waited for them (`BLOB_BYTES_LOST`, see the SPEC-QUESTION in the header) is
+   * uploaded again and sent.
+   */
+  private bytesStagedAgain(keyspaceId: string, blobId: string): void {
+    for (const h of this.holds.all()) {
+      if (h.kind !== "BLOB_BYTES_LOST" || h.blobIds === undefined || !h.blobIds.includes(blobId)) continue;
+      const e = h.mutationId === undefined ? undefined : this.entries.get(h.mutationId);
+      if (e === undefined || !this.stashKeyspaces(e).has(keyspaceId)) continue;
+      h.blobIds = h.blobIds.filter((id) => id !== blobId);
+      if (h.blobIds.length > 0) continue; // the other blobs are still lost
+      this.stopHold(h.kind, h.keyspaceId, h.lane, h.mutationId);
+      const rt = this.rt(e.mutationId);
+      rt.blobs = "unchecked"; // the upload before the send is made again, from the bytes that were staged
+      rt.blobRepairs = 0;
+      rt.nextAttemptAt = 0;
+      this.schedulePump();
     }
   }
 
@@ -454,30 +654,68 @@ export abstract class BlobLayer extends PresenceLayer {
     });
   }
 
-  /** The action retired: "A client keeps a blob's bytes locally until the action that references it is confirmed" (09 [READ-94]): the bytes it staged go. */
-  protected onActionRetiredBlobs(e: OutboxEntry): void {
-    this.detach(this.dropStagedOf(e));
+  /**
+   * The action left the engine's hands: it was confirmed, or cancelled, or the app acknowledged its dead letter or its export entry. "A client keeps a blob's bytes locally until the action that
+   * references it is confirmed" (09 [READ-94]): the bytes that it staged go, but those that another action held by the engine still names.
+   */
+  protected onActionRetiredBlobs(e: HeldContent): void {
+    this.detach(this.dropStagedOf(e).catch((err: unknown) => this.noteInternalError(err)));
   }
 
-  /** Erases the staged bytes of the blobs that an action names, and what this run knew of their uploads. */
-  protected async dropStagedOf(e: OutboxEntry): Promise<void> {
+  /** Erases the staged bytes of the blobs that an action names, except those that an action that the engine still holds names, and what this run knew of their uploads. */
+  protected async dropStagedOf(e: HeldContent): Promise<void> {
     let refs: readonly string[];
     try {
       refs = decodeContent(e.content).blobRefs;
     } catch {
       return;
     }
+    const keyspaces = new Set([e.keyspaceId, ...(e.authoredIn !== undefined ? [e.authoredIn] : [])]);
     for (const id of new Set(refs)) {
-      for (const ks of this.stashKeyspaces(e)) {
+      for (const ks of keyspaces) {
+        // judged when the bytes are about to go: another action may have been authored while this one waited for the stash
+        if (this.namedByHeldActions().has(this.blobKey(ks, id))) continue;
         this.committed.delete(this.blobKey(ks, id));
-        await this.blobStash.delete(ks, id);
+        await this.stashDelete(ks, id);
       }
     }
   }
 
   /** Releases the bytes of a staged blob that no action will name (09 [READ-94]: the engine's own cache; the server's blob stays until its sweep). */
   protected async releaseBlobNow(keyspaceId: string, blobId: string): Promise<void> {
-    await this.blobStash.delete(keyspaceId, blobId);
+    await this.stashDelete(keyspaceId, blobId);
+  }
+
+  /**
+   * Starts the collection of staged bytes that no action names (09 [READ-94]): at once, and every `STAGED_SWEEP_MS`, a staged blob that no action held by the engine names and that was staged more than
+   * `STAGED_GRACE_MS` ago is erased: a stage that no action followed (a tab that went away between `stageBlob` and `submit`), or bytes that an acknowledgement or a restart left. A flusher's job: the
+   * stash is the partition's, and the tabs share it.
+   */
+  protected startStagedSweep(): void {
+    this.sweepTimer?.();
+    this.stashIndexReload();
+    this.detach(this.sweepStaged());
+    this.sweepTimer = this.after(STAGED_SWEEP_MS, () => this.startStagedSweep());
+  }
+
+  protected async sweepStaged(): Promise<void> {
+    let rows: Awaited<ReturnType<BlobStash["list"]>>;
+    try {
+      rows = await this.blobStash.list();
+    } catch (e) {
+      this.noteInternalError(e);
+      return;
+    }
+    for (const s of rows) {
+      if (this.stopped || this.role !== "flusher") return;
+      if (s.stagedAtMs === undefined || this.clock.now() - s.stagedAtMs <= STAGED_GRACE_MS) continue; // a stash that keeps no time never collects by age
+      if (this.namedByHeldActions().has(this.blobKey(s.keyspaceId, s.blobId))) continue;
+      try {
+        await this.stashDelete(s.keyspaceId, s.blobId);
+      } catch (e) {
+        this.noteInternalError(e);
+      }
+    }
   }
 
   /** What is staged: the bytes that the engine keeps for actions (09 [READ-94]). */
@@ -508,18 +746,21 @@ export abstract class BlobLayer extends PresenceLayer {
 
   private async download(keyspaceId: string, blobId: string, info: GetBlobResponse, o: BlobCallOptions): Promise<BlobData | "again"> {
     if (info.sha256.length !== 32) throw new BlobError("PROTOCOL_ERROR", "GetBlobResponse.sha256 is not 32 octets");
-    if (!/^https?:\/\//i.test(info.downloadUrl)) throw new BlobError("PROTOCOL_ERROR", "the download URL is not an http(s) URL");
+    if (!blobUrlAllowed(info.downloadUrl, this.blobAllowInsecure)) throw new BlobError("PROTOCOL_ERROR", "the download URL is not an https URL (http only on the loopback, 02 note after [ARC-56], 16 [SEC-45])");
     if (info.size > BigInt(this.limits.maxBlobBytes)) throw new BlobError("PROTOCOL_ERROR", `GetBlobResponse.size (${info.size}) is over max_blob_bytes (${this.limits.maxBlobBytes})`);
+    // 16 [SEC-1]: `max_blob_bytes` is the server's and has no protocol maximum, so the app's bound is the one that holds what the call buffers
+    const cap = o.maxBytes ?? this.blobMaxDownload;
+    if (info.size > BigInt(cap)) throw new BlobError("DOWNLOAD_TOO_LARGE", `the blob is ${info.size} octets, over what this call buffers (${cap}): raise BlobCallOptions.maxBytes or EngineConfig.blobs.maxDownloadBytes`);
     const size = Number(info.size);
     const http = this.blobHttp;
     for (let attempt = 0; ; attempt++) {
       this.check(o);
       let res: { status: number; bytes: Uint8Array; tooLarge?: boolean } | undefined;
       try {
-        res = await http.get(info.downloadUrl, { maxBytes: size, ...(o.signal !== undefined ? { signal: o.signal } : {}) });
-      } catch {
-        if (o.signal?.aborted === true) throw new BlobError("ABORTED", "the call was aborted");
-        res = undefined;
+        res = await this.bounded(o, size, (signal) => http.get(info.downloadUrl, { maxBytes: size, signal }));
+      } catch (e) {
+        if (e instanceof BlobError) throw e;
+        res = undefined; // the connection failed, or timed out: asked again
       }
       if (res !== undefined && res.status === 200 && res.tooLarge !== true) {
         // 16 [SEC-7]: "A client MUST check a downloaded blob against its `sha256`", and the size that the call declared
@@ -549,7 +790,7 @@ export abstract class BlobLayer extends PresenceLayer {
     await this.rpc(keyspaceId, o, () => this.transport.deleteBlob(create(DeleteBlobRequestSchema, { keyspaceId, blobId, reason })));
     this.cache.delete(keyspaceId, blobId);
     this.committed.delete(this.blobKey(keyspaceId, blobId));
-    await this.blobStash.delete(keyspaceId, blobId);
+    await this.stashDelete(keyspaceId, blobId);
   }
 
   // ---------------------------------------------------------------------------------------------------------------------
@@ -588,7 +829,7 @@ export abstract class BlobLayer extends PresenceLayer {
     try {
       const named = this.namedByHeldActions();
       for (const s of await this.blobStash.list()) {
-        if (s.keyspaceId === keyspaceId && !named.has(this.blobKey(s.keyspaceId, s.blobId))) await this.blobStash.delete(s.keyspaceId, s.blobId);
+        if (s.keyspaceId === keyspaceId && !named.has(this.blobKey(s.keyspaceId, s.blobId))) await this.stashDelete(s.keyspaceId, s.blobId);
       }
     } catch (e) {
       this.noteInternalError(e);
@@ -621,7 +862,7 @@ export abstract class BlobLayer extends PresenceLayer {
     this.uploads.clear();
     this.committed.clear();
     this.cache.clear();
-    await this.blobStash.clear();
+    await this.stashClear();
   }
 
   /** The downloaded blobs that the engine holds, for the sync status and for a test. */

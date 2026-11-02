@@ -26,6 +26,8 @@ export interface PresenceSource {
   onPresence(listener: (event: PresenceEvent) => void): () => void;
   /** The `client_id` of the engine's session: the entry that carries it is this engine's own. Empty in a follower tab, which has none (03 [ID-35]). */
   readonly clientId: string;
+  /** The `client_id` that the engine's own entry carries, in a follower tab too (it is the flusher's); a source that has none of its own is told by `clientId`. */
+  readonly presenceSelfId?: string;
 }
 
 /** One entry of a topic. */
@@ -92,7 +94,8 @@ export class PresenceView {
     }
     let tabs: Record<string, QueryJson> | undefined;
     if (awareness && state !== undefined && state !== null && typeof state === "object" && !Array.isArray(state)) tabs = state as Record<string, QueryJson>;
-    return { clientId: e.clientId, principal: e.principal, state, undecodable, raw: e.state, tabs, expiresAt: e.expiresAtMs, self: this.engine.clientId !== "" && e.clientId === this.engine.clientId };
+    const me = this.engine.presenceSelfId ?? this.engine.clientId;
+    return { clientId: e.clientId, principal: e.principal, state, undecodable, raw: e.state, tabs, expiresAt: e.expiresAtMs, self: me !== "" && e.clientId === me };
   }
 
   /** Every entry of the topic that has not expired, in the order of the client ids. */

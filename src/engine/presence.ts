@@ -22,18 +22,22 @@
 //  - [READ-81] A snapshot replaces the view of a topic, upserts replace whole entries, `left_client_ids` remove entries; an upsert whose `expires_at` is older than that of
 //    the entry held for the same client instance is ignored. A presence frame never moves a cursor, a watermark or a lane watermark: it is applied outside the log.
 //  - [READ-80] A frame is applied only to the topic that it names, in the keyspace that it names, and only when this engine has joined that topic.
-//  - [SEC-1], [SEC-28] A presence state is untrusted input: this layer keeps the bytes as they came, and the view decodes them with the strict json/v1 reader.
+//  - [SEC-1], [SEC-28] A presence state is untrusted input: this layer keeps the bytes as they came, and the view decodes them with the strict json/v1 reader. What a server sends is bounded as what it
+//    promised: an entry over `limits.max_presence_state_bytes` ([READ-74]) or with a client id that is no client id is dropped (and reported once, `protocol-error`), the view of a topic holds at most
+//    `limits.max_presence_members_per_topic` entries ([READ-79]) and `MAX_VIEW_BYTES` octets, and an entry expires `limits.presence_ttl_seconds` after it was published ([READ-76]), whatever `expires_at` says.
 //  - [CLI-66] The purge of a keyspace (`ACCESS_REVOKED` and the revocation of the subject) removes the presence state with the rest of the purge list (`presencePurge`).
 //
-// SPEC-QUESTION (09 [READ-74], 14 [CLI-61]): "The engine MUST NOT leave a topic while any of its tabs is still in it" says nothing of a tab that is gone without saying so (a crash, a killed process): no message of
-// it comes, and the engine cannot tell it from a tab that is still in the topic. Taken: the engine learns that a tab left from its `gone` message (a tab that stops, 14 [CLI-61]) or its `leavePresence`;
-// a tab that crashes keeps its registration, and so keeps the topic joined and (for Yjs awareness) its state in the entry, until the engine stops or the last tab leaves. The cost is an entry that outlives a
-// crashed tab, which every tab of the engine shares; a platform that reports the loss of a tab would end its registrations (`presenceTabGone`).
+// Q75.2 (decided, V21 MUST-4): "When the last of its tabs in the topic leaves, the engine MUST leave the topic with `LeavePresence`", and a tab id is "not kept after the tab closes" ([READ-83]): a follower tab
+// that closes without a completed `stop()` is a tab that left. The engine learns it from the tab's `gone` message, from a `pagehide` hint, and, for a crash or a close that sent nothing, from the lock that
+// each tab holds and the flusher asks for (`tab-layer.ts`, `presenceTabGone`).
 //
-// SPEC-QUESTION (09 [READ-74], [CLI-61]): "When several of its tabs are in one topic, the entry's state is the latest state that one of them set" does not say what the
-// entry holds when the tab that set it leaves while others stay ("when one of several tabs leaves, its entry stays"). Reading A (taken): the state stays as it is, and is
-// kept alive by the same keepalive; no publish follows. Reading B: the entry takes the latest state of a tab that remains, which could republish an older state. A is the
-// one that "its entry stays" says. For Yjs awareness the state is the map of the tabs that remain, and the engine publishes it ([READ-83]).
+// Q75.1 (decided, V21 SHOULD-1): "When several of its tabs are in one topic, the entry's state is the latest state that one of them set": "them" are the tabs in the topic, so when a tab leaves, the entry
+// takes the latest state that one of the tabs that remain set (`presenceLeave`); "its entry stays" is about the entry, not its state. When no tab that remains set a state there is nothing to take, and the
+// entry stays as it is, marked as the state of a tab that left (`orphaned`): the one gap of the text.
+//
+// SPEC-QUESTION (09 [READ-74], residual of Q75.1): the text does not say what the entry holds when the only tab that set a state leaves and the tabs that remain set none. Taken: the entry keeps that
+// state (a reading of the last state, marked `orphaned` in `presenceTopics`) and is kept alive with it, until a remaining tab sets one or the last tab leaves. Reading B: the entry is left to expire.
+// For Yjs awareness the state is the map of the tabs that remain, and the engine publishes it ([READ-83]).
 
 import { create } from "@bufbuild/protobuf";
 import { timestampMs } from "@bufbuild/protobuf/wkt";
@@ -87,11 +91,57 @@ const sep = "\u0000";
  * 04 Table 4.10a, and what a server sends is untrusted input (16 [SEC-1]): a frame of 16 MiB holds some hundreds of thousands of entries. The view keeps the first of them.
  */
 export const MAX_VIEW_ENTRIES = 100_000;
+/** The most octets (states and client ids) that the view of one topic holds (16 [SEC-1]): a server that allows 64 KiB states and many members does not make the client hold them all. */
+export const MAX_VIEW_BYTES = 8 << 20;
+/** A client id is a UUID (03 [ID-35]); one longer than this is not one. */
+const MAX_CLIENT_ID_LENGTH = 128;
+/** How far past `now + presence_ttl` an entry's `expires_at` may be, in server time: the estimate of the server's clock is not exact (14 [CLI-55]). */
+const EXPIRY_SLACK_MS = 5_000;
 const keyOf = (ks: string, topic: string): string => `${ks}${sep}${topic}`;
+
+/** What an entry costs the view: its state, its client id and what the entry itself weighs. */
+const entrySize = (e: PresenceEntryRaw): number => e.state.length + e.clientId.length + 64;
+
+/** The view of a topic: a map of the entries by client instance that knows the octets that it holds. */
+class View {
+  private readonly m = new Map<string, PresenceEntryRaw>();
+  bytes = 0;
+
+  get size(): number {
+    return this.m.size;
+  }
+  get(id: string): PresenceEntryRaw | undefined {
+    return this.m.get(id);
+  }
+  has(id: string): boolean {
+    return this.m.has(id);
+  }
+  set(id: string, e: PresenceEntryRaw): void {
+    const old = this.m.get(id);
+    if (old !== undefined) this.bytes -= entrySize(old);
+    this.m.set(id, e);
+    this.bytes += entrySize(e);
+  }
+  delete(id: string): boolean {
+    const old = this.m.get(id);
+    if (old === undefined) return false;
+    this.m.delete(id);
+    this.bytes -= entrySize(old);
+    return true;
+  }
+  values(): IterableIterator<PresenceEntryRaw> {
+    return this.m.values();
+  }
+  [Symbol.iterator](): IterableIterator<[string, PresenceEntryRaw]> {
+    return this.m[Symbol.iterator]();
+  }
+}
 
 interface TabState {
   /** The json/v1 text of the state that the tab set; undefined: the tab joined and set none. */
   state: Uint8Array | undefined;
+  /** When the tab set it, in the order of the topic's sets: the latest state of the tabs that are in the topic is the entry's (09 [READ-74]). */
+  setSeq: number;
 }
 
 type Op = "join" | "publish";
@@ -99,8 +149,18 @@ type Op = "join" | "publish";
 /** What the engine keeps of one topic. */
 class Topic {
   readonly tabs = new Map<string, TabState>();
-  /** Plain topics: the latest state that a tab set (09 [READ-74]). */
+  /** Plain topics: the latest state that a tab set (09 [READ-74]), among the tabs that are in the topic; when the tab that set it left and no remaining tab set one, the state of that tab (see `orphaned`). */
   latest: Uint8Array | undefined;
+  /** The sets of the topic so far: `TabState.setSeq` is drawn from it. */
+  setCounter = 0;
+  /** `latest` is the state of a tab that left, and no tab that remains set one: the one gap of 09 [READ-74] (Q75.1). */
+  orphaned = false;
+  /** An entry of a frame was dropped as no entry of the server can be, and the engine said so (once for a session, not for every frame that a server floods). */
+  droppedReported = false;
+  /** The join was under way when the last tab left: the server made the session a member all the same, so the engine leaves when the join is answered. */
+  leaveWhenJoined = false;
+  /** The entry that was refused for its size, as text: it is not refused again until it changes. */
+  refusedEntry: Uint8Array | undefined;
   /** The session id on which the server made this session a member; undefined: not a member (a new session, a drop, a refusal). */
   joined: string | undefined;
   /** A call is under way. */
@@ -123,7 +183,7 @@ class Topic {
   waitTimer: (() => void) | undefined;
   keepTimer: (() => void) | undefined;
   /** The view: the entries that the server told this client of, by client instance. */
-  view = new Map<string, PresenceEntryRaw>();
+  view = new View();
   /** The topic was left: its calls that are under way end without effect. */
   closed = false;
 
@@ -216,8 +276,8 @@ export abstract class PresenceLayer extends SessionLayer {
   }
 
   /** The topics that this engine is in, for a test and for the sync status. */
-  presenceTopics(): { keyspaceId: string; topic: string; joined: boolean; awareness: boolean; tabs: string[] }[] {
-    return [...this.topics.values()].map((t) => ({ keyspaceId: t.keyspaceId, topic: t.topic, joined: t.joined !== undefined, awareness: t.awareness, tabs: [...t.tabs.keys()] }));
+  presenceTopics(): { keyspaceId: string; topic: string; joined: boolean; awareness: boolean; tabs: string[]; orphaned: boolean }[] {
+    return [...this.topics.values()].map((t) => ({ keyspaceId: t.keyspaceId, topic: t.topic, joined: t.joined !== undefined, awareness: t.awareness, tabs: [...t.tabs.keys()], orphaned: t.orphaned }));
   }
 
   // ---------------------------------------------------------------------------------------------------------------------
@@ -243,7 +303,7 @@ export abstract class PresenceLayer extends SessionLayer {
       this.topics.set(key, t);
     }
     const fresh = !t.tabs.has(tab);
-    if (fresh) t.tabs.set(tab, { state: undefined });
+    if (fresh) t.tabs.set(tab, { state: undefined, setSeq: 0 });
     t.blocked = undefined; // the app asks again: a refusal of before is tried once more
     // a tab that joins a topic that the engine is in already has the view that the engine holds, which no frame brings it: the other tabs read it from the flusher (14 [CLI-61])
     if (fresh && t.view.size > 0) this.emitPresence({ type: "changed", keyspaceId, topic });
@@ -262,7 +322,9 @@ export abstract class PresenceLayer extends SessionLayer {
       throw new LocalRefusal("INVALID", `a presence state of ${state.length} octets, over max_presence_state_bytes (${this.limits.maxPresenceStateBytes}, 09 [READ-74])`);
     }
     mine.state = state;
+    mine.setSeq = ++t.setCounter;
     t.latest = state;
+    t.orphaned = false; // a tab that is in the topic set it
     t.stale = true;
     this.pumpTopic(t);
   }
@@ -275,16 +337,39 @@ export abstract class PresenceLayer extends SessionLayer {
       this.closeTopic(t, true);
       return;
     }
-    // Yjs awareness: the state is the map of the tabs that remain; a plain entry stays as it is (SPEC-QUESTION above)
+    // Yjs awareness: the state is the map of the tabs that remain
     if (t.awareness) {
       t.stale = true;
       this.pumpTopic(t);
+      return;
+    }
+    // Q75.1, 09 [READ-74]: "the latest state that one of them set": the entry takes the latest state of the tabs that remain, which republishes it when it is not the one that the server holds
+    let best: TabState | undefined;
+    for (const s of t.tabs.values()) if (s.state !== undefined && (best === undefined || s.setSeq > best.setSeq)) best = s;
+    if (best?.state !== undefined) {
+      t.orphaned = false;
+      if (!this.sameBytes(best.state, t.latest)) {
+        t.latest = best.state;
+        t.stale = true;
+        this.pumpTopic(t);
+      }
+    } else if (t.latest !== undefined) {
+      t.orphaned = true; // no tab that remains set a state: the entry stays as the tab that left made it (the one gap)
     }
   }
 
   /** A tab of the engine went away (it said so, 14 [CLI-61]): it leaves every topic that it is in. */
   protected presenceTabGone(tab: string): void {
     for (const t of [...this.topics.values()]) if (t.tabs.has(tab)) this.presenceLeave(tab, t.keyspaceId, t.topic);
+  }
+
+  /** [READ-77]: the entry and the membership end with this call; one that does not reach the server ends with the session or by its TTL. */
+  private sendLeave(t: Topic, member: string): void {
+    this.detach(
+      this.transport.leavePresence(create(LeavePresenceRequestSchema, { sessionId: member, keyspaceId: t.keyspaceId, topic: t.topic })).catch((e: unknown) => {
+        this.noteRevoked(e);
+      }),
+    );
   }
 
   private closeTimers(t: Topic): void {
@@ -301,15 +386,9 @@ export abstract class PresenceLayer extends SessionLayer {
     const member = t.joined;
     t.joined = undefined;
     const had = t.view.size > 0;
-    t.view = new Map();
-    if (sendLeave && member !== undefined && member === this.sessionId()) {
-      // [READ-77]: the entry and the membership end with this call; one that does not reach the server ends with the session or by its TTL
-      this.detach(
-        this.transport.leavePresence(create(LeavePresenceRequestSchema, { sessionId: member, keyspaceId: t.keyspaceId, topic: t.topic })).catch((e: unknown) => {
-          this.noteRevoked(e);
-        }),
-      );
-    }
+    t.view = new View();
+    if (sendLeave && member !== undefined && member === this.sessionId()) this.sendLeave(t, member);
+    else if (sendLeave && t.op === "join") t.leaveWhenJoined = true; // the join is under way: the server makes the session a member, and the answer finds the topic left
     if (had) this.emitPresence({ type: "changed", keyspaceId: t.keyspaceId, topic: t.topic });
     this.armExpiry();
   }
@@ -370,9 +449,13 @@ export abstract class PresenceLayer extends SessionLayer {
     if (!t.stale && !t.keepalive && this.sameBytes(want, t.published)) return;
     if (want.length > this.limits.maxPresenceStateBytes) {
       t.stale = false;
+      t.keepalive = false; // nothing is published, so nothing is kept alive
+      if (this.sameBytes(t.refusedEntry, want)) return; // refused already: it is said once, not at every pump
+      t.refusedEntry = want;
       this.emitPresence({ type: "refused", keyspaceId: t.keyspaceId, topic: t.topic, operation: "publish", code: codeName(Code.PAYLOAD_TOO_LARGE), local: true, detail: `the entry of ${want.length} octets is over max_presence_state_bytes (${this.limits.maxPresenceStateBytes}, 09 [READ-74])` });
       return;
     }
+    t.refusedEntry = undefined;
     // [READ-79]: not sooner than the interval after the answer of the last publish
     if (t.answeredMono !== undefined) {
       const wait = t.answeredMono + this.limits.presenceMinPublishIntervalMs - this.clock.mono();
@@ -397,7 +480,10 @@ export abstract class PresenceLayer extends SessionLayer {
         }
         await this.run(() => {
           if (t.op === "join") t.op = undefined;
-          if (t.closed) return;
+          if (t.closed) {
+            if (t.leaveWhenJoined && this.sessionId() === sid) this.sendLeave(t, sid); // N4: the last tab left while the join was under way
+            return;
+          }
           t.failures = 0;
           t.authTries = 0;
           t.retryAt = 0;
@@ -576,22 +662,22 @@ export abstract class PresenceLayer extends SessionLayer {
     const now = this.serverNow();
     let changed = false;
     if (frame.snapshot) {
-      const next = new Map<string, PresenceEntryRaw>();
+      const next = new View();
       for (const e of frame.entries) {
-        const raw = this.entryOf(e);
-        if (raw !== undefined && (next.size < this.maxViewEntries || next.has(raw.clientId))) next.set(raw.clientId, raw);
+        const raw = this.entryOf(e, t, now);
+        if (raw !== undefined && this.admits(next, raw)) next.set(raw.clientId, raw);
       }
       // 09 [READ-81]: "A client replaces its view of a topic on each snapshot"
       changed = next.size !== t.view.size || [...next].some(([id, e]) => !sameEntry(t.view.get(id), e));
       t.view = next;
     } else {
       for (const e of frame.entries) {
-        const raw = this.entryOf(e);
+        const raw = this.entryOf(e, t, now);
         if (raw === undefined) continue;
         const have = t.view.get(raw.clientId);
         // 09 [READ-81]: "a client MUST ignore an upsert whose `expires_at` is older than that of the entry it holds for the same client instance"
         if (have !== undefined && raw.expiresAtMs < have.expiresAtMs) continue;
-        if (have === undefined && t.view.size >= this.maxViewEntries) continue; // 16 [SEC-1]
+        if (!this.admits(t.view, raw)) continue; // 16 [SEC-1]: the member cap and the byte total of the view
         if (!sameEntry(have, raw)) changed = true;
         t.view.set(raw.clientId, raw);
       }
@@ -608,10 +694,37 @@ export abstract class PresenceLayer extends SessionLayer {
     if (changed || frame.snapshot) this.emitPresence({ type: "changed", keyspaceId: t.keyspaceId, topic: t.topic });
   }
 
-  private entryOf(e: PresenceEntry): PresenceEntryRaw | undefined {
+  /** The most entries that the view of `t` holds: the member cap that the server advertised (09 [READ-79]), and the client's own (`maxViewEntries`). */
+  private viewCap(): number {
+    return Math.min(this.maxViewEntries, this.limits.maxPresenceMembersPerTopic);
+  }
+
+  /** Whether the view can take the entry: it is one it holds already, or there is room for another member, and the octets stay within `MAX_VIEW_BYTES` (16 [SEC-1]). */
+  private admits(view: View, raw: PresenceEntryRaw): boolean {
+    const have = view.get(raw.clientId);
+    if (have === undefined && view.size >= this.viewCap()) return false;
+    return view.bytes - (have === undefined ? 0 : entrySize(have)) + entrySize(raw) <= MAX_VIEW_BYTES;
+  }
+
+  private entryOf(e: PresenceEntry, t: Topic, now: number): PresenceEntryRaw | undefined {
     // 09 [READ-75]: an entry has the client instance that published it; one with no `expires_at` cannot be judged for its expiry, and is not kept
     if (e.clientId === "" || e.expiresAt === undefined) return undefined;
-    return { clientId: e.clientId, principal: e.principal, state: e.state, expiresAtMs: timestampMs(e.expiresAt) };
+    // 16 [SEC-1]: what a server sends is as bounded as what it promised: a client id is a UUID, a state is at most `max_presence_state_bytes` (09 [READ-74]: the server refuses a larger one with PAYLOAD_TOO_LARGE)
+    if (e.clientId.length > MAX_CLIENT_ID_LENGTH || e.state.length > this.limits.maxPresenceStateBytes) {
+      if (!t.droppedReported) {
+        t.droppedReported = true;
+        this.emit({
+          type: "protocol-error",
+          what: "PresenceFrame",
+          detail: e.state.length > this.limits.maxPresenceStateBytes ? `an entry of ${e.state.length} octets, over max_presence_state_bytes (${this.limits.maxPresenceStateBytes}, 09 [READ-74]); it is not kept` : `a client id of ${e.clientId.length} characters (03 [ID-35]); the entry is not kept`,
+          keyspaces: [t.keyspaceId],
+        });
+      }
+      return undefined;
+    }
+    // 09 [READ-76]: "An entry expires `limits.presence_ttl_seconds` after its last publish": an `expires_at` further away than that is not believed
+    const horizon = now + this.limits.presenceTtlMs + EXPIRY_SLACK_MS;
+    return { clientId: e.clientId, principal: e.principal, state: e.state, expiresAtMs: Math.min(timestampMs(e.expiresAt), horizon) };
   }
 
   /** The timer that drops the entries as they expire (09 [READ-81]): one for the engine, armed for the earliest expiry. */
@@ -653,6 +766,7 @@ export abstract class PresenceLayer extends SessionLayer {
       t.retryAt = 0;
       t.blocked = undefined;
       t.stale = true;
+      t.droppedReported = false;
       this.closeTimers(t);
     }
     // the clients of this engine hold the view of an earlier session until a snapshot replaces it
@@ -685,7 +799,7 @@ export abstract class PresenceLayer extends SessionLayer {
       // (`answeredMono` stays: the interval of 09 [READ-79] runs per session and client instance, and a leave and a join do not start a new one)
       this.closeTimers(t);
       if (t.view.size > 0) {
-        t.view = new Map();
+        t.view = new View();
         this.emitPresence({ type: "changed", keyspaceId, topic: t.topic });
       }
     }

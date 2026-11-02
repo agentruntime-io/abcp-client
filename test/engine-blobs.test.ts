@@ -265,7 +265,7 @@ describe("09 [READ-89], 14 [CLI-44]: an action that names a blob that is not com
     const ref = await r.engine.stageBlob(KS, bytesOf(200)); // offline: nothing is sent
     expect(calls(r.server, "createUpload")).toBe(0);
     const { mutationId } = await submitWith(r, [ref.blobId]);
-    expect(await r.engine.stagedBlobs()).toEqual([{ keyspaceId: KS, blobId: ref.blobId, size: 200 }]);
+    expect(await r.engine.stagedBlobs()).toMatchObject([{ keyspaceId: KS, blobId: ref.blobId, size: 200 }]);
     // the store loses the object after the upload (09 [READ-88]): the first send, which comes after the upload, is answered BLOB_MISSING
     r.server.inject("mutate", {
       kind: "result",
@@ -315,21 +315,21 @@ describe("09 [READ-89], 14 [CLI-44]: an action that names a blob that is not com
     expect(ofType(r, "held")).toEqual([]);
   });
 
-  it("BLOB_MISSING for a blob that the engine holds no bytes of: resent with the backoff, no hold, nothing dead-lettered, and no server blob is deleted", async () => {
+  // V21 MUST-1 (09 [READ-94]): the engine cannot re-upload bytes that it does not hold, and a resend would meet the same answer for ever: the action is held, loudly (the full scenarios are in
+  // test/engine-blobs-lost.test.ts), where it was resent with the backoff before
+  it("BLOB_MISSING for a blob that the engine holds no bytes of: the action is held (`held` event, scope action, the blob id in the status), not resent, nothing dead-lettered, and no server blob is deleted", async () => {
     const r = await brig();
     r.random.fixed = 0.5;
     const { mutationId } = await submitWith(r, ["z".repeat(22)]);
     await r.engine.settle();
     expect(calls(r.server, "mutate")).toBe(1);
-    await r.clock.advance(500);
+    await r.clock.advance(60_000);
     await r.engine.settle();
-    expect(calls(r.server, "mutate")).toBe(2);
-    await r.clock.advance(1000);
-    await r.engine.settle();
-    expect(calls(r.server, "mutate")).toBe(3);
+    expect(calls(r.server, "mutate")).toBe(1); // no silent resend
     expect(r.engine.outbox().map((e) => e.mutationId)).toEqual([mutationId]);
     expect(r.engine.deadLetterEntries()).toEqual([]);
-    expect(r.engine.status().holds).toEqual([]);
+    expect(r.engine.status().holds).toEqual([{ scope: "action", code: "BLOB_MISSING", keyspaceId: KS, mutationId, blobIds: ["z".repeat(22)] }]);
+    expect(ofType(r, "held")).toMatchObject([{ state: "start", scope: "action", code: "BLOB_MISSING", mutationId }]);
     expect(calls(r.server, "deleteBlob")).toBe(0);
   });
 

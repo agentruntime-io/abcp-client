@@ -24,10 +24,12 @@ import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
+import type { BlobStash } from "../engine/blob-store.js";
 import { StorageError } from "../engine/errors.js";
 import { MemoryStorage, type MemoryStorageOptions } from "../engine/memory-storage.js";
 import { partitionId, sameKey, type PartitionKey, type StorageProvider } from "../engine/tabs.js";
 import type { OutboxStorage, ReplicaImage, StorageMode, StorageOp, StoredLight, StoredState, StoreName } from "../engine/storage.js";
+import { FileBlobStash } from "./file-blob-stash.js";
 import { parse, stringify } from "./serialize.js";
 
 const JOURNAL = "journal.jsonl";
@@ -271,6 +273,14 @@ export class FileStorageProvider implements StorageProvider {
 
   private dirOf(key: PartitionKey): string {
     return path.join(this.root, createHash("sha256").update(partitionId(key)).digest("hex").slice(0, 32));
+  }
+
+  /**
+   * The stash of the bytes that the partition's actions name (09 [READ-94], 14 [CLI-44], [CLI-21]): files in `blobs` under the partition's directory, as durable as its outbox. `destroy` removes it
+   * with the partition (14 [CLI-65]). The engine takes it as its default; an app's own stash goes before it.
+   */
+  blobStash(key: PartitionKey): BlobStash {
+    return new FileBlobStash(path.join(this.dirOf(key), "blobs"));
   }
 
   open(key: PartitionKey): Promise<OutboxStorage> {

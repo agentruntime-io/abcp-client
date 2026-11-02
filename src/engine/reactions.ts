@@ -23,6 +23,7 @@ import { codeName, isKnownClass, isKnownCode, reactionOf, retryReasonName } from
 import { encodeContent } from "./entry.js";
 import { makeReject } from "./endings.js";
 import type { Follow } from "./follow.js";
+import type { RepairResult } from "./blob-store.js";
 import type { Hold, HoldKind } from "./holds.js";
 import type { LaneName } from "./manifests.js";
 import { ReplicaLayer } from "./replica.js";
@@ -68,7 +69,7 @@ export abstract class ReactionLayer extends ReplicaLayer {
    * 09 [READ-89], 14 [CLI-44]: an action got `Retry{BLOB_PENDING}` or `Reject{BLOB_MISSING}`: the upload of the blobs that it names is completed or repeated with the
    * bytes that the engine holds (`blobs.ts`). Resolves when that is done, whatever came of it.
    */
-  protected abstract repairBlobs(e: OutboxEntry): Promise<void>;
+  protected abstract repairBlobs(e: OutboxEntry): Promise<RepairResult>;
   protected abstract requestResumeCheck(f: Follow, cause: string): void;
   protected abstract whenLoaded(f: Follow): Promise<void>;
   protected abstract probeKeyspaceLoad(f: Follow): void;
@@ -186,7 +187,7 @@ export abstract class ReactionLayer extends ReplicaLayer {
       case RetryReason.BLOB_PENDING:
         // 09 [READ-89], 14 [CLI-44]: "the client completes or repeats the upload of the same blob bytes (09 §9.9), then resends": nothing was recorded; the
         // identical action is resent after the larger of `after_ms` and the client backoff, once the upload is done
-        this.afterBlobRepair(e, this.nextDelay(e, retry.afterMs));
+        this.afterBlobRepair(e, this.nextDelay(e, retry.afterMs), "pending");
         break;
       case RetryReason.NOT_PROCESSED:
       case RetryReason.LANE_NOT_READY:
@@ -209,19 +210,27 @@ export abstract class ReactionLayer extends ReplicaLayer {
    * The upload of the blobs that the action names is completed or repeated (09 [READ-89]), and the action is resent after `delayMs` or after the upload, whichever is later
    * (14 [CLI-44], [CLI-43]). The entry is not sent while the upload is under way.
    */
-  protected afterBlobRepair(e: OutboxEntry, delayMs: number): void {
+  protected afterBlobRepair(e: OutboxEntry, delayMs: number, why: "missing" | "pending"): void {
     const rt = this.rt(e.mutationId);
     const started = this.clock.now();
     rt.nextAttemptAt = Number.MAX_SAFE_INTEGER; // not before the upload is done
     this.detach(
       (async () => {
+        let done: RepairResult | undefined;
         try {
-          await this.repairBlobs(e);
+          done = await this.repairBlobs(e);
         } catch (err) {
           this.noteInternalError(err);
         }
         await this.run(() => {
           if (!this.entries.has(e.mutationId) || e.outcome !== undefined) return;
+          // 09 [READ-94], 14 [CLI-44], V21 MUST-1: the server has not the blob, and the engine holds the bytes of a blob that the action names in no stash: with nothing to upload, or after an upload that
+          // did not mend it, a resend meets the same answer for ever. The action is held, loudly, until the app stages the bytes again (see the SPEC-QUESTION in `blobs.ts`).
+          if (why === "missing" && done !== undefined && done.lacking.length > 0 && (done.uploaded === 0 || rt.blobRepairs > 0)) {
+            this.startHold({ kind: "BLOB_BYTES_LOST", scope: "action", keyspaceId: e.keyspaceId, mutationId: e.mutationId, code: codeName(Code.BLOB_MISSING), blobIds: done.lacking });
+            return; // the entry is not sent while the hold lasts (`nextAttemptAt` stays out of reach; `bytesStagedAgain` frees it)
+          }
+          if (done !== undefined && done.uploaded > 0) rt.blobRepairs++;
           rt.nextAttemptAt = 0;
           this.deferEntry(e, Math.max(0, delayMs - (this.clock.now() - started)));
         });
@@ -377,7 +386,7 @@ export abstract class ReactionLayer extends ReplicaLayer {
       case "RETRY":
         // a `Reject` of class RETRY is `BLOB_MISSING` (A.2): "the client re-uploads the same bytes, then resends the identical mutation" (09 [READ-89], 14 [CLI-44], 02
         // [ARC-51] item 1), with the client backoff
-        this.afterBlobRepair(e, this.nextDelay(e, undefined));
+        this.afterBlobRepair(e, this.nextDelay(e, undefined), "missing");
         return;
       case "DEAD_LETTER":
         await this.endAction(e, { sink: "deadLetter", reject, reason: codeName(reject.code), dependents: "fail" });
@@ -733,7 +742,8 @@ export abstract class ReactionLayer extends ReplicaLayer {
     const out: OutboxEntry[] = [];
     for (const e of this.entries.values()) {
       if (e.outcome !== undefined || this.ending.has(e.mutationId) || e.stuck !== undefined) continue;
-      if (h.scope === "app" || (h.scope === "keyspace" && h.keyspaceId === e.keyspaceId) || (h.scope === "lane" && h.keyspaceId === e.keyspaceId && h.lane === e.lane)) out.push(e);
+      if (h.scope === "action" ? h.mutationId === e.mutationId : false) out.push(e);
+      else if (h.scope === "app" || (h.scope === "keyspace" && h.keyspaceId === e.keyspaceId) || (h.scope === "lane" && h.keyspaceId === e.keyspaceId && h.lane === e.lane)) out.push(e);
     }
     return out.sort((a, b) => a.ordinal - b.ordinal);
   }
@@ -784,6 +794,7 @@ export abstract class ReactionLayer extends ReplicaLayer {
    */
   protected reidentify(_why: string): void {
     this.clientId = this.newClientId();
+    this.onRuntimeChanged(); // the tabs that follow this one tell the user's own presence entry by it
     for (const f of this.follows.values()) {
       f.lanes.SEQUENCED.reset();
       f.lanes.GATED.reset();
@@ -936,6 +947,11 @@ export abstract class ReactionLayer extends ReplicaLayer {
       if (e === undefined || this.ending.has(mutationId)) return false;
       if (!e.everSent && !e.registered) {
         await this.endAction(e, { sink: "none", reject: makeReject(Code.CANCELLED, ErrorClass.DEAD_LETTER, "cancelled by the app"), reason: codeName(Code.CANCELLED), dependents: "fail" });
+        return true;
+      }
+      // held for bytes that the engine lost (`BLOB_BYTES_LOST`, see `blobs.ts`): the server answered BLOB_MISSING, which records nothing (09 [READ-89]), so the action can leave as one never sent
+      if (!e.registered && this.holds.has("BLOB_BYTES_LOST", e.keyspaceId, undefined, mutationId)) {
+        await this.endAction(e, { sink: "none", reject: makeReject(Code.CANCELLED, ErrorClass.DEAD_LETTER, "cancelled by the app"), reason: codeName(Code.CANCELLED), dependents: "fail", slot: "release" });
         return true;
       }
       if (e.lane !== "GATED") return false;

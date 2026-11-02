@@ -23,6 +23,10 @@
 //    ahead of the chosen one in the lock's queue passes the lock on. With no answer the flusher keeps the role. "Two flushers MUST NOT drain
 //    one outbox": the lock is released only after the work of the old flusher has ended, and a tab that is not the flusher writes nothing.
 //
+//  - [CLI-61], 09 [READ-74], [READ-83] A follower tab that closes keeps no presence: each tab holds a lock named for its tab and engine (`tabLockName`) for as long as it lives, and the flusher asks for
+//    it for each follower that it hears of; the platform grants it when the tab closes or crashes, and the flusher then ends the tab's registrations (`presenceTabGone`), leaving a topic when the
+//    last of its tabs has gone. A `pagehide` is a hint that says so at once (`gone`). Where there is no reliable cross-tab lock, each tab is an engine of its own and there is no follower to lose.
+//
 // SPEC-QUESTION (14 [CLI-61], Q54.1): the text does not say where a follower's `submit` goes. Reading A (taken): to the flusher, which authors,
 // stores and answers it: [CLI-21] asks that the call resolve only when the action is in a durable outbox, which holds, and the flusher
 // is the one writer of the outbox, so the dependencies of [CLI-30] are computed from one view. Reading B: the follower appends to the
@@ -34,6 +38,8 @@
 // store already holds is answered with it, authored once. `NO_FLUSHER` is for an engine that is stopping, and for one with no tab host.
 
 import { KeyspaceLifecycle } from "../gen/abpc/v2/types_pb.js";
+import { BoundedSet } from "./bounded.js";
+import { BlobError, type BlobErrorCode, type BlobWait } from "./blob-store.js";
 import { LocalRefusal, type LocalRefusalCode, type StorageCause } from "./errors.js";
 import type { EngineConfig } from "./core.js";
 import { Follow } from "./follow.js";
@@ -41,7 +47,7 @@ import type { PresenceEntryRaw, PresenceEvent } from "./presence.js";
 import { RevocationLayer } from "./revocation.js";
 import type { ReplicaImage, ReplicaSummary } from "./storage.js";
 import type { LockLease, PartitionKey, StorageProvider, TabChannel, TabHost } from "./tabs.js";
-import { lockName } from "./tabs.js";
+import { lockName, tabLockName } from "./tabs.js";
 import type { EngineEvent, HoldInfo } from "./types.js";
 
 /** How long a follower waits for the flusher to answer a command before it asks again, on the engine's clock (it never refuses a call for it). */
@@ -64,12 +70,19 @@ export interface RuntimeSnapshot {
   loadsWithSkipped: number;
   anomalies: Record<string, number>;
   stopped: Record<string, string>;
+  /** The `client_id` of the flusher's session: what a follower tab tells the user's own presence entry by (14 [CLI-61], 09 [READ-75]). */
+  clientId: string;
+  /** The stash of blob bytes, as the flusher has it (see `SyncStatus`). */
+  blobStash: "memory" | "durable";
+  stagedBlobs: number;
+  stagedBytes: number;
 }
 
 type TabMessage =
-  | { t: "hello"; from: string; visible: boolean; reply: boolean }
+  /** `inc`: the engine of the tab (a reload is another one); `locked`: the tab holds its lock (`tabLockName`), so the flusher can learn that it closed. */
+  | { t: "hello"; from: string; visible: boolean; reply: boolean; inc?: string; locked?: boolean }
   | { t: "visible"; from: string; visible: boolean }
-  | { t: "gone"; from: string }
+  | { t: "gone"; from: string; inc?: string }
   /** The flusher offers its role to the tabs of the engine; a visible follower answers with `accept`. */
   | { t: "offer"; from: string; id: string }
   | { t: "accept"; from: string; to: string; id: string }
@@ -83,7 +96,14 @@ type TabMessage =
   | { t: "presence"; from: string; keyspaceId: string; topic: string; entries: PresenceEntryRaw[] }
   /** Any other presence event of the flusher (`joined`, `published`, `refused`, `ended`), for the tabs whose calls it concerns. */
   | { t: "presence-event"; from: string; event: PresenceEvent }
-  | { t: "cmd"; from: string; id: number; name: string; args: unknown[] }
+  /** `abortable`: the app of the tab may stop the call (`cmd-abort`); `wait`: it wants to hear what the call waits for (`wait`). */
+  | { t: "cmd"; from: string; inc?: string; id: number; name: string; args: unknown[]; abortable?: boolean; wait?: boolean }
+  /** The app of a follower tab stopped a call that it carried to the flusher. */
+  | { t: "cmd-abort"; from: string; inc?: string; id: number }
+  /** The flusher runs the call (or has run it): the follower does not carry it again. */
+  | { t: "accepted"; from: string; to: string; id: number }
+  /** What a call of a follower tab waits for on the flusher (`BlobCallOptions.onWait`). */
+  | { t: "wait"; from: string; to: string; id: number; wait: BlobWait }
   | { t: "reply"; from: string; to: string; id: number; ok: true; value: unknown }
   | { t: "reply"; from: string; to: string; id: number; ok: false; error: { name: string; code?: string; cause?: string; detail: string; message: string } };
 
@@ -94,7 +114,35 @@ interface Wait {
   reject: (e: unknown) => void;
   /** Cancels the timer that asks again. */
   cancel: () => void;
+  /** The flusher answered that it runs the call: it is not carried again unless another tab becomes the flusher. */
+  accepted: boolean;
+  /** What the app gave the call: it may stop it, and hears what it waits for. */
+  signal?: AbortSignal;
+  onWait?: (w: BlobWait) => void;
+  /** Removes the listener of the signal. */
+  detach?: () => void;
 }
+
+/** What the app of a follower tab gave a call that goes to the flusher (14 [CLI-44]: "the app decides when to stop asking"). */
+export interface CommandOptions {
+  signal?: AbortSignal;
+  onWait?: (w: BlobWait) => void;
+}
+
+/** What a command that a follower's call carries to the flusher may use: the signal that stops it, and where its waits go. */
+export interface CommandContext {
+  signal?: AbortSignal;
+  onWait?: (w: BlobWait) => void;
+}
+
+/** A command that the flusher runs for a follower tab, with the answer that it gave (kept for a while, so that a call that is carried again is answered, not run again). */
+interface RunningCommand {
+  ctl: AbortController;
+  reply?: Extract<TabMessage, { t: "reply" }>;
+}
+
+/** How many answers of finished commands the flusher keeps for the calls that are carried again. */
+const COMMANDS_REMEMBERED = 256;
 
 /** A hidden flusher's offer of the role. */
 interface HandoverRound {
@@ -122,6 +170,17 @@ export abstract class TabLayer extends RevocationLayer {
   private readonly peers = new Map<string, boolean>();
   private readonly waits = new Map<number, Wait>();
   private cmdSeq = 0;
+  /** This engine among the engines of its tab (a reload is the same tab id): the lock of this tab is named with it, and so are its calls. Not the engine's random source: it tells engines apart, no more. */
+  private readonly incarnation = `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
+  /** The lock that this tab holds for as long as it lives (`tabLockName`); undefined where there is none, or when the tab did not get it. */
+  private tabLease: LockLease | undefined;
+  /** The flusher's requests for the locks of the follower tabs that it knows of: one is granted when its tab is gone. By tab id. */
+  private readonly tabWatch = new Map<string, { inc: string; abort: AbortController }>();
+  /** The engines of tabs that are known to be gone: what they still send is not run. */
+  private readonly goneIncarnations = new BoundedSet<string>(1024);
+  /** The commands that followers carried to this flusher, by `from`, `inc` and `id`. */
+  private readonly commandsRun = new Map<string, RunningCommand>();
+  private offPageHide: (() => void) | undefined;
   private round: HandoverRound | undefined;
   private handoffSeq = 0;
   /** The handover that the flusher announced: the tab that it is for, and until when this tab acts on it. */
@@ -133,7 +192,7 @@ export abstract class TabLayer extends RevocationLayer {
   private stateQueued = false;
   protected handOverWhenHidden = false;
   /** The commands that a flusher runs for a follower, by name. */
-  protected abstract commands(): Record<string, (args: unknown[]) => Promise<unknown>>;
+  protected abstract commands(): Record<string, (args: unknown[], ctx?: CommandContext) => Promise<unknown>>;
   protected abstract becomeFlusher(): Promise<void>;
 
   protected constructor(cfg: EngineConfig) {
@@ -187,7 +246,14 @@ export abstract class TabLayer extends RevocationLayer {
       this.emit({ type: "role", role: "flusher", cause: "ELECTED", clientId: this.clientId });
       return;
     }
+    // 09 [READ-74]: the lock that tells the flusher that this tab is gone: held before the first message of this tab, so that no message precedes it
+    try {
+      this.tabLease = await this.tabHost.locks.tryAcquire(tabLockName(this.partition, this.tabHost.tabId, this.incarnation));
+    } catch {
+      this.tabLease = undefined; // no lock: this tab's registrations end by its `gone` message, or with the flusher
+    }
     this.openChannel();
+    this.watchPageHide();
     const lease = await this.tabHost.locks.tryAcquire(lockName(this.partition));
     if (lease !== undefined) {
       this.lease = lease;
@@ -267,7 +333,67 @@ export abstract class TabLayer extends RevocationLayer {
 
   private announce(): void {
     if (this.channel === undefined || this.tabHost === undefined) return;
-    this.send({ t: "hello", from: this.tabHost.tabId, visible: this.visibleNow(), reply: false });
+    this.send({ t: "hello", from: this.tabHost.tabId, visible: this.visibleNow(), reply: false, inc: this.incarnation, locked: this.tabLease !== undefined });
+  }
+
+  /** The page is going away: the other tabs are told at once (a hint; the lock of the tab is what tells for sure), and the tab says so again when it comes back. */
+  private watchPageHide(): void {
+    const host = this.tabHost;
+    if (host?.onPageHide === undefined) return;
+    this.offPageHide = host.onPageHide((event) => {
+      if (this.stopped || this.role === "stopped") return;
+      if (event === "hide") {
+        this.send({ t: "gone", from: host.tabId, inc: this.incarnation });
+        return;
+      }
+      // a page that came back from the back-forward cache: the flusher ended what it registered, so the tab registers it again
+      this.announce();
+      if (this.role === "follower") this.onFlusherChanged();
+    });
+  }
+
+  /**
+   * The flusher asks for the lock of a follower tab, and is granted it when the tab is gone (it closed or crashed: the platform frees the lock). Not for a tab that holds none, nor with no reliable
+   * lock; a tab that is known by another engine of it (a reload) is watched under the new one.
+   */
+  private watchTab(tab: string, inc: string | undefined, locked: boolean | undefined): void {
+    const host = this.tabHost;
+    if (this.role !== "flusher" || host === undefined || !host.locks.reliable || tab === host.tabId || locked !== true || inc === undefined) return;
+    if (this.goneIncarnations.has(inc)) return;
+    const have = this.tabWatch.get(tab);
+    if (have?.inc === inc) return;
+    have?.abort.abort();
+    const ctl = new AbortController();
+    this.tabWatch.set(tab, { inc, abort: ctl });
+    host.locks.acquire(tabLockName(this.partition, tab, inc), ctl.signal).then(
+      (lease) => {
+        void lease.release();
+        if (ctl.signal.aborted || this.tabWatch.get(tab)?.abort !== ctl) return; // another engine of the tab replaced it, or this tab is not the flusher any more
+        this.tabWatch.delete(tab);
+        this.tabIsGone(tab, inc);
+      },
+      () => undefined, // aborted: this tab stopped watching
+    );
+  }
+
+  /** A follower tab is gone, said by its message or by its lock: what it registered ends (09 [READ-74]: the engine leaves a topic when the last of its tabs has). */
+  private tabIsGone(tab: string, inc: string | undefined): void {
+    if (inc !== undefined) this.goneIncarnations.add(inc);
+    this.peers.delete(tab);
+    const w = this.tabWatch.get(tab);
+    if (w !== undefined && (inc === undefined || w.inc === inc)) {
+      w.abort.abort();
+      this.tabWatch.delete(tab);
+    }
+    for (const [key, r] of [...this.commandsRun]) if (key.startsWith(`${tab}\u0000${inc ?? ""}\u0000`)) r.ctl.abort(); // a call of a tab that is gone is of no use to it
+    if (this.role === "flusher") this.post(() => this.presenceTabGone(tab));
+  }
+
+  private stopWatching(): void {
+    for (const w of this.tabWatch.values()) w.abort.abort();
+    this.tabWatch.clear();
+    for (const r of this.commandsRun.values()) r.ctl.abort();
+    this.commandsRun.clear();
   }
 
   private watchVisibility(): void {
@@ -297,7 +423,12 @@ export abstract class TabLayer extends RevocationLayer {
     switch (m.t) {
       case "hello":
         this.peers.set(m.from, m.visible);
-        if (!m.reply && this.tabHost !== undefined) this.send({ t: "hello", from: this.tabHost.tabId, visible: this.visibleNow(), reply: true });
+        if (m.inc !== undefined) this.goneIncarnations.delete(m.inc); // a page that came back from the back-forward cache is no longer gone
+        if (!m.reply && this.tabHost !== undefined) this.send({ t: "hello", from: this.tabHost.tabId, visible: this.visibleNow(), reply: true, inc: this.incarnation, locked: this.tabLease !== undefined });
+        if (this.role === "flusher") {
+          this.watchTab(m.from, m.inc, m.locked);
+          if (!m.reply) this.queueState(); // a tab that comes learns what the flusher is (its `client_id`, its holds, what it stages)
+        }
         if (m.visible) this.offerAgain();
         return;
       case "visible":
@@ -305,9 +436,8 @@ export abstract class TabLayer extends RevocationLayer {
         if (m.visible) this.offerAgain();
         return;
       case "gone":
-        this.peers.delete(m.from);
         // 09 [READ-74]: "The engine MUST NOT leave a topic while any of its tabs is still in it": a tab that left, left its topics
-        if (this.role === "flusher") this.post(() => this.presenceTabGone(m.from));
+        this.tabIsGone(m.from, m.inc);
         return;
       case "offer":
         // 14 [CLI-61]: a tab that is alive, a follower in the lock's queue and visible takes the role that a hidden flusher offers
@@ -347,19 +477,44 @@ export abstract class TabLayer extends RevocationLayer {
       case "cmd":
         if (this.role === "flusher" && !this.stopped) this.runCommand(m);
         return;
+      case "cmd-abort":
+        if (this.role === "flusher") this.commandsRun.get(`${m.from}\u0000${m.inc ?? ""}\u0000${m.id}`)?.ctl.abort();
+        return;
+      case "accepted": {
+        const w = m.to === this.tabHost?.tabId ? this.waits.get(m.id) : undefined;
+        if (w !== undefined) {
+          w.accepted = true;
+          w.cancel(); // the flusher runs it: it is not carried again
+        }
+        return;
+      }
+      case "wait": {
+        const w = m.to === this.tabHost?.tabId ? this.waits.get(m.id) : undefined;
+        if (w?.onWait !== undefined) {
+          try {
+            w.onWait(m.wait);
+          } catch {
+            // a callback of the app never stops the engine
+          }
+        }
+        return;
+      }
       case "reply": {
         if (m.to !== this.tabHost?.tabId) return;
         const w = this.waits.get(m.id);
         if (w === undefined) return;
         this.waits.delete(m.id);
         w.cancel();
+        w.detach?.();
         if (m.ok) {
           // the call resolves when this tab shows what it did: the app reads its own writes through its own engine (14 [CLI-21])
           const value = m.value;
           const done = (): void => w.resolve(value);
           if (this.role === "follower") this.detach(this.run(() => (this.role === "follower" ? this.refreshMirrors() : undefined)).then(done, done));
           else done();
-        } else w.reject(m.error.name === "LocalRefusal" ? new LocalRefusal(m.error.code as LocalRefusalCode, m.error.detail, m.error.cause as StorageCause | undefined) : new Error(m.error.message));
+        } else if (m.error.name === "LocalRefusal") w.reject(new LocalRefusal(m.error.code as LocalRefusalCode, m.error.detail, m.error.cause as StorageCause | undefined));
+        else if (m.error.name === "BlobError") w.reject(new BlobError(m.error.code as BlobErrorCode, m.error.detail.replace(/^blob: [A-Z_]+: /, "")));
+        else w.reject(new Error(m.error.message));
         return;
       }
     }
@@ -415,6 +570,10 @@ export abstract class TabLayer extends RevocationLayer {
       loadsWithSkipped,
       anomalies,
       stopped,
+      clientId: this.clientId,
+      blobStash: this.blobStashMode(),
+      stagedBlobs: this.stashStats().count,
+      stagedBytes: this.stashStats().bytes,
     };
   }
 
@@ -447,19 +606,45 @@ export abstract class TabLayer extends RevocationLayer {
   private runCommand(m: Extract<TabMessage, { t: "cmd" }>): void {
     const host = this.tabHost;
     if (host === undefined) return;
-    const fn = this.commands()[m.name];
-    const reply = (r: { ok: true; value: unknown } | { ok: false; error: { name: string; code?: string; detail: string; message: string } }): void => {
-      this.send({ t: "reply", from: host.tabId, to: m.from, id: m.id, ...r } as TabMessage);
-    };
-    if (fn === undefined) {
-      reply({ ok: false, error: { name: "Error", detail: m.name, message: `unknown command ${m.name}` } });
+    if (m.inc !== undefined && this.goneIncarnations.has(m.inc)) return; // the tab is gone: nobody is waiting for the answer
+    const key = `${m.from}\u0000${m.inc ?? ""}\u0000${m.id}`;
+    const send = (r: Extract<TabMessage, { t: "reply" }>): void => this.send(r);
+    // a call that is carried again (the follower asked again, or its message came twice) is run once: the flusher says that it has it, and answers when it is done
+    const known = this.commandsRun.get(key);
+    if (known !== undefined) {
+      this.send({ t: "accepted", from: host.tabId, to: m.from, id: m.id });
+      if (known.reply !== undefined) send(known.reply);
       return;
     }
+    const fn = this.commands()[m.name];
+    const reply = (r: { ok: true; value: unknown } | { ok: false; error: { name: string; code?: string; cause?: string; detail: string; message: string } }): void => {
+      const msg = { t: "reply", from: host.tabId, to: m.from, id: m.id, ...r } as Extract<TabMessage, { t: "reply" }>;
+      const rc = this.commandsRun.get(key);
+      if (rc !== undefined) rc.reply = msg;
+      send(msg);
+    };
+    if (fn === undefined) {
+      this.send({ t: "reply", from: host.tabId, to: m.from, id: m.id, ok: false, error: { name: "Error", detail: m.name, message: `unknown command ${m.name}` } });
+      return;
+    }
+    const ctl = new AbortController();
+    this.commandsRun.set(key, { ctl });
+    while (this.commandsRun.size > COMMANDS_REMEMBERED) {
+      const oldest = [...this.commandsRun].find(([, r]) => r.reply !== undefined);
+      if (oldest === undefined) break;
+      this.commandsRun.delete(oldest[0]);
+    }
+    this.send({ t: "accepted", from: host.tabId, to: m.from, id: m.id });
+    const ctx: CommandContext = {
+      ...(m.abortable === true ? { signal: ctl.signal } : {}),
+      ...(m.wait === true ? { onWait: (wait: BlobWait) => this.send({ t: "wait", from: host.tabId, to: m.from, id: m.id, wait }) } : {}),
+    };
     this.detach(
-      fn(m.args).then(
+      fn(m.args, ctx).then(
         (value) => reply({ ok: true, value }),
         (e: unknown) => {
           if (e instanceof LocalRefusal) reply({ ok: false, error: { name: "LocalRefusal", code: e.code, ...(e.cause !== undefined ? { cause: e.cause } : {}), detail: e.message.replace(/^refused locally \([A-Z_, ]+\): /, ""), message: e.message } });
+          else if (e instanceof BlobError) reply({ ok: false, error: { name: "BlobError", code: e.code, detail: e.message, message: e.message } });
           else reply({ ok: false, error: { name: "Error", detail: String(e), message: e instanceof Error ? e.message : String(e) } });
         },
       ),
@@ -474,27 +659,42 @@ export abstract class TabLayer extends RevocationLayer {
    * (see the SPEC-QUESTION above). A call that the flusher has not answered is asked again every `COMMAND_TIMEOUT_MS`, and stays waiting: it is
    * never refused while the flusher may still commit it ([CLI-21]).
    */
-  protected viaFlusher<T>(name: string, args: unknown[], local: () => Promise<T>): Promise<T> {
+  protected viaFlusher<T>(name: string, args: unknown[], local: () => Promise<T>, opts: CommandOptions = {}): Promise<T> {
     if (this.role !== "follower") return local();
     const host = this.tabHost;
     if (host === undefined || this.channel === undefined) return Promise.reject(new LocalRefusal("NO_FLUSHER", "this engine has no flusher to carry the call"));
+    // 14 [CLI-44]: "the app decides when to stop asking": a call that the app has stopped is not carried at all
+    if (opts.signal?.aborted === true) return Promise.reject(new BlobError("ABORTED", "the call was aborted"));
     return new Promise<T>((resolve, reject) => {
       const id = ++this.cmdSeq;
-      const w: Wait = { name, args, resolve: resolve as (v: unknown) => void, reject, cancel: () => undefined };
+      const w: Wait = { name, args, resolve: resolve as (v: unknown) => void, reject, cancel: () => undefined, accepted: false, ...(opts.signal !== undefined ? { signal: opts.signal } : {}), ...(opts.onWait !== undefined ? { onWait: opts.onWait } : {}) };
+      if (opts.signal !== undefined) {
+        const signal = opts.signal;
+        const onAbort = (): void => {
+          if (this.waits.get(id) !== w) return;
+          this.waits.delete(id);
+          w.cancel();
+          this.send({ t: "cmd-abort", from: host.tabId, inc: this.incarnation, id }); // the flusher stops the call that it runs
+          reject(new BlobError("ABORTED", "the call was aborted"));
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+        w.detach = () => signal.removeEventListener("abort", onAbort);
+      }
       this.waits.set(id, w);
       this.postCommand(id, w);
     });
   }
 
-  /** Carries a call to the flusher, and arms the timer that carries it again. */
+  /** Carries a call to the flusher, and arms the timer that carries it again, until the flusher says that it runs it. */
   private postCommand(id: number, w: Wait): void {
     const host = this.tabHost;
     if (host === undefined) return;
     w.cancel();
+    w.accepted = false; // a flusher that has not heard of the call (it is a new one) has not accepted it
     w.cancel = this.clock.setTimer(COMMAND_TIMEOUT_MS, () => {
-      if (this.waits.get(id) === w && this.role === "follower") this.postCommand(id, w);
+      if (this.waits.get(id) === w && this.role === "follower" && !w.accepted) this.postCommand(id, w);
     });
-    this.send({ t: "cmd", from: host.tabId, id, name: w.name, args: w.args });
+    this.send({ t: "cmd", from: host.tabId, inc: this.incarnation, id, name: w.name, args: w.args, ...(w.signal !== undefined ? { abortable: true } : {}), ...(w.onWait !== undefined ? { wait: true } : {}) });
   }
 
   /** The calls of this tab that wait for the flusher's answer (14 [CLI-21], [CLI-41]): none is refused while the flusher may still commit it. */
@@ -512,12 +712,13 @@ export abstract class TabLayer extends RevocationLayer {
     this.waits.clear();
     for (const w of mine) {
       w.cancel();
+      w.detach?.();
       const fn = this.commands()[w.name];
       if (fn === undefined) {
         w.reject(new Error(`unknown command ${w.name}`));
         continue;
       }
-      this.detach(fn(w.args).then(w.resolve, w.reject));
+      this.detach(fn(w.args, { ...(w.signal !== undefined ? { signal: w.signal } : {}), ...(w.onWait !== undefined ? { onWait: w.onWait } : {}) }).then(w.resolve, w.reject));
     }
   }
 
@@ -536,6 +737,7 @@ export abstract class TabLayer extends RevocationLayer {
     }
     for (const w of waiting) {
       w.cancel();
+      w.detach?.();
       const id = w.name === "submit" ? (w.args[2] as string | undefined) : undefined;
       if (id !== undefined && held?.has(id) === true) w.resolve({ mutationId: id });
       else w.reject(new LocalRefusal("NO_FLUSHER", why));
@@ -770,25 +972,33 @@ export abstract class TabLayer extends RevocationLayer {
   protected resetRuntime(): void {
     super.resetRuntime();
     this.stateQueued = false;
+    this.stopWatching(); // a follower that watches no tab: the next flusher watches them
   }
 
   /** Releases what the tab holds: the lock, the channel, the visibility watch. */
   protected async leave(cause: "STOPPED"): Promise<void> {
     this.offVisibility?.();
     this.offVisibility = undefined;
+    this.offPageHide?.();
+    this.offPageHide = undefined;
+    this.stopWatching();
     this.cancelOffer();
     this.lockAbort?.abort();
     await this.failWaits("the engine stopped", true);
     this.role = "stopped";
     // the event reaches the app of this tab and, while the channel is open, the followers: they learn that a flusher left
     this.emit({ type: "role", role: "stopped", cause });
-    if (this.channel !== undefined && this.tabHost !== undefined) this.send({ t: "gone", from: this.tabHost.tabId });
+    if (this.channel !== undefined && this.tabHost !== undefined) this.send({ t: "gone", from: this.tabHost.tabId, inc: this.incarnation });
     this.offChannel?.();
     this.channel?.close();
     this.channel = undefined;
     if (this.lease !== undefined) {
       await this.lease.release(); // the next tab in line is granted the lock, and becomes the flusher
       this.lease = undefined;
+    }
+    if (this.tabLease !== undefined) {
+      await this.tabLease.release(); // the flusher is granted the lock of this tab: it is gone
+      this.tabLease = undefined;
     }
   }
 
@@ -797,6 +1007,8 @@ export abstract class TabLayer extends RevocationLayer {
     this.stopped = true;
     this.role = "stopped";
     this.offVisibility?.();
+    this.offPageHide?.();
+    this.stopWatching();
     this.lockAbort?.abort();
     void this.failWaits("the engine was killed", false);
     this.endRunning();

@@ -41,6 +41,15 @@ export function lockName(k: PartitionKey): string {
   return `abpc.flusher\u0000${k.origin}\u0000${k.appId}\u0000${k.partition}`;
 }
 
+/**
+ * The name of the lock that one tab holds for as long as it lives (14 [CLI-61], 09 [READ-74]): the flusher asks for it, and is granted it when the platform frees it, which is when the tab closes or
+ * crashes, so that the flusher learns that a follower tab is gone without a message of the tab. `incarnation` names one engine of the tab (a reload is the same tab id and another engine), so that
+ * the lock of a page that has gone is never taken for the one that replaced it.
+ */
+export function tabLockName(k: PartitionKey, tabId: string, incarnation: string): string {
+  return `abpc.tab\u0000${k.origin}\u0000${k.appId}\u0000${k.partition}\u0000${tabId}\u0000${incarnation}`;
+}
+
 export function sameKey(a: PartitionKey, b: PartitionKey): boolean {
   return a.origin === b.origin && a.appId === b.appId && a.partition === b.partition && a.tab === b.tab;
 }
@@ -113,4 +122,9 @@ export interface TabHost {
   visible?(): boolean;
   /** Calls `fn` when this tab's visibility changes. */
   onVisibility?(fn: (visible: boolean) => void): () => void;
+  /**
+   * Calls `fn("hide")` when the page is going away (a browser's `pagehide`) and `fn("show")` when a page that was put away comes back (`pageshow` of a page restored from the back-forward cache).
+   * It is a hint, sent at once, that the tab is closing: the lock that each tab holds (`tabLockName`) is what tells for sure, when the platform frees it. A host with neither leaves it out.
+   */
+  onPageHide?(fn: (event: "hide" | "show") => void): () => void;
 }

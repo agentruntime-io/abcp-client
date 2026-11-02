@@ -18,7 +18,7 @@
 //
 // Untested against a real IndexedDB (Node has none): `test/platform-idb-blob-stash.test.ts` runs it against the double of `test/helpers/fake-idb.ts`.
 
-import type { BlobStash, StagedBlob } from "../engine/blob-store.js";
+import { digestSha256, sameBytes, type BlobStash, type StagedBlob } from "../engine/blob-store.js";
 import { StorageError } from "../engine/errors.js";
 import { done, openDb, wait, type IDBDatabaseLike, type IDBFactoryLike, type IDBObjectStoreLike } from "./idb.js";
 
@@ -50,6 +50,8 @@ function factsOf(row: unknown): Facts | undefined {
 }
 
 export class IndexedDbBlobStash implements BlobStash {
+  /** The bytes are in a database: they outlive the page. */
+  readonly durable = true;
   private db: Promise<IDBDatabaseLike> | undefined;
   /** The connection was closed by another tab's request to delete or upgrade the database, or by `close`. */
   private closed = false;
@@ -128,6 +130,8 @@ export class IndexedDbBlobStash implements BlobStash {
     const facts = factsOf(factsRow);
     if (facts === undefined || facts.keyspaceId !== keyspaceId || facts.blobId !== blobId) return undefined;
     if (!isBytes(bytes) || bytes.length !== facts.size) return undefined; // damaged: not staged
+    // a row of the right length with other bytes in it is damaged too: shown as the blob, its upload would be refused by the store at every repair (09 [READ-87]) and its action would loop on `BLOB_MISSING`
+    if (!sameBytes(await digestSha256(bytes), facts.sha256)) return undefined;
     return { keyspaceId, blobId, bytes: new Uint8Array(bytes), sha256: new Uint8Array(facts.sha256), size: facts.size, contentType: facts.contentType, stagedAtMs: facts.stagedAtMs };
   }
 
@@ -141,12 +145,12 @@ export class IndexedDbBlobStash implements BlobStash {
     await this.transact("readwrite", (s) => Promise.all([wait(s.bytes.delete(key)), wait(s.facts.delete(key))]));
   }
 
-  async list(): Promise<{ keyspaceId: string; blobId: string; size: number }[]> {
+  async list(): Promise<{ keyspaceId: string; blobId: string; size: number; stagedAtMs: number }[]> {
     const rows = await this.transact("readonly", (s) => wait(s.facts.getAll()));
-    const out: { keyspaceId: string; blobId: string; size: number }[] = [];
+    const out: { keyspaceId: string; blobId: string; size: number; stagedAtMs: number }[] = [];
     for (const row of rows) {
       const f = factsOf(row);
-      if (f !== undefined) out.push({ keyspaceId: f.keyspaceId, blobId: f.blobId, size: f.size });
+      if (f !== undefined) out.push({ keyspaceId: f.keyspaceId, blobId: f.blobId, size: f.size, stagedAtMs: f.stagedAtMs });
     }
     return out;
   }

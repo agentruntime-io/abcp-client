@@ -81,7 +81,7 @@ describe("09 [READ-94], 14 [CLI-44]: on the browser host the bytes that an actio
     // the page is reloaded: nothing of the first engine is left but IndexedDB
     const second = await w.load({ start: false });
     expect(second.engine.outbox().map((e) => e.mutationId)).toEqual([mutationId]);
-    expect(await second.engine.stagedBlobs()).toEqual([{ keyspaceId: KS, blobId: ref.blobId, size: 900 }]);
+    expect(await second.engine.stagedBlobs()).toMatchObject([{ keyspaceId: KS, blobId: ref.blobId, size: 900 }]);
     second.engine.start();
     await w.advance(second.engine, 5000);
     expect(committed(second.events, mutationId)).toBe(true);

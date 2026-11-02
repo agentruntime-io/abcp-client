@@ -25,6 +25,11 @@ export type HoldKind =
   | "MUTATE_FAILURE"
   | "UNKNOWN_DROP_REASON"
   | "CONFLICT_WAIT"
+  /**
+   * A client condition, not a row of the table (SPEC-QUESTION in `blobs.ts`): the server answered `BLOB_MISSING` to an action, and no stash of the engine holds the bytes of a blob that it names, so
+   * no upload can mend it. The action alone is held until the app stages the bytes again under the same blob id, or the action reaches its bound (14 [CLI-45]).
+   */
+  | "BLOB_BYTES_LOST"
   | "EPOCH_RESOLUTION"
   | "NO_TOKEN"
   | "SUBJECT_REVOKED";
@@ -52,6 +57,8 @@ export interface Hold {
   reject?: Reject;
   /** The time of the next probe has come: the head action may be resent, the keyspace re-added, the call repeated. */
   probeDue?: boolean;
+  /** `BLOB_BYTES_LOST`: the blobs of the action whose bytes the engine does not hold. */
+  blobIds?: string[];
 }
 
 export function holdKey(kind: HoldKind, keyspaceId?: string, lane?: LaneName, mutationId?: string): string {
@@ -116,6 +123,7 @@ export class HoldRegistry {
       if (h.lane !== undefined) i.lane = h.lane;
       if (h.mutationId !== undefined) i.mutationId = h.mutationId;
       if (h.boundMs !== undefined) i.bound = h.boundMs;
+      if (h.blobIds !== undefined) i.blobIds = [...h.blobIds];
       return i;
     });
   }

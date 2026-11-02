@@ -25,7 +25,7 @@ import type { KeyspaceView } from "./overlay.js";
 import { checkInterest, covers } from "./replica-store.js";
 import { getMember, parse as parseJson } from "../rules/jsonv1/index.js";
 import { StateValue } from "../rules/fold/index.js";
-import { TabLayer } from "./tab-layer.js";
+import { TabLayer, type CommandContext } from "./tab-layer.js";
 import type { DeadLetterEntry, DraftEntry, ExportEntry, JournalEntry, OutboxEntry, RejectionRecord, UnreadableRow } from "./storage.js";
 import type { PartitionKey } from "./tabs.js";
 import type { ActionInput, ChangeInput, EngineEvent, PreconditionInput, SubmitOptions, SubmitResult, SyncStatus } from "./types.js";
@@ -98,6 +98,11 @@ export type SignOutResult =
 export interface SignOutOptions {
   /** What to do with entries that are not synced and cannot be flushed now: keep them in a locked partition, or discard them with a report to the export hook. */
   unsynced?: "keep-locked" | "discard";
+}
+
+/** What a command of a follower tab hands the call that the flusher runs for it. */
+function callOptions(ctx: CommandContext | undefined): BlobCallOptions {
+  return { ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}), ...(ctx?.onWait !== undefined ? { onWait: ctx.onWait } : {}) };
 }
 
 /** The presence registrations of this tab (09 [READ-73], [READ-74]): kept whatever the tab's role, to be told to a new flusher (`onFlusherChanged`). */
@@ -212,6 +217,7 @@ export class Engine extends TabLayer {
     await this.drainStuck();
     await this.purgeJournal().catch(() => undefined);
     await this.persistFollowed();
+    this.startStagedSweep(); // 09 [READ-94]: staged bytes that no held action names go once they are old enough; the stash is counted for the sync status
     if (this.startRequested) this.beginRunning();
     // what a revocation left before the restart, finished after this task
     for (const f of this.follows.values()) if (f.revoked) this.post(() => this.resumeRevocation(f));
@@ -280,7 +286,7 @@ export class Engine extends TabLayer {
     return f;
   }
 
-  protected commands(): Record<string, (args: unknown[]) => Promise<unknown>> {
+  protected commands(): Record<string, (args: unknown[], ctx?: CommandContext) => Promise<unknown>> {
     return {
       submit: (a) => this.submitAction(a[0] as ActionInput, a[1] as SubmitOptions | undefined, a[2] as string | undefined),
       cancel: (a) => super.cancel(a[0] as string),
@@ -295,8 +301,9 @@ export class Engine extends TabLayer {
       presenceSet: (a) => this.guarded(() => this.presenceSet(a[0] as string, a[1] as string, a[2] as string, a[3] as Uint8Array)),
       presenceLeave: (a) => this.guarded(() => this.presenceLeave(a[0] as string, a[1] as string, a[2] as string)),
       blobStage: (a) => this.stageBlobNow(a[0] as string, a[1] as Uint8Array, a[2] as StageOptions | undefined).then((r) => this.afterStage(r)),
-      blobUpload: (a) => this.uploadBlobNow(a[0] as string, a[1] as Uint8Array, a[2] as StageOptions | undefined),
-      blobDelete: (a) => this.deleteBlobNow(a[0] as string, a[1] as string, a[2] as string),
+      // 14 [CLI-44]: what the app of a follower tab gave the call (its signal, its `onWait`) reaches the call that the flusher runs
+      blobUpload: (a, ctx) => this.uploadBlobNow(a[0] as string, a[1] as Uint8Array, { ...(a[2] as StageOptions | undefined), ...callOptions(ctx) }),
+      blobDelete: (a, ctx) => this.deleteBlobNow(a[0] as string, a[1] as string, a[2] as string, callOptions(ctx)),
       blobRelease: (a) => this.releaseBlobNow(a[0] as string, a[1] as string),
     };
   }
@@ -539,6 +546,14 @@ export class Engine extends TabLayer {
     await this.viaFlusher("presenceLeave", [tab, keyspaceId, topic], () => this.guarded(() => this.presenceLeave(tab, keyspaceId, topic)));
   }
 
+  /**
+   * The `client_id` that the entry of this engine carries (09 [READ-75]): the flusher's own, which a follower tab has from the flusher's state (14 [CLI-61]; it has none of its own, 03 [ID-35]).
+   * The view of a topic tells the entry of the user's own engine from another member's by it.
+   */
+  get presenceSelfId(): string {
+    return this.role === "follower" ? (this.runtimeMirror?.clientId ?? "") : this.clientId;
+  }
+
   /** A new flusher: the memberships and the states of this tab are told to it again (09 [READ-73]; the session of the old flusher ended with it). */
   protected onFlusherChanged(): void {
     const tab = this.tabKey();
@@ -573,17 +588,18 @@ export class Engine extends TabLayer {
 
   /**
    * Stages the bytes and uploads them: `CreateUpload`, the PUT to the signed URL with the headers that it gives, `CommitBlob` (09 [READ-86], [READ-88]); resolves with the blob's
-   * reference once the blob is committed. The `signal` and `onWait` of a call that a follower tab makes do not reach the flusher.
+   * reference once the blob is committed. The `signal` and `onWait` of a call that a follower tab makes reach the flusher, which runs the call once: the signal stops it there, and what it waits
+   * for comes back to `onWait` (14 [CLI-44]: "the app decides when to stop asking").
    */
   uploadBlob(keyspaceId: string, bytes: Uint8Array, opts: StageOptions & BlobCallOptions = {}): Promise<BlobRef> {
     const { signal, onWait, ...stage } = opts;
     const o: StageOptions = { ...stage, blobId: stage.blobId ?? this.mintBlobId() };
-    return this.viaFlusher("blobUpload", [keyspaceId, bytes, o], () => this.uploadBlobNow(keyspaceId, bytes, { ...o, ...(signal !== undefined ? { signal } : {}), ...(onWait !== undefined ? { onWait } : {}) }));
+    return this.viaFlusher("blobUpload", [keyspaceId, bytes, o], () => this.uploadBlobNow(keyspaceId, bytes, { ...o, ...(signal !== undefined ? { signal } : {}), ...(onWait !== undefined ? { onWait } : {}) }), { ...(signal !== undefined ? { signal } : {}), ...(onWait !== undefined ? { onWait } : {}) });
   }
 
-  /** `DeleteBlob` (09 [READ-91]); the cached and staged bytes of the blob go with it. */
+  /** `DeleteBlob` (09 [READ-91]); the cached and staged bytes of the blob go with it. As for `uploadBlob`, a follower tab's `signal` and `onWait` reach the flusher. */
   deleteBlob(keyspaceId: string, blobId: string, reason: string, opts: BlobCallOptions = {}): Promise<void> {
-    return this.viaFlusher("blobDelete", [keyspaceId, blobId, reason], () => this.deleteBlobNow(keyspaceId, blobId, reason, opts));
+    return this.viaFlusher("blobDelete", [keyspaceId, blobId, reason], () => this.deleteBlobNow(keyspaceId, blobId, reason, opts), { ...(opts.signal !== undefined ? { signal: opts.signal } : {}), ...(opts.onWait !== undefined ? { onWait: opts.onWait } : {}) });
   }
 
   /** Lets go of the bytes of a staged blob that no action will name (the server's blob stays until the sweep of 09 [READ-92]; the engine never deletes one on its own, [READ-94]). */
@@ -647,6 +663,9 @@ export class Engine extends TabLayer {
       suspended: rt?.suspended ?? this.holds.all().some((h) => h.kind === "APP_SUSPENDED"),
       holds: rt?.holds ?? this.holds.info(),
       pendingCalls: this.callsWaiting(),
+      blobStash: rt?.blobStash ?? this.blobStashMode(),
+      stagedBlobs: rt?.stagedBlobs ?? this.stashStats().count,
+      stagedBytes: rt?.stagedBytes ?? this.stashStats().bytes,
     };
   }
 
@@ -838,6 +857,7 @@ export class Engine extends TabLayer {
       if (unsynced > 0) {
         const discarded = this.outbox();
         await this.run(() => this.tx([...discarded.map((e) => ({ op: "deleteEntry" as const, mutationId: e.mutationId }))]));
+        for (const e of discarded) this.entries.delete(e.mutationId); // gone from the outbox: they name nothing any more
         for (const e of discarded) await this.dropStagedOf(e).catch((err: unknown) => this.noteInternalError(err)); // the actions are gone: so are the bytes that they carried
       }
       await this.stop();

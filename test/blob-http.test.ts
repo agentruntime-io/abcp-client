@@ -4,7 +4,7 @@
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { fetchBlobHttp } from "../src/engine/index.js";
+import { DRAIN_BUDGET_BYTES, fetchBlobHttp } from "../src/engine/index.js";
 
 interface Seen {
   method: string;
@@ -92,4 +92,103 @@ describe("09 [READ-86], [READ-90]: fetchBlobHttp", () => {
     ac.abort();
     await expect(h.get(`${base}/get`, { maxBytes: 10, signal: ac.signal })).rejects.toBeInstanceOf(Error);
   });
+});
+
+// V21 MUST-2, 16 [SEC-1]: the URLs are the server's, and what is behind them is not trusted: an answer that the engine does not use (the body of a PUT's answer, of a GET that is not 200) is read
+// for at most `DRAIN_BUDGET_BYTES` and then dropped, and a 200 GET is read for at most `maxBytes`, whatever the body is.
+describe("16 [SEC-1]: fetchBlobHttp reads a bounded part of every body", () => {
+  /** A `fetch` whose answer is a body of `total` octets, `chunk` octets at a time, that counts what the reader pulled; `length` is the `Content-Length` it declares, when it does. */
+  const counting = (status: number, total: number, chunk: number, length?: number): { fetchFn: typeof fetch; pulled: () => number } => {
+    let pulled = 0;
+    const fetchFn = (async () => {
+      const body = new ReadableStream<Uint8Array>({
+        pull(c) {
+          if (pulled >= total) {
+            c.close();
+            return;
+          }
+          pulled += chunk;
+          c.enqueue(new Uint8Array(chunk));
+        },
+      });
+      return new Response(body, { status, ...(length !== undefined ? { headers: { "content-length": String(length) } } : {}) });
+    }) as unknown as typeof fetch;
+    return { fetchFn, pulled: () => pulled };
+  };
+  const total = 256 << 20;
+
+  it("a GET answered with a status other than 200 reads at most the drain budget of a 256 MiB body", async () => {
+    const small = counting(404, total, 1024);
+    expect(await fetchBlobHttp(small.fetchFn).get("https://x.test/a", { maxBytes: 10 })).toMatchObject({ status: 404 });
+    expect(small.pulled()).toBeLessThanOrEqual(DRAIN_BUDGET_BYTES + 4 * 1024); // the budget, and the chunk or two that a stream pulls ahead
+    const big = counting(500, total, 1 << 20);
+    expect(await fetchBlobHttp(big.fetchFn).get("https://x.test/a", { maxBytes: 10 })).toMatchObject({ status: 500 });
+    expect(big.pulled()).toBeLessThanOrEqual(2 << 20);
+  });
+
+  it("a PUT whose answer has a 256 MiB body reads at most the drain budget of it, whatever the status", async () => {
+    for (const status of [200, 403, 500]) {
+      const small = counting(status, total, 1024);
+      expect((await fetchBlobHttp(small.fetchFn).put("https://x.test/a", {}, new Uint8Array(10))).status).toBe(status);
+      expect(small.pulled()).toBeLessThanOrEqual(DRAIN_BUDGET_BYTES + 4 * 1024);
+      const big = counting(status, total, 1 << 20);
+      await fetchBlobHttp(big.fetchFn).put("https://x.test/a", {}, new Uint8Array(10));
+      expect(big.pulled()).toBeLessThanOrEqual(2 << 20);
+    }
+  });
+
+  it("a 200 GET that declares a Content-Length over maxBytes reads nothing; one that does not is cut at maxBytes", async () => {
+    const declared = counting(200, total, 1 << 20, total);
+    expect(await fetchBlobHttp(declared.fetchFn).get("https://x.test/a", { maxBytes: 10 })).toMatchObject({ status: 200, tooLarge: true });
+    expect(declared.pulled()).toBeLessThanOrEqual(2 << 20);
+    const hidden = counting(200, total, 1 << 20);
+    expect(await fetchBlobHttp(hidden.fetchFn).get("https://x.test/a", { maxBytes: 10 })).toMatchObject({ status: 200, tooLarge: true });
+    expect(hidden.pulled()).toBeLessThanOrEqual(2 << 20);
+  });
+
+  it("against a server on the loopback that streams 128 MiB: the client stops reading, and holds a small part of it", async () => {
+    let written = 0;
+    const chunk = Buffer.alloc(1 << 20, 0x61);
+    const server = http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(req.url === "/get200" ? 200 : 404, { "content-type": "application/octet-stream" });
+      let n = 0;
+      const pump = (): void => {
+        while (n < 128 && !res.destroyed) {
+          n++;
+          written += chunk.length;
+          if (!res.write(chunk)) {
+            res.once("drain", pump);
+            return;
+          }
+        }
+        res.end();
+      };
+      pump();
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const h = fetchBlobHttp();
+      const before = process.memoryUsage().arrayBuffers;
+      for (const path of ["/get404", "/get200"]) {
+        written = 0;
+        const r = await h.get(`${url}${path}`, { maxBytes: 1 << 20 });
+        expect(r.status).toBe(path === "/get200" ? 200 : 404);
+        expect(r.bytes.length).toBe(0);
+        await new Promise((res) => setTimeout(res, 100)); // the server notices the closed connection
+        expect(written).toBeLessThan(48 << 20); // not the 128 MiB that it would have sent
+      }
+      written = 0;
+      expect((await h.put(`${url}/put404`, {}, new Uint8Array(10))).status).toBe(404);
+      await new Promise((res) => setTimeout(res, 100));
+      expect(written).toBeLessThan(48 << 20);
+      expect(process.memoryUsage().arrayBuffers - before).toBeLessThan(48 << 20);
+    } finally {
+      await new Promise<void>((r) => {
+        server.close(() => r());
+        server.closeAllConnections();
+      });
+    }
+  }, 60_000);
 });

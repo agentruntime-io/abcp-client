@@ -5,10 +5,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { digestSha256, MemoryBlobStash, set, type StagedBlob } from "../src/engine/index.js";
+import { digestSha256, set, type StagedBlob } from "../src/engine/index.js";
 import { FileBlobStash } from "../src/platform/node.js";
 import { goOffline, KS } from "./helpers/engine.js";
-import { brig, bytesOf, drive } from "./helpers/presence.js";
+import { brig, bytesOf, until } from "./helpers/presence.js";
 
 const dirs: string[] = [];
 const tmp = (): string => {
@@ -41,6 +41,15 @@ describe("09 [READ-94]: FileBlobStash keeps the bytes in files, checked on every
     expect(await s.get(KS, b.blobId)).toBeUndefined();
     expect(await s.list()).toHaveLength(1);
     await s.delete(KS, b.blobId); // nothing to delete
+  });
+
+  it("it is durable, lists when each blob was staged, and writes a file to its end before it is named (V21 N3)", async () => {
+    const dir = tmp();
+    const s = new FileBlobStash(dir);
+    expect(s.durable).toBe(true);
+    await s.put(await blob("a".repeat(22), 100));
+    expect(await s.list()).toEqual([{ keyspaceId: KS, blobId: "a".repeat(22), size: 100, stagedAtMs: 1 }]);
+    expect(fs.readdirSync(dir).filter((f) => f.endsWith(".tmp"))).toEqual([]); // each file was renamed into place
   });
 
   it("14 [CLI-65]: has answers from the facts; clear erases the files that the stash wrote and leaves the others alone", async () => {
@@ -103,19 +112,13 @@ describe("14 [CLI-44], 09 [READ-94]: an engine that restarts with an action whos
     const second = await brig({ server: first.server, clock: first.clock, manifests: first.manifests, storage: first.storage, seed: 12, cfg: { blobs: { stash: new FileBlobStash(dir) } } });
     second.random.fixed = 0;
     expect(second.engine.outbox().map((e) => e.mutationId)).toEqual([mutationId]);
-    // the stash reads files, which the engine's clock does not wait for: the clock moves while the test waits in real time
-    for (let i = 0; i < 100 && !second.events.some((e) => e.type === "committed"); i++) {
-      await new Promise((r) => setTimeout(r, 10));
-      await second.clock.advance(200);
-      await second.engine.settle();
-    }
-    expect(second.events.some((e) => e.type === "committed" && e.mutationId === mutationId)).toBe(true);
+    // the stash reads files, which the engine's clock does not wait for: the test waits for what it expects (a deadline, no assumption about the time that the files take)
+    await until(second, () => second.events.some((e) => e.type === "committed" && e.mutationId === mutationId), "the restarted engine committed the action");
     expect(Buffer.from(first.server.blobs.object(KS, ref.blobId) as Uint8Array).equals(Buffer.from(bytes))).toBe(true);
-    // confirmed: the files are gone (the engine deletes them outside its queue: real file I/O)
-    for (let i = 0; i < 100 && (await second.engine.stagedBlobs()).length > 0; i++) await new Promise((r) => setTimeout(r, 10));
+    // confirmed: the files are gone (the engine deletes them outside its queue: real file I/O, the facts first and the bytes after them)
+    await until(second, () => fs.readdirSync(dir).length === 0, "the files of the confirmed action are erased");
     expect(await second.engine.stagedBlobs()).toEqual([]);
-    expect(fs.readdirSync(dir)).toEqual([]);
-    // the default stash is in memory: after a restart the action meets BLOB_MISSING with no bytes to upload, and is resent with the backoff
+    // the default stash is in memory: after a restart the action meets BLOB_MISSING with no bytes to upload, and is held, loudly (V21 MUST-1), not resent for ever
     const third = await brig();
     third.random.fixed = 0.5;
     await goOffline(third);
@@ -128,8 +131,6 @@ describe("14 [CLI-44], 09 [READ-94]: an engine that restarts with an action whos
     await fourth.engine.settle();
     expect(fourth.engine.outbox()).toHaveLength(1);
     expect(await fourth.engine.stagedBlobs()).toEqual([]);
-    expect(fourth.engine.status().holds).toEqual([]);
-    void MemoryBlobStash;
-    void drive;
+    expect(fourth.engine.status().holds).toMatchObject([{ scope: "action", code: "BLOB_MISSING", blobIds: [ref2.blobId] }]);
   });
 });

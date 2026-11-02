@@ -6,7 +6,7 @@
 import { describe, expect, it } from "vitest";
 import { create } from "@bufbuild/protobuf";
 import { KeyEntrySchema, RecordSchema } from "../src/gen/abpc/v2/types_pb.js";
-import { StoreFull, type OutboxEntry, type ReplicaHead, type StorageOp } from "../src/engine/index.js";
+import { lockName, StoreFull, tabLockName, type OutboxEntry, type ReplicaHead, type StorageOp } from "../src/engine/index.js";
 import { MemoryStorage } from "../src/engine/memory-storage.js";
 import { BroadcastTabChannel, type BroadcastChannelConstructor } from "../src/platform/channel.js";
 import { IndexedDbStorage, IndexedDbStorageProvider } from "../src/platform/idb-storage.js";
@@ -168,6 +168,37 @@ describe("the web host", () => {
     off();
     expect(listeners.size).toBe(0);
     expect(seen).toEqual([false]);
+  });
+
+  // V21 MUST-4, 09 [READ-74], 14 [CLI-61]: `pagehide` is the hint that a tab closes, and `pageshow` of a persisted page says that it came back; the lock that the tab holds is what tells for sure
+  it("reports pagehide as a hint that the tab closes, and pageshow of a page that was put away (persisted) as its return", () => {
+    const listeners = new Map<string, Set<(e: { persisted?: boolean }) => void>>();
+    const page = {
+      addEventListener: (t: "pagehide" | "pageshow", fn: (e: { persisted?: boolean }) => void) => void (listeners.get(t) ?? listeners.set(t, new Set()).get(t))?.add(fn),
+      removeEventListener: (t: "pagehide" | "pageshow", fn: (e: { persisted?: boolean }) => void) => void listeners.get(t)?.delete(fn),
+    };
+    const fire = (t: "pagehide" | "pageshow", persisted?: boolean): void => {
+      for (const l of [...(listeners.get(t) ?? [])]) l(persisted === undefined ? {} : { persisted });
+    };
+    const h = createWebHost({ env: { indexedDB: new FakeIDBFactory(), page } });
+    const seen: string[] = [];
+    const off = h.onPageHide((e) => seen.push(e));
+    fire("pagehide");
+    fire("pageshow", false); // a page that was loaded, not restored
+    fire("pageshow", true);
+    expect(seen).toEqual(["hide", "show"]);
+    off();
+    expect([...listeners.values()].every((s) => s.size === 0)).toBe(true);
+    // without a window there is nothing to listen to
+    expect(createWebHost({ env: { indexedDB: new FakeIDBFactory() } }).onPageHide(() => undefined)()).toBeUndefined();
+  });
+
+  it("names the lock of a tab by the tab and the engine that holds it: a reload is the same tab id and another engine, and the lock of the page that went is not the one of the page that replaced it", () => {
+    const k = { origin: "https://abpc.test", appId: "app", partition: "i|ana" };
+    expect(tabLockName(k, "tab1", "e1")).not.toBe(tabLockName(k, "tab1", "e2"));
+    expect(tabLockName(k, "tab1", "e1")).not.toBe(tabLockName(k, "tab2", "e1"));
+    expect(tabLockName(k, "tab1", "e1")).not.toBe(lockName(k)); // never the flusher's lock
+    expect(tabLockName(k, "tab1", "e1")).not.toBe(tabLockName({ ...k, partition: "i|bob" }, "tab1", "e1"));
   });
 
   it("takes what the global scope gives", () => {

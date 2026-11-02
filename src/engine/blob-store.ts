@@ -16,6 +16,12 @@ export interface BlobHttp {
   get(url: string, o: { maxBytes: number; signal?: AbortSignal }): Promise<{ status: number; bytes: Uint8Array; tooLarge?: boolean }>;
 }
 
+/** What a repair of an action's blobs did (`BlobLayer.repairBlobs`): the uploads that it made, and the blobs of the action whose bytes the engine holds in no stash. */
+export interface RepairResult {
+  uploaded: number;
+  lacking: string[];
+}
+
 /** A blob that the app handed the engine and an action may name (09 [READ-94]). */
 export interface StagedBlob {
   keyspaceId: string;
@@ -32,17 +38,23 @@ export interface StagedBlob {
 
 /**
  * Where the engine keeps the bytes of the blobs that actions name until the actions are confirmed (09 [READ-94]). A durable one survives a restart: an action that names a staged blob
- * finds its bytes after a reload, and the engine uploads them again on `BLOB_MISSING` (14 [CLI-44]). The default is in memory; the browser host's is `IndexedDbBlobStash`, and a Node
- * process's is `FileBlobStash`, which the app gives the engine.
+ * finds its bytes after a reload, and the engine uploads them again on `BLOB_MISSING` (14 [CLI-44]). The default is the platform's, as durable as its outbox: the browser host's is
+ * `IndexedDbBlobStash`, and a Node host with a directory has a `FileBlobStash` in each partition's directory; where the platform has none the stash is in memory (`MemoryBlobStash`, which says so,
+ * `durable: false`), and an engine whose outbox is durable refuses to stage bytes in it (14 [CLI-21]).
  */
 export interface BlobStash {
+  /**
+   * Whether the bytes outlive the process (a stash in files or in a database). The engine reads it for the sync status and refuses to stage a blob when its outbox is durable and this is not
+   * (14 [CLI-21]: no silent fall-back to memory). A stash that does not say is taken as durable: the app gave it on purpose.
+   */
+  readonly durable?: boolean;
   put(blob: StagedBlob): Promise<void>;
   get(keyspaceId: string, blobId: string): Promise<StagedBlob | undefined>;
   /** Whether the blob is staged: what a stash that keeps its bytes in a database or on a disk answers without reading them. */
   has(keyspaceId: string, blobId: string): Promise<boolean>;
   delete(keyspaceId: string, blobId: string): Promise<void>;
-  /** What is staged, without the bytes. */
-  list(): Promise<{ keyspaceId: string; blobId: string; size: number }[]>;
+  /** What is staged, without the bytes. `stagedAtMs` is when the blob was staged (device clock); a stash that does not keep it leaves it out, and the engine never collects such a blob by age. */
+  list(): Promise<{ keyspaceId: string; blobId: string; size: number; stagedAtMs?: number }[]>;
   /**
    * Erases every staged blob: a sign-out purges what the principal's partition holds (14 [CLI-65]), and the bytes that an action carries are the principal's data too. Resolves when
    * nothing is left, and fails when something could not be erased.
@@ -52,6 +64,7 @@ export interface BlobStash {
 
 /** A `BlobStash` in memory. */
 export class MemoryBlobStash implements BlobStash {
+  readonly durable = false;
   private readonly rows = new Map<string, StagedBlob>();
 
   put(blob: StagedBlob): Promise<void> {
@@ -68,8 +81,8 @@ export class MemoryBlobStash implements BlobStash {
     this.rows.delete(`${keyspaceId}\u0000${blobId}`);
     return Promise.resolve();
   }
-  list(): Promise<{ keyspaceId: string; blobId: string; size: number }[]> {
-    return Promise.resolve([...this.rows.values()].map((b) => ({ keyspaceId: b.keyspaceId, blobId: b.blobId, size: b.size })));
+  list(): Promise<{ keyspaceId: string; blobId: string; size: number; stagedAtMs: number }[]> {
+    return Promise.resolve([...this.rows.values()].map((b) => ({ keyspaceId: b.keyspaceId, blobId: b.blobId, size: b.size, stagedAtMs: b.stagedAtMs })));
   }
   clear(): Promise<void> {
     this.rows.clear();
@@ -101,8 +114,10 @@ export interface BlobWait {
 }
 
 export interface BlobCallOptions {
-  /** Stops the call: the app decides when to stop asking (14 [CLI-44]). The call fails with `ABORTED`. */
+  /** Stops the call: the app decides when to stop asking (14 [CLI-44]). The call fails with `ABORTED`. A follower tab's signal reaches the flusher, which stops the call there. */
   signal?: AbortSignal;
+  /** `getBlob`: the most octets that the call buffers (16 [SEC-1]); a blob that the server declares larger is refused with `DOWNLOAD_TOO_LARGE` before any byte is read. Default: the engine's `blobs.maxDownloadBytes`. */
+  maxBytes?: number;
   /** Called each time the call waits before it asks again. */
   onWait?: (wait: BlobWait) => void;
 }
@@ -145,6 +160,8 @@ export type BlobErrorCode =
   /** The rounds of the upload were used up (see the SPEC-QUESTION above). */
   | "UPLOAD_FAILED"
   | "DOWNLOAD_FAILED"
+  /** The blob is declared larger than the call allows (`BlobCallOptions.maxBytes`, `blobs.maxDownloadBytes`): nothing was read (16 [SEC-1]). */
+  | "DOWNLOAD_TOO_LARGE"
   | "ABORTED"
   | "NO_TOKEN"
   | "SUBJECT_REVOKED"
@@ -176,10 +193,39 @@ export const MAX_UPLOAD_ROUNDS = 4;
 export const MAX_TRANSFER_ATTEMPTS = 4;
 /** The default size of the cache of downloaded bytes. */
 export const DEFAULT_BLOB_CACHE_BYTES = 32 * 1024 * 1024;
+/** The most octets that `getBlob` buffers unless the app says less or more (16 [SEC-1]): the limit `max_blob_bytes` is the server's, and has no protocol maximum (04 Table 4.10a). */
+export const DEFAULT_MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
+/** The most octets of staged bytes that a stash holds at once, unless the app says otherwise. */
+export const DEFAULT_MAX_STAGED_BYTES = 256 * 1024 * 1024;
+/** The wait that a PUT or a GET of the engine is given before it is counted as failed: 30 s, and 32 KiB/s for the octets that it moves (14 [CLI-44]). A browser's `fetch` has no timeout. */
+export const DEFAULT_TRANSFER_TIMEOUT = (octets: number): number => 30_000 + Math.ceil((octets / (32 * 1024)) * 1000);
+/** Staged bytes that no action held by the engine names are collected when they are older than this (device clock): a stage that no action followed (09 [READ-94]). */
+export const STAGED_GRACE_MS = 24 * 60 * 60 * 1000;
+/** How often a running engine looks for such bytes, besides at its start. */
+export const STAGED_SWEEP_MS = 60 * 60 * 1000;
 
 const BLOB_ID_RE = /^[A-Za-z0-9_-]{21,64}$/;
 /** `Content-Length` and `Host` are the platform's: a header that names one is not set by the engine (09 [READ-86] "besides Content-Length"). */
 export const PLATFORM_HEADERS: ReadonlySet<string> = new Set(["content-length", "host"]);
+
+/**
+ * Whether a signed URL may be used (02 note after [ARC-56]: blob URLs are plain HTTPS; 16 [SEC-45]): `https:`, and `http:` only on the loopback (a development server on the same machine) or where the
+ * app allows it for a development deployment. A URL with a user name or a password is refused: a signed URL is a bearer capability, and carries nothing else.
+ */
+export function blobUrlAllowed(url: string, allowInsecure: boolean): boolean {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return false;
+  }
+  if (u.username !== "" || u.password !== "") return false;
+  if (u.protocol === "https:") return true;
+  if (u.protocol !== "http:") return false;
+  if (allowInsecure) return true;
+  const h = u.hostname.toLowerCase();
+  return h === "localhost" || h.endsWith(".localhost") || h === "127.0.0.1" || h === "[::1]" || /^127.d+.d+.d+$/.test(h);
+}
 
 /** Whether the text is a blob id (03 Table 3.1, 09 [READ-84]). */
 export function isBlobId(s: string): boolean {
@@ -215,19 +261,49 @@ export async function digestSha256(bytes: Uint8Array): Promise<Uint8Array> {
 
 export const sameBytes = (a: Uint8Array, b: Uint8Array): boolean => a.length === b.length && a.every((x, i) => x === b[i]);
 
-/** `BlobHttp` over the platform's `fetch`: no credentials and no redirect (a signed URL is a bearer capability, 09 [READ-90]). */
+/**
+ * What of an answer that the engine does not use is read before the body is dropped (16 [SEC-1]): the body of a PUT's answer and of a GET that is not 200. The URLs are the server's, and what
+ * stands behind them is not trusted: a few octets of the explanation let the connection be reused, and no more is read of a body that has no end.
+ */
+export const DRAIN_BUDGET_BYTES = 4 * 1024;
+
+/** Drops the body of an answer after at most `DRAIN_BUDGET_BYTES` of it (16 [SEC-1]); a body that fails to read is dropped as it is. */
+async function discardBody(res: Response): Promise<void> {
+  const body = res.body;
+  if (body === null) return;
+  const reader = body.getReader();
+  try {
+    let n = 0;
+    while (n < DRAIN_BUDGET_BYTES) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      n += value.length;
+    }
+  } catch {
+    // an aborted or broken body: nothing more is read of it
+  }
+  await reader.cancel().catch(() => undefined);
+}
+
+/** `BlobHttp` over the platform's `fetch`: no credentials and no redirect (a signed URL is a bearer capability, 09 [READ-90]). Every body it reads is bounded (16 [SEC-1]). */
 export function fetchBlobHttp(fetchFn: typeof fetch = globalThis.fetch): BlobHttp {
   return {
     async put(url, headers, body, o) {
       const res = await fetchFn(url, { method: "PUT", headers: { ...headers }, body, credentials: "omit", redirect: "error", ...(o?.signal !== undefined ? { signal: o.signal } : {}) });
-      await res.arrayBuffer().catch(() => undefined); // the answer is read to its end, so that the connection is reused
+      await discardBody(res); // the answer is only its status; a body of it is read for the drain budget, never to its end
       return { status: res.status };
     },
     async get(url, o) {
       const res = await fetchFn(url, { method: "GET", credentials: "omit", redirect: "error", ...(o.signal !== undefined ? { signal: o.signal } : {}) });
       if (res.status !== 200 || res.body === null) {
-        await res.arrayBuffer().catch(() => undefined);
+        await discardBody(res);
         return { status: res.status, bytes: new Uint8Array(0) };
+      }
+      // a body that declares itself longer than the call allows is not read at all
+      const declared = Number(res.headers.get("content-length"));
+      if (res.headers.get("content-length") !== null && Number.isFinite(declared) && declared > o.maxBytes) {
+        await res.body.cancel().catch(() => undefined);
+        return { status: res.status, bytes: new Uint8Array(0), tooLarge: true };
       }
       const reader = res.body.getReader();
       const chunks: Uint8Array[] = [];

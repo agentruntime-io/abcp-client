@@ -12,7 +12,7 @@ import { type AppLimits, type KeyChange, KeyChangeSchema } from "../gen/abpc/v2/
 import type { Mutation } from "../gen/abpc/v2/sync_pb.js";
 import { VersionTopology, DEFAULT_FEATURES } from "../rules/fold/index.js";
 import { BoundedSet, pushBounded } from "./bounded.js";
-import { DEFAULT_BLOB_CACHE_BYTES, fetchBlobHttp, MemoryBlobStash, type BlobHttp, type BlobStash } from "./blob-store.js";
+import { DEFAULT_BLOB_CACHE_BYTES, DEFAULT_MAX_DOWNLOAD_BYTES, DEFAULT_MAX_STAGED_BYTES, DEFAULT_TRANSFER_TIMEOUT, fetchBlobHttp, MemoryBlobStash, type BlobHttp, type BlobStash } from "./blob-store.js";
 import { systemClock, systemRandom, type Clock, type Random } from "./clock.js";
 import { MAX_CHANGES_PER_ACTION, MAX_INTEREST_PREFIXES, MAX_PRESENCE_MIN_INTERVAL_MS, MAX_PRESENCE_STATE_BYTES } from "./counts.js";
 import { CanonError, decodeContent } from "./entry.js";
@@ -107,10 +107,24 @@ export interface EngineConfig {
   blobs?: {
     /** Moves bytes to and from signed URLs; default the platform's `fetch` (`fetchBlobHttp`). */
     http?: BlobHttp;
-    /** Keeps the bytes of the blobs that actions name until the actions are confirmed (09 [READ-94]); default in memory. */
+    /**
+     * Keeps the bytes of the blobs that actions name until the actions are confirmed (09 [READ-94]); default: the platform's stash for the partition (a browser's IndexedDB, a Node host's
+     * directory), else memory. One stash is one partition's: a sign-out erases it whole, and `getBlob` serves what it holds, so two principals never share one.
+     */
     stash?: BlobStash;
     /** The most octets of downloaded blobs that the engine keeps; default 32 MiB. */
     cacheBytes?: number;
+    /**
+     * How long one PUT or GET of a signed URL may take before the engine gives it up and counts it as a failed attempt (14 [CLI-44]), in ms on the engine's clock, or a function of the
+     * octets that it moves. Default: 30 s and 32 KiB/s (`DEFAULT_TRANSFER_TIMEOUT`). A browser's `fetch` has no timeout of its own.
+     */
+    transferTimeoutMs?: number | ((octets: number) => number);
+    /** The most octets that `getBlob` buffers (16 [SEC-1]); default 100 MiB. A call may lower it with `BlobCallOptions.maxBytes`. */
+    maxDownloadBytes?: number;
+    /** The most octets of staged bytes that the stash holds at once (09 [READ-94]); a blob that would pass it is refused locally, as for a full quota (14 [CLI-21]). Default 256 MiB. */
+    maxStagedBytes?: number;
+    /** Upload and download URLs may be `http:` for any host (a development deployment); by default only `https:`, and `http:` on the loopback (02 note after [ARC-56], 16 [SEC-45]). */
+    allowInsecureUrls?: boolean;
   };
 }
 
@@ -182,6 +196,8 @@ export interface Runtime {
    * its staged blobs and uploads them, `ready` when the send may go (`blobs.ts`).
    */
   blobs: "unchecked" | "checking" | "ready";
+  /** How many repairs of the action's blobs uploaded something (`BLOB_MISSING`, 09 [READ-89]): a second one that meets the same answer, with bytes lacking, holds the action. */
+  blobRepairs: number;
   /** How often a request that carried it got `Unauthenticated` (14 [CLI-50]). */
   authTries: number;
 }
@@ -196,6 +212,11 @@ export abstract class EngineCore {
   /** The most octets of downloaded blobs that the cache holds. */
   protected readonly blobCacheBytes: number;
   private blobHttpGiven: BlobHttp | undefined;
+  /** How long a transfer of that many octets may take (see `EngineConfig.blobs.transferTimeoutMs`). */
+  protected readonly blobTransferTimeout: (octets: number) => number;
+  protected readonly blobMaxDownload: number;
+  protected readonly blobMaxStaged: number;
+  protected readonly blobAllowInsecure: boolean;
   storage!: OutboxStorage;
   readonly clock: Clock;
   readonly random: Random;
@@ -271,6 +292,11 @@ export abstract class EngineCore {
     this.blobStashIn = cfg.blobs?.stash ?? new MemoryBlobStash();
     this.blobCacheBytes = cfg.blobs?.cacheBytes ?? DEFAULT_BLOB_CACHE_BYTES;
     this.blobHttpGiven = cfg.blobs?.http;
+    const tt = cfg.blobs?.transferTimeoutMs;
+    this.blobTransferTimeout = typeof tt === "function" ? tt : typeof tt === "number" ? () => tt : DEFAULT_TRANSFER_TIMEOUT;
+    this.blobMaxDownload = cfg.blobs?.maxDownloadBytes ?? DEFAULT_MAX_DOWNLOAD_BYTES;
+    this.blobMaxStaged = cfg.blobs?.maxStagedBytes ?? DEFAULT_MAX_STAGED_BYTES;
+    this.blobAllowInsecure = cfg.blobs?.allowInsecureUrls === true;
     this.storage = cfg.storage ?? new MemoryStorage();
     this.clock = cfg.clock ?? systemClock;
     this.random = cfg.random ?? systemRandom;
@@ -702,7 +728,7 @@ export abstract class EngineCore {
   protected rt(id: string): Runtime {
     let r = this.runtimes.get(id);
     if (r === undefined) {
-      r = { inflight: false, nextAttemptAt: 0, timer: undefined, polling: false, alone: false, blobs: "unchecked", authTries: 0 };
+      r = { inflight: false, nextAttemptAt: 0, timer: undefined, polling: false, alone: false, blobs: "unchecked", blobRepairs: 0, authTries: 0 };
       this.runtimes.set(id, r);
     }
     return r;
@@ -714,6 +740,8 @@ export abstract class EngineCore {
     r?.timer?.();
     this.runtimes.delete(id);
     this.decoded.delete(id);
+    // the action is gone (retired, cancelled, ended): the hold that waited for the app to stage its bytes again goes with it (`blobs.ts`)
+    for (const h of this.holds.all()) if (h.kind === "BLOB_BYTES_LOST" && h.mutationId === id) this.stopHold(h.kind, h.keyspaceId, h.lane, h.mutationId);
   }
 
   /** The outbox entries of a keyspace, in outbox order (14 [CLI-6]). */
@@ -800,6 +828,7 @@ export abstract class EngineCore {
     if (hold.lane !== undefined) ev.lane = hold.lane;
     if (hold.mutationId !== undefined) ev.mutationId = hold.mutationId;
     if (hold.boundMs !== undefined) ev.bound = hold.boundMs;
+    if (hold.blobIds !== undefined) ev.blobIds = [...hold.blobIds];
     this.emit(ev);
     this.onHoldChanged();
     this.onRuntimeChanged();
@@ -836,6 +865,7 @@ export abstract class EngineCore {
       case "EPOCH_RESOLUTION":
         return "keyspace";
       case "CONFLICT_WAIT":
+      case "BLOB_BYTES_LOST":
         return "action";
       default:
         return "app";

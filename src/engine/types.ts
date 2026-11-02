@@ -176,6 +176,8 @@ export interface HeldEvent extends Base {
   code: string;
   /** The hold's bound, in server time (ms since the epoch), when it has one (14 [CLI-45]). */
   bound?: number;
+  /** A hold for bytes that the engine lost (`BLOB_MISSING`, scope `action`): the blobs that the app stages again, under these ids, to clear it. */
+  blobIds?: string[];
 }
 
 export interface ReloadedEvent extends Base {
@@ -387,6 +389,8 @@ export interface HoldInfo {
   code: string;
   /** The hold's bound in server time, ms since the epoch. */
   bound?: number;
+  /** A hold for bytes that the engine lost (`BLOB_MISSING`, scope `action`): the blobs that the app stages again, under these ids, to clear it. */
+  blobIds?: string[];
 }
 
 export interface SyncStatus {
@@ -420,4 +424,9 @@ export interface SyncStatus {
   holds: HoldInfo[];
   /** The calls of this tab that wait for the flusher's answer (14 [CLI-61], [CLI-21]): a follower never refuses a call while the flusher may still commit it. */
   pendingCalls: number;
+  /** Where the bytes that actions name are kept (09 [READ-94], 14 [CLI-21]): `durable` outlives the process, `memory` does not. */
+  blobStash: "memory" | "durable";
+  /** The blobs staged for actions, and their octets, as the flusher counts them (a follower reports the flusher's count). */
+  stagedBlobs: number;
+  stagedBytes: number;
 }

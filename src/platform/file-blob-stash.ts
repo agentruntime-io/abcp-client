@@ -6,11 +6,15 @@
 // exists, and a crash between the two leaves bytes that no facts name, which `list` ignores and the next `put` of the blob replaces. A read checks the bytes against the size and the digest
 // that the facts hold, so that a damaged file is a blob that is not staged (the upload then fails with `BLOB_MISSING`, which 14 [CLI-44] makes the action's resend meet again), never a wrong upload.
 //
-// The directory is the stash's, for one partition: a sign-out that purges the partition erases the staged bytes too (`clear`, 14 [CLI-65]), and only the files that this stash wrote; the engine
-// takes the stash from the app (`EngineConfig.blobs.stash`), a Node host has no default one.
+// The directory is the stash's, for one partition: a sign-out that purges the partition erases the staged bytes too (`clear`, 14 [CLI-65]), and only the files that this stash wrote. The Node host
+// (`FileStorageProvider.blobStash`) gives each partition one in `<partition directory>/blobs`, which is the engine's default (09 [READ-94], 14 [CLI-21]: the outbox is durable, so are the bytes that its
+// actions name), and which `destroy` removes with the partition; an app's own (`EngineConfig.blobs.stash`) goes before it, and is one partition's: two principals never share a stash.
+//
+// A file is written to its end and flushed to the disk before it is renamed into place, so that a power loss never leaves a name over bytes that were not written (the check of `get` would catch
+// them, but an upload of the bytes would then be lost for good).
 
 import { createHash } from "node:crypto";
-import { access, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
 import * as path from "node:path";
 import type { BlobStash, StagedBlob } from "../engine/blob-store.js";
 
@@ -28,6 +32,8 @@ const hex = (b: Uint8Array): string => Buffer.from(b).toString("hex");
 const OWN_FILE = /^[0-9a-f]{64}\.(bin|json)(\.tmp)?$/;
 
 export class FileBlobStash implements BlobStash {
+  /** The bytes are in files: they outlive the process. */
+  readonly durable = true;
   private ready: Promise<void> | undefined;
 
   constructor(private readonly dir: string) {}
@@ -43,7 +49,13 @@ export class FileBlobStash implements BlobStash {
 
   private async writeAtomic(file: string, data: Uint8Array | string): Promise<void> {
     const tmp = `${file}.tmp`;
-    await writeFile(tmp, data);
+    const h = await open(tmp, "w");
+    try {
+      await h.writeFile(data);
+      await h.sync(); // on the disk before the name is
+    } finally {
+      await h.close();
+    }
     await rename(tmp, file);
   }
 
@@ -98,14 +110,14 @@ export class FileBlobStash implements BlobStash {
     for (const f of await readdir(this.dir)) if (OWN_FILE.test(f)) await rm(path.join(this.dir, f), { force: true });
   }
 
-  async list(): Promise<{ keyspaceId: string; blobId: string; size: number }[]> {
+  async list(): Promise<{ keyspaceId: string; blobId: string; size: number; stagedAtMs: number }[]> {
     await this.init();
-    const out: { keyspaceId: string; blobId: string; size: number }[] = [];
+    const out: { keyspaceId: string; blobId: string; size: number; stagedAtMs: number }[] = [];
     for (const f of await readdir(this.dir)) {
       if (!f.endsWith(".json")) continue;
       try {
         const facts = JSON.parse(await readFile(path.join(this.dir, f), "utf8")) as Facts;
-        out.push({ keyspaceId: facts.keyspaceId, blobId: facts.blobId, size: facts.size });
+        out.push({ keyspaceId: facts.keyspaceId, blobId: facts.blobId, size: facts.size, stagedAtMs: facts.stagedAtMs });
       } catch {
         // a file that is not one of this stash's facts is not a staged blob
       }

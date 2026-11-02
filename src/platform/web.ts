@@ -34,6 +34,11 @@ export interface WebEnv {
     addEventListener(type: "visibilitychange", fn: () => void): void;
     removeEventListener(type: "visibilitychange", fn: () => void): void;
   };
+  /** The window: `pagehide` says that the page is going away, `pageshow` that one put away comes back (the back-forward cache). */
+  page?: {
+    addEventListener(type: "pagehide" | "pageshow", fn: (e: { persisted?: boolean }) => void): void;
+    removeEventListener(type: "pagehide" | "pageshow", fn: (e: { persisted?: boolean }) => void): void;
+  };
   randomUUID?: () => string;
 }
 
@@ -60,6 +65,7 @@ export function globalWebEnv(): WebEnv {
     sessionStorage?: WebEnv["sessionStorage"];
     document?: WebEnv["document"];
     crypto?: { randomUUID?: () => string };
+    addEventListener?: unknown;
   };
   let session: WebEnv["sessionStorage"];
   try {
@@ -75,6 +81,7 @@ export function globalWebEnv(): WebEnv {
     ...(g.navigator?.storage !== undefined ? { storageManager: g.navigator.storage } : {}),
     ...(session !== undefined ? { sessionStorage: session } : {}),
     ...(g.document !== undefined ? { document: g.document } : {}),
+    ...(g.document !== undefined && typeof g.addEventListener === "function" ? { page: g as unknown as NonNullable<WebEnv["page"]> } : {}),
     ...(g.crypto?.randomUUID !== undefined ? { randomUUID: () => (g.crypto as { randomUUID: () => string }).randomUUID() } : {}),
   };
 }
@@ -188,6 +195,22 @@ export class WebTab implements TabHost {
 
   visible(): boolean {
     return this.env.document?.visibilityState !== "hidden";
+  }
+
+  /** 14 [CLI-61], 09 [READ-74]: `pagehide` is a hint that this tab closes (the lock that the tab holds says so for sure); `pageshow` of a persisted page says that it came back. */
+  onPageHide(fn: (event: "hide" | "show") => void): () => void {
+    const p = this.env.page;
+    if (p === undefined) return () => undefined;
+    const hide = (): void => fn("hide");
+    const show = (e: { persisted?: boolean }): void => {
+      if (e.persisted === true) fn("show");
+    };
+    p.addEventListener("pagehide", hide);
+    p.addEventListener("pageshow", show);
+    return () => {
+      p.removeEventListener("pagehide", hide);
+      p.removeEventListener("pageshow", show);
+    };
   }
 
   onVisibility(fn: (visible: boolean) => void): () => void {

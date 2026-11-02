@@ -55,8 +55,11 @@ export abstract class EndingLayer extends EngineCore {
   /** Waiters for the cursor of a keyspace to reach a seq (the hold `CONFLICT_WAIT`). */
   protected readonly cursorWaiters = new Map<string, Set<{ need: bigint; wake: () => void }>>();
 
-  /** The action retired: the bytes that it staged for its blobs go (09 [READ-94], `blobs.ts`). */
-  protected abstract onActionRetiredBlobs(e: OutboxEntry): void;
+  /**
+   * The action left the engine's hands (confirmed, cancelled, or its dead letter or export entry acknowledged): the bytes that it staged for its blobs go, unless another action that the engine
+   * holds names them (09 [READ-94], `blobs.ts`).
+   */
+  protected abstract onActionRetiredBlobs(e: { keyspaceId: string; content: Uint8Array; authoredIn?: string }): void;
 
   protected isExcludedFromOverlay(e: OutboxEntry): boolean {
     return this.ending.has(e.mutationId) || e.stuck !== undefined;
@@ -221,6 +224,7 @@ export abstract class EndingLayer extends EngineCore {
       // unknown, which may have consumed its slot (14 [CLI-83]).
       this.settleSlot(en, spec.slot === "release" || (this.freshReading && it.unknown === undefined) ? "decide" : "wait");
       this.dropRuntime(en.mutationId);
+      if (it.sink === "none") this.onActionRetiredBlobs(en); // cancelled: no store holds it, and its bytes are of no use (a dead letter and an export entry keep theirs)
     }
     for (const op of ops) {
       if (op.op === "putDeadLetter") this.deadLetters.set(op.entry.mutationId, op.entry);
@@ -550,18 +554,22 @@ export abstract class EndingLayer extends EngineCore {
 
   async ackDeadLetter(mutationId: string): Promise<void> {
     await this.run(async () => {
-      if (!this.deadLetters.has(mutationId)) return;
+      const d = this.deadLetters.get(mutationId);
+      if (d === undefined) return;
       await this.tx([{ op: "ackDeadLetter", mutationId }]);
       this.deadLetters.delete(mutationId);
+      this.onActionRetiredBlobs(d); // 09 [READ-94]: the action is the app's no longer
       await this.drainStuck();
     });
   }
 
   async ackExport(mutationId: string): Promise<void> {
     await this.run(async () => {
-      if (!this.exports.has(mutationId)) return;
+      const x = this.exports.get(mutationId);
+      if (x === undefined) return;
       await this.tx([{ op: "ackExport", mutationId }]);
       this.exports.delete(mutationId);
+      this.onActionRetiredBlobs(x);
       await this.drainStuck();
     });
   }

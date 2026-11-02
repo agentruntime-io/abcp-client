@@ -2,6 +2,9 @@
 // two principals or two apps, each have their flusher lock), the channel is Node's `BroadcastChannel`, and the storage is in memory or in files
 // under a directory (`FileStorageProvider`), where a second process that opens a partition is refused by the partition's `LOCK`.
 //
+// The partitions of a directory keep the bytes that their actions name in files too (`FileStorageProvider.blobStash`, `blobs/` in the partition's directory), so that the outbox and its bytes outlive a
+// restart together (09 [READ-94], 14 [CLI-21]).
+//
 // A `NodeDevice` is what tabs of one device share. A process that runs one engine needs only `createNodeHost()`; two tabs on one device (a test of
 // the handover of the flusher, 14 [CLI-61]) are `device.newTab()` twice.
 

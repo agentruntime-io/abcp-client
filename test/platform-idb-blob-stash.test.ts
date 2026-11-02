@@ -77,6 +77,23 @@ describe("09 [READ-94]: IndexedDbBlobStash keeps the bytes of the blobs that act
     expect(await s.list()).toEqual([]);
   });
 
+  // V21 N2, 09 [READ-87]: a row of the right length with other bytes in it is a damaged row, not the blob: shown as the blob, its upload is refused by the store at every repair
+  it("a row of the right length whose bytes are not the digest's is a blob that is not staged; the stash is durable and lists when each blob was staged", async () => {
+    const f = new FakeIDBFactory();
+    const s = new IndexedDbBlobStash(f, "blobs-digest");
+    expect(s.durable).toBe(true);
+    const a = await blob("a".repeat(22), 500);
+    await s.put(a);
+    expect(await s.list()).toEqual([{ keyspaceId: "ks1", blobId: a.blobId, size: 500, stagedAtMs: 12345 }]);
+    expect((await s.get("ks1", a.blobId))?.size).toBe(500);
+    const bytes = f.dbs.get("blobs-digest")?.stores.get("bytes") as Map<string, unknown>;
+    const damaged = new Uint8Array(a.bytes); // one octet changed: the length is the facts'
+    damaged[10] = (damaged[10] as number) ^ 0xff;
+    bytes.set(`ks1\u0000${a.blobId}`, damaged);
+    expect(await s.get("ks1", a.blobId)).toBeUndefined();
+    expect(await s.has("ks1", a.blobId)).toBe(true); // its facts are there: `get` is what checks the bytes
+  });
+
   it("14 [CLI-65]: clear erases every blob in one transaction, whoever staged it", async () => {
     const f = new FakeIDBFactory();
     const mine = new IndexedDbBlobStash(f, "blobs-4");

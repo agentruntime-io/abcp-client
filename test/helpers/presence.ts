@@ -135,6 +135,21 @@ export async function drive<T>(r: Rig, p: Promise<T>, stepMs = 1000, max = 300):
   return value as T;
 }
 
+/**
+ * Waits, in real time, for a condition that real I/O (files, a database) makes true: the engine's clock does not wait for it, so each round lets the event loop run and the engine settle, and
+ * moves the engine's clock by `stepMs` (a timer that the engine waits for passes). There is no assumption about how long the I/O takes: only a deadline, long enough for a loaded machine, after
+ * which the test fails with `what`.
+ */
+export async function until(r: Rig, cond: () => boolean | Promise<boolean>, what: string, stepMs = 200, deadlineMs = 60_000): Promise<void> {
+  const end = Date.now() + deadlineMs;
+  while (!(await cond())) {
+    if (Date.now() > end) throw new Error(`timed out waiting for: ${what}`);
+    await new Promise((res) => setTimeout(res, 5));
+    if (stepMs > 0) await r.clock.advance(stepMs);
+    await r.engine.settle().catch(() => undefined);
+  }
+}
+
 /** The bytes of a test blob: `n` octets of a pattern. */
 export function bytesOf(n: number, seed = 7): Uint8Array {
   const out = new Uint8Array(n);
