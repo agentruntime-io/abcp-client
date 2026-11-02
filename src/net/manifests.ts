@@ -153,8 +153,9 @@ export class ParsedManifest implements EngineManifest {
   presenceTopicKind(kind: string, topic: string): "plain" | "awareness" | undefined {
     const topics = this.presence.get(kind);
     if (topics === undefined) return undefined;
-    if (topics.some((t) => matchKeyTemplate(t, topic) !== undefined)) return "plain";
-    return this.find(topic)?.c.template.rule === "crdt" ? "awareness" : undefined;
+    // 09 [READ-72] (Q73.1, draft 16): a topic that is a key of a `crdt:*` template of the kind is a Yjs awareness topic, also when a presence topic template of the kind equals it
+    if (this.find(topic)?.c.template.rule === "crdt") return "awareness";
+    return topics.some((t) => matchKeyTemplate(t, topic) !== undefined) ? "plain" : undefined;
   }
 }
 

@@ -51,9 +51,9 @@ export interface EngineManifest extends Rules {
   /** The owning key of a fenced key (11 §11.2.4): the key that a write to this key is fenced by, or undefined. */
   fencedBy(key: string): string | undefined;
   /**
-   * How a presence topic of a keyspace of the kind is judged (09 [READ-72], [READ-83], 04 [MAN-15]): `plain` when it matches a presence topic template of the kind,
-   * `awareness` when it is a key of a `crdt:*` template of the kind (a topic that matches both is a plain one, as the server reads it), undefined when it is
-   * neither or when the kind declares no presence. A manifest that cannot say leaves this out, and the engine takes a topic for a plain one.
+   * How a presence topic of a keyspace of the kind is judged (09 [READ-72], [READ-83], 04 [MAN-15]): `awareness` when it is a key of a `crdt:*` template of the kind (also when
+   * a presence topic template of the kind equals it), `plain` when it is any other topic that matches a presence topic template of the kind, undefined when it is neither or when
+   * the kind declares no presence. A manifest that cannot say leaves this out, and the engine takes a topic for a plain one.
    */
   presenceTopicKind?(kind: string, topic: string): "plain" | "awareness" | undefined;
 }
@@ -187,8 +187,9 @@ class StaticVersion implements EngineManifest {
   presenceTopicKind(kind: string, topic: string): "plain" | "awareness" | undefined {
     const topics = this.presence.get(kind);
     if (topics === undefined) return undefined;
-    if (topics.some((t) => matchKeyTemplate(t, topic) !== undefined)) return "plain";
-    return this.find(topic)?.c.template.rule === "crdt" ? "awareness" : undefined;
+    // 09 [READ-72] (Q73.1, draft 16): a topic that is a key of a `crdt:*` template of the kind is a Yjs awareness topic, also when a presence topic template of the kind equals it
+    if (this.find(topic)?.c.template.rule === "crdt") return "awareness";
+    return topics.some((t) => matchKeyTemplate(t, topic) !== undefined) ? "plain" : undefined;
   }
 }
 

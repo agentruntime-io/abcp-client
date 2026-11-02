@@ -129,7 +129,7 @@ describe("09 [READ-57]: cursors that would make the `SubscribeRequest` longer th
   });
 });
 
-describe("16 [SEC-3] with 02 [ARC-46]: a structurally invalid record stops the engine for that keyspace and is reported; it is not a record that needs a later revision, so the hold is not UPGRADE_REQUIRED", () => {
+describe("16 [SEC-3], 14 [CLI-50] and Table 14.1: a structurally invalid record stops the engine for that keyspace and is reported (`protocol-error`, the hold PROTOCOL_ERROR); it is not a record that needs a later revision, so the hold is not UPGRADE_REQUIRED", () => {
   it("a record that changes one key twice: the confirmed state stays at the previous seq, `protocol-error` is reported, the keyspace is held as PROTOCOL_ERROR, and another keyspace goes on", async () => {
     const r = await rig({ keyspaces: ["ks1", "ks2"] });
     r.server.write("ks1", [kc("settings/ok", "set", 1)]);
@@ -143,5 +143,23 @@ describe("16 [SEC-3] with 02 [ARC-46]: a structurally invalid record stops the e
     r.server.write("ks2", [kc("settings/two", "set", 2)]);
     await tick(r, 30_000); // the session ended with the violation and resumes with its backoff
     expect(r.engine.confirmed("ks2").has("settings/two")).toBe(true);
+  });
+
+  it("Table 14.1: the held keyspace is sent nothing (an action authored into it waits in the outbox), and the other keyspace still takes actions", async () => {
+    const r = await rig({ keyspaces: ["ks1", "ks2"] });
+    r.server.write("ks1", [kc("settings/ok", "set", 1)]);
+    await r.engine.settle();
+    r.server.appendRaw("ks1", { changes: [create(KeyChangeSchema, { key: "settings/dup", kind: ChangeKind.SET, value: new TextEncoder().encode("1"), encoding: "json/v1" }), create(KeyChangeSchema, { key: "settings/dup", kind: ChangeKind.SET, value: new TextEncoder().encode("2"), encoding: "json/v1" })] });
+    await r.engine.settle();
+    expect(r.engine.status().holds.map((h) => [h.keyspaceId, h.code])).toEqual([["ks1", "PROTOCOL_ERROR"]]);
+    // 16 [SEC-3]: an action authored into the held keyspace waits in the outbox, and nothing is sent to the keyspace while the hold lasts
+    const sentBefore = mutateRequests(r).flatMap((q) => q.mutations).length;
+    await r.engine.submit({ keyspaceId: "ks1", opType: "Set", changes: [set("settings/after", 1)] });
+    await r.engine.submit({ keyspaceId: "ks2", opType: "Set", changes: [set("settings/other", 1)] });
+    await tick(r, 1_000);
+    const sent = mutateRequests(r).flatMap((q) => q.mutations).slice(sentBefore);
+    expect(sent.map((m) => m.keyspaceId ?? "")).not.toContain("ks1");
+    expect(r.engine.outbox().filter((e) => e.keyspaceId === "ks1")).toHaveLength(1);
+    expect(sent.map((m) => m.opType)).toContain("Set"); // the action of ks2 was sent
   });
 });

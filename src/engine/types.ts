@@ -288,7 +288,10 @@ export interface InterestChangedEvent extends Base {
 
 export interface ProtocolErrorEvent extends Base {
   type: "protocol-error";
-  /** The message's type, or the field of an `AppLimits` that carried a forbidden value; `Mutate` for a whole-call failure (14 §14.5). */
+  /**
+   * The message's type, or the field of an `AppLimits` that carried a forbidden value; `Mutate` for a whole-call failure (14 §14.5); `RecordsFrame` for a record that decodes under
+   * 02 [ARC-61] and is structurally invalid (16 [SEC-3]), whose `keyspaces` hold the keyspace of the record.
+   */
   what: string;
   detail: string;
   keyspaces: string[];

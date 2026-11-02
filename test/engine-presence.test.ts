@@ -505,6 +505,21 @@ describe("09 [READ-83]: Yjs awareness", () => {
     expect(stateOf((r.server.presence.entries(KS, DOC)[0] as { state: Uint8Array }).state)).toEqual({ [t2.tab.tabId]: { cursor: "b" } });
     expect(leaves(r.server)).toBe(0);
   });
+
+  it("09 [READ-72], 04 [MAN-15]: a presence topic template that equals the crdt template names an awareness topic: the entry is still a map of tab id to state", async () => {
+    // Q73.1, draft 16: the topic is both a topic template and a key of a `crdt:*` template, and the key of the `crdt:*` template decides
+    const r = tabsRig({ manifests: new StaticManifests({ ...PRESENCE_MANIFEST, presence: { kind: ["room/{id}", "docs/{id}"] } }) });
+    const t1 = await r.open();
+    await settleAll(t1.engine);
+    await t1.engine.joinPresence(KS, DOC);
+    await t1.engine.joinPresence(KS, ROOM);
+    expect(t1.engine.presenceTopics().map((t) => [t.topic, t.awareness]).sort()).toEqual([[DOC, true], [ROOM, false]]);
+    await t1.engine.publishPresence(KS, DOC, { cursor: "a" });
+    await settleAll(t1.engine);
+    await r.clock.advance(1100);
+    await settleAll(t1.engine);
+    expect(stateOf((r.server.presence.entries(KS, DOC)[0] as { state: Uint8Array }).state)).toEqual({ [t1.tab.tabId]: { cursor: "a" } });
+  });
 });
 
 describe("14 [CLI-66]: the presence state is on the purge list of a revoked keyspace", () => {

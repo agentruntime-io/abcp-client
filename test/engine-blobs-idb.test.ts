@@ -63,6 +63,18 @@ class World {
     await this.clock.advance(ms);
     await engine.settle();
   }
+
+  /**
+   * Advances the clock by `ms` and settles until `done` holds, at most `rounds` times. `settle` returns when nothing has started or ended for a few turns of the event loop ("what is left waits
+   * for time or for the outside"), and the digest of the staged bytes is work of the outside: it runs on the thread pool, so on a loaded machine `settle` can return before it has ended. A
+   * test that waits for what that work leads to waits for the condition, and yields the event loop between rounds, rather than assuming a fixed number of advances is enough.
+   */
+  async advanceUntil(engine: Engine, ms: number, done: () => boolean, rounds = 400): Promise<void> {
+    for (let i = 0; i < rounds && !done(); i++) {
+      await this.advance(engine, ms);
+      if (!done()) await new Promise<void>((r) => setTimeout(r, 2));
+    }
+  }
 }
 
 const submitWith = (e: Engine, refs: string[], key = "settings/a"): Promise<{ mutationId: string }> => e.submit({ keyspaceId: KS, opType: "Set", changes: [set(key, 1)], blobRefs: refs });
@@ -83,7 +95,7 @@ describe("09 [READ-94], 14 [CLI-44]: on the browser host the bytes that an actio
     expect(second.engine.outbox().map((e) => e.mutationId)).toEqual([mutationId]);
     expect(await second.engine.stagedBlobs()).toMatchObject([{ keyspaceId: KS, blobId: ref.blobId, size: 900 }]);
     second.engine.start();
-    await w.advance(second.engine, 5000);
+    await w.advanceUntil(second.engine, 5000, () => committed(second.events, mutationId));
     expect(committed(second.events, mutationId)).toBe(true);
     // the bytes were uploaded before the action was sent: the server never had to answer BLOB_MISSING or BLOB_PENDING (14 [CLI-44])
     expect(w.server.calls.map((c) => c.method).filter((m) => ["createUpload", "commitBlob", "mutate"].includes(m))).toEqual(["createUpload", "commitBlob", "mutate"]);
@@ -115,8 +127,7 @@ describe("09 [READ-94], 14 [CLI-44]: on the browser host the bytes that an actio
       },
     });
     second.engine.start();
-    await w.advance(second.engine, 5000);
-    await w.advance(second.engine, 5000);
+    await w.advanceUntil(second.engine, 5000, () => committed(second.events, mutationId));
     expect(committed(second.events, mutationId)).toBe(true);
     expect(calls(w.server, "createUpload")).toBe(2); // before the first send, and for the answer
     expect(putCount(w.server)).toBe(2);

@@ -290,8 +290,9 @@ export abstract class ReplicaLayer extends ReplicaStoreLayer {
         } else if (e.code === "seq") {
           if (!f.resuming) this.resumeKeyspace(f);
         } else {
-          // 16 [SEC-3]: a structurally invalid record stops the engine for that keyspace and is reported, as 02 [ARC-46] says; it is no record that needs a
-          // later revision (15 [COMPAT-36] and §15.5 are cited only for that one), so no UPGRADE_REQUIRED: the `protocol-error` event and the hold PROTOCOL_ERROR
+          // 16 [SEC-3]: a record that decodes under 02 [ARC-61] and is structurally invalid stops the engine for that keyspace, which it reports with a `protocol-error`
+          // event and holds with the `PROTOCOL_ERROR` hold of 14 [CLI-50] and Table 14.1 (nothing is sent to the keyspace, a re-add with good records cold-loads it,
+          // 14 [CLI-51]); it is no record that needs a later revision (15 [COMPAT-36] and §15.5 are cited only for that one), so no UPGRADE_REQUIRED
           this.onProtocolViolation(new ProtocolViolation("RecordsFrame", e.message, [f.id]), [f.id]);
         }
         return false;

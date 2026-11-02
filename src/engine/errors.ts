@@ -42,8 +42,9 @@ export class RpcError extends Error {
 
 /**
  * A message from the server that breaks 02 [ARC-61]: bytes that do not decode (a `CanonError` of `rules/canon`), a string that
- * is not valid UTF-8, a response that does not answer its request. 16 [SEC-3] and 14 [CLI-50]: the client applies, stores and
- * repairs none of it, emits `protocol-error` and holds each keyspace that the message concerns.
+ * is not valid UTF-8, a response that does not answer its request; a record that decodes and is structurally invalid (16 [SEC-3]) is reported
+ * the same way. 16 [SEC-3] and 14 [CLI-50]: the client applies, stores and repairs none of it, emits `protocol-error` and holds each keyspace
+ * that the message concerns with the hold `PROTOCOL_ERROR` (Table 14.1).
  */
 export class ProtocolViolation extends Error {
   /** The keyspaces that the message concerns; empty when it concerns none, or every one the session follows. */
