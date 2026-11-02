@@ -8,10 +8,11 @@
 // document at the seq, which the commit limit of 05 [STATE-72] and the serving limit of 05 [STATE-75] read.
 
 import { ByteWriter } from "../bytes.js";
-import { CrdtError, type Reason } from "./errors.js";
+import { CrdtError, fail, type Reason } from "./errors.js";
 import { CellFold, chains, DsCursor, dsTermOf, joined, MKind, type MRun, type Profile, pushRuns, uvSize } from "./measure.js";
 import { checkRoots, type Roots } from "./roots.js";
 import {
+  ContentRef,
   type ClientClock,
   type ClientRanges,
   type Id,
@@ -75,7 +76,17 @@ export interface Def {
   gcParent: boolean;
   /** the name of the root that the parent is, when it is a root */
   root: string | null;
+  /**
+   * The nesting depth of 05 [STATE-71]: the number of ContentType items on the chain of the struct's parents, itself included, saturating at 255; 0 for a
+   * GC. It is a function of the key's integrated updates, which a def never leaves (an id keeps its first definition), so structs that agree on the rest
+   * agree on it and it is no part of `sameRun`. Storing it makes "an item's depth is its parent's plus one" cost one lookup, whatever the length of the
+   * chain of hidden items above the parent (02 [ARC-46]).
+   */
+  depth: number;
 }
+
+/** The deepest nest of ContentType items that a key accepts (05 [STATE-71], Nesting, round 18, H2): "depth 32 is accepted and depth 33 is refused". */
+export const MAX_NESTING = 32;
 
 /** Whether e, which starts where d ends, can join d: the ids agree on everything that a reader of the definitions asks. */
 function sameRun(d: Def, e: Def): boolean {
@@ -355,8 +366,9 @@ export class Doc {
 
   /**
    * The commit of an update: checks b as 05 [STATE-71] says, under `roots` (the template's crdt_roots under the manifest
-   * version in force for the record; none skips the root conditions), and folds it as 05 [STATE-76] says. A malformed update
-   * gives the verdict SCHEMA_INVALID, with the refusal, and leaves the Doc as it was: such an update is rejected at commit and
+   * version in force for the record; none skips the root conditions) and, with the key's integrated updates, the nesting of its
+   * ContentType items (`checkNesting`), and folds it as 05 [STATE-76] says. A malformed update, or one that nests too deep for the
+   * key, gives the verdict SCHEMA_INVALID, with the refusal, and leaves the Doc as it was: such an update is rejected at commit and
    * never reaches the fold. Every other update, a no-op for good included, makes the key present.
    */
   apply(b: Uint8Array, roots?: Roots): Result {
@@ -364,11 +376,35 @@ export class Doc {
     try {
       u = parseUpdate(b);
       if (roots !== undefined) checkRoots(u, roots);
+      this.checkNesting(u);
     } catch (e) {
       if (e instanceof CrdtError) return { verdict: "SCHEMA_INVALID", reason: e.reason, error: e };
       throw e;
     }
     return this.applyUpdate(u);
+  }
+
+  /**
+   * The Nesting condition of 05 [STATE-71]: "The **depth** of a `ContentType` item is the number of `ContentType` items on the chain of its
+   * parents, itself included, where an item's parent is the one that [STATE-76] gives it (the parent that it encodes, or else the parent of its
+   * origin, or else that of its right origin), each id with its first definition in seq order ([STATE-76]), over the key's integrated updates
+   * ([STATE-41]) and this update; a struct of this update that [STATE-76] ignores has no depth, and the chain ends at a root, at an id that is not
+   * present, and after an item that takes its parent from a `GC` (that item counts if it is a `ContentType` item, and it has no parent to go on to).
+   * An update that [STATE-76] folds to a no-op for good (a gap, a `Skip`, a missing dependency) is judged like any other [...]. An item whose depth
+   * is above 32 fails the check: depth 32 is accepted and depth 33 is refused." Throws a CrdtError with the reason "nesting", to be rejected with
+   * SCHEMA_INVALID. It changes nothing of the Doc.
+   *
+   * 02 [ARC-46]: the chain is walked by a loop, never by recursion (Yjs JS overflows its stack on a deep nest), each item of the update once, and the
+   * chain above an id of the Doc not at all: the Doc stores the depth of each first definition.
+   */
+  checkNesting(u: Update): void {
+    const a = new Analysis(this, u);
+    for (const s of u.all) {
+      // a struct that is not a type has no depth to judge, and one wholly below the next clock is ignored by 05 [STATE-76]: it has none
+      if (s.kind !== "item" || s.content !== ContentRef.Type || s.clock + s.len <= this.next(s.client)) continue;
+      const depth = a.nestOf({ client: s.client, clock: s.clock });
+      if (depth > MAX_NESTING) throw fail("nesting", `ContentType item ${s.client}:${s.clock} at depth ${depth}, above ${MAX_NESTING}`);
+    }
   }
 
   /**
@@ -378,7 +414,14 @@ export class Doc {
    * under another manifest. An update that does not parse was never committed: the result is SCHEMA_INVALID and the Doc is as it was.
    */
   fold(b: Uint8Array): Result {
-    return this.apply(b, undefined);
+    let u: Update;
+    try {
+      u = parseUpdate(b);
+    } catch (e) {
+      if (e instanceof CrdtError) return { verdict: "SCHEMA_INVALID", reason: e.reason, error: e };
+      throw e;
+    }
+    return this.applyUpdate(u); // the nesting was judged at the commit, with the state of that time: a fold of the log does not judge it again
   }
 
   /**
@@ -413,6 +456,7 @@ export class Doc {
         hasParent: p.hasId,
         gcParent: p.gc,
         root: p.root,
+        depth: a.depthOf(s, p), // 05 [STATE-71] (Nesting): the parent's depth plus one for a ContentType item
       };
       const last = news[news.length - 1];
       if (last !== undefined && last.client === s.client && sameRun(last.def, def)) last.def.end = def.end; // last.def is this call's own
@@ -546,6 +590,11 @@ export class Analysis {
   private readonly implied: ParentRef[];
   private readonly state: number[];
   private readonly hmemo = new Map<string, boolean>();
+  /** The nesting depth plus 1 of each item of the update, by its position in `u.all` (`nestOf`), 0 when it is not computed yet; allocated when the first is asked. */
+  private dep: Uint16Array | null = null;
+  /** The last parent that `depthOf` asked for, and its depth. */
+  private last: Id | null = null;
+  private lastDepth = 0;
 
   /** u is null when the questions are about the Doc alone. */
   constructor(
@@ -666,7 +715,66 @@ export class Analysis {
       hasParent: p.hasId,
       gcParent: p.gc,
       root: p.root,
+      depth: 0, // the questions of 05 [STATE-76] do not ask it: `nestOf` and `depthOf` give the depth of 05 [STATE-71]
     };
+  }
+
+  /**
+   * The nesting depth of the struct that first defines id (05 [STATE-71]): the number of ContentType items on the chain that starts at id, id
+   * included; 0 for an id that no struct defines (the chain ends there) and for a GC. An id below its client's next clock has the depth that the Doc
+   * stores with its definition; an id of the update is walked up through the update's items to the first one whose depth is known, or to a root, an
+   * item that takes its parent from a GC, an id of the Doc, or an id that is not present, and the depths of the items on the way are filled in from
+   * the top down. Each item of the update is walked once, with no recursion.
+   */
+  nestOf(id: Id): number {
+    let base = 0;
+    const chain: Struct[] = [];
+    let cur: Id = id;
+    for (;;) {
+      if (cur.clock < this.doc.next(cur.client)) {
+        base = this.doc.defAt(cur)?.depth ?? 0; // the first definition of the id wins ("a struct of this update that [STATE-76] ignores has no depth")
+        break;
+      }
+      if (this.u === null) break;
+      const t = this.u.find(cur);
+      if (t === undefined || t.kind !== "item") break; // not present, or a GC defines it: the chain ends, and a GC is no ContentType item
+      this.dep ??= new Uint16Array(this.u.all.length);
+      const known = this.dep[t.idx] as number;
+      if (known !== 0) {
+        base = known - 1;
+        break;
+      }
+      if (chain.length > this.u.all.length) break; // the references of an update have no cycle (05 [STATE-71]), so a chain is never longer than the update
+      chain.push(t);
+      const p = this.parentOf(t);
+      if (!p.hasId || p.id === null) break; // a root, or an item that takes its parent from a GC: the chain ends after t
+      cur = p.id;
+    }
+    for (let i = chain.length - 1; i >= 0; i--) {
+      const t = chain[i] as Struct;
+      if (t.content === ContentRef.Type && base < 255) base++;
+      (this.dep as Uint16Array)[t.idx] = base + 1;
+    }
+    return base;
+  }
+
+  /**
+   * The nesting depth of the struct s whose parent is p (05 [STATE-71]): the depth of the parent item, plus 1 when s is a ContentType item. A GC has
+   * none, and a parent that is a root, or none, or that s takes from a GC (the chain ends after s) adds nothing. The depths saturate at 255, which no
+   * bound is near: a key that an earlier draft let nest deeper still refuses a level above it.
+   */
+  depthOf(s: Struct, p: ParentRef): number {
+    if (s.kind !== "item") return 0;
+    let depth = 0;
+    if (p.hasId && p.id !== null) {
+      if (this.last !== null && this.last.client === p.id.client && this.last.clock === p.id.clock) depth = this.lastDepth;
+      else {
+        depth = this.nestOf(p.id);
+        this.last = p.id; // the structs that an update adds to one text or array share their parent
+        this.lastDepth = depth;
+      }
+    }
+    return s.content === ContentRef.Type && depth < 255 ? depth + 1 : depth;
   }
 
   /**

@@ -22,15 +22,16 @@ export {
   parseUpdate,
 } from "./parse.js";
 export { type RootType, type Roots, checkRoots } from "./roots.js";
-export { Doc, canonicalForm, integrated, type Result, type Verdict } from "./doc.js";
+export { Doc, MAX_NESTING, canonicalForm, integrated, type Result, type Verdict } from "./doc.js";
 export { type BaseError, type BaseFault, validateBase } from "./base.js";
 
 import { type Update, parseUpdate } from "./parse.js";
 import { checkRoots, type Roots } from "./roots.js";
 
 /**
- * The whole of 05 [STATE-71]: `parseUpdate`, then `checkRoots`. Throws a CrdtError, to be rejected with SCHEMA_INVALID.
- * (`roots` may be left out where the root conditions were judged at commit.)
+ * The conditions of 05 [STATE-71] that depend on the update and the template alone: `parseUpdate`, then `checkRoots`. Throws a CrdtError, to be
+ * rejected with SCHEMA_INVALID. (`roots` may be left out where the root conditions were judged at commit.) The Nesting condition needs the key's
+ * integrated updates: it is `Doc.checkNesting`, which `Doc.apply` makes.
  */
 export function checkWellFormed(b: Uint8Array, roots?: Roots): Update {
   const u = parseUpdate(b);

@@ -45,16 +45,11 @@ const KNOWN_LIBRARY_DIFFERENCES: Record<string, { library: "yjs" | "yrs"; shows?
 };
 
 /**
- * The vectors of the pinned spec (draft 14, omniview 4377ab8) that the client's rules do not pass yet, with the work that will
- * make them pass (the twin of the server's `vectors.SkipPending`). Remove an id when its work lands.
+ * The vectors of the pinned spec (draft 16, omniview 6e5fe6f) that the client's rules do not pass yet, with the work that will
+ * make them pass (the twin of the server's `vectors.SkipPending`). Remove an id when its work lands. Empty: the nesting vectors of round 18
+ * (`crdt-type-depth-002`, `-003`, `-004`, `-006`, `-009`, R18-B1) pass.
  */
-const PENDING = new Map<string, string>([
-  ["crdt-type-depth-002", "round 18 R18-B1 (05 [STATE-71], H2: ContentType nesting at most 32)"],
-  ["crdt-type-depth-003", "round 18 R18-B1 (05 [STATE-71], H2: ContentType nesting at most 32)"],
-  ["crdt-type-depth-004", "round 18 R18-B1 (05 [STATE-71], H2: ContentType nesting at most 32)"],
-  ["crdt-type-depth-006", "round 18 R18-B1 (05 [STATE-71], H2: ContentType nesting at most 32)"],
-  ["crdt-type-depth-009", "round 18 R18-B1 (05 [STATE-71], H2: ContentType nesting at most 32)"],
-]);
+const PENDING = new Map<string, string>([]);
 const vit = (id: string) => (PENDING.has(id) ? it.skip : it);
 
 /** Stable JSON for a comparison of documents: object keys sorted. */

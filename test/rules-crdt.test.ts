@@ -9,7 +9,7 @@ import * as vm from "node:vm";
 import { create } from "@bufbuild/protobuf";
 import { describe, expect, it } from "vitest";
 import { ChangeKind, KeyChangeSchema, RecordKind, RecordSchema } from "../src/gen/abpc/v2/types_pb.js";
-import { Doc, parseUpdate, validateBase, type BaseError, type Roots, type Verdict } from "../src/rules/crdt/index.js";
+import { Doc, MAX_NESTING, parseUpdate, validateBase, type BaseError, type Roots, type Verdict } from "../src/rules/crdt/index.js";
 import { Analysis } from "../src/rules/crdt/doc.js";
 import { applyRecord, ReplicaState } from "../src/rules/fold/index.js";
 
@@ -977,5 +977,124 @@ describe("05 [STATE-74] document length: its cost follows the shape of the docum
     expect(performance.now() - t1).toBeLessThan(1000);
     expect(len2).not.toBe(len);
     expect(doc.documentLength(), "the Doc that was cloned").toBe(len);
+  });
+});
+
+// ---- 05 [STATE-71], Nesting (round 18, H2): the twins of server/internal/crdt/nesting_test.go ----
+//
+// The depth of a ContentType item is the number of ContentType items on the chain of its parents, itself included, with the parents of 05 [STATE-76]; depth 32
+// is accepted and depth 33 is refused with SCHEMA_INVALID (the reason `nesting`), judged with the key's integrated updates and before the fold, and the chain is
+// walked without recursion. The vectors `crdt-type-depth-001` to `-009` fix the cases of the text; these tests build the shapes that they do not.
+
+/** A ContentType item (a YText, type ref 2) whose parent is the item at (client, clock). */
+const typeIn = (client: number, clock: number): number[] => cat([0x07, 0], uv(client), uv(clock), uv(2));
+const skipOf = (n: number): number[] => cat([10], uv(n));
+
+/** An update of one client group of many structs (a spread of 300,000 arguments would overflow the stack of the test, not of the code under test). */
+function bigUpdate(client: number, from: number, n: number, struct: (clock: number) => number[]): Uint8Array {
+  const out: number[] = [...uv(1), ...uv(n), ...uv(client), ...uv(from)];
+  for (let i = 0; i < n; i++) for (const b of struct(from + i)) out.push(b);
+  out.push(0); // an empty delete set
+  return Uint8Array.from(out);
+}
+
+/** The update of one client group, clocks from `from`, that holds n ContentType items: the first under the root "t" when from is 0, each other under the one before it. */
+const nestUpdate = (client: number, from: number, n: number): Uint8Array =>
+  bigUpdate(client, from, n, (clock) => (clock === 0 ? rootType("t") : typeIn(client, clock - 1)));
+
+function wantNesting(d: Doc, b: Uint8Array): void {
+  const before = Buffer.from(d.canonical()).toString("hex");
+  const present = d.present;
+  const r = d.apply(b, textRoots);
+  expect({ verdict: r.verdict, reason: r.reason }).toEqual({ verdict: "SCHEMA_INVALID", reason: "nesting" });
+  expect(r.error?.reason).toBe("nesting");
+  expect(d.present, "a refused update leaves the key as it was").toBe(present);
+  expect(Buffer.from(d.canonical()).toString("hex")).toBe(before);
+}
+
+describe("05 [STATE-71] Nesting: depth 32 is accepted and depth 33 is refused", () => {
+  it("in one update and across two: the refused update leaves the key as it was", () => {
+    const d = new Doc();
+    mustApply(d, nestUpdate(5, 0, MAX_NESTING), "APPLIED");
+    for (const c of [0, 15, 31]) expect(d.defAt({ client: 5, clock: c })?.depth, `the depth stored at clock ${c}`).toBe(c + 1);
+    wantNesting(d, nestUpdate(5, MAX_NESTING, 1)); // a 33rd level, in a second update
+    mustApply(d, update([group(6, 0, textIn(5, MAX_NESTING - 1, "x"))]), "APPLIED");
+
+    const fresh = new Doc();
+    wantNesting(fresh, nestUpdate(5, 0, MAX_NESTING + 1));
+    expect(fresh.present).toBe(false);
+    const u = parseUpdate(nestUpdate(5, 0, MAX_NESTING + 1));
+    expect(() => fresh.checkNesting(u)).toThrow(/nesting/);
+    expect(() => fresh.checkNesting(parseUpdate(nestUpdate(5, 0, MAX_NESTING)))).not.toThrow();
+  });
+
+  it("counts only the ContentType items on a chain that passes through a hidden item that is no type", () => {
+    for (const [levels, accept] of [
+      [MAX_NESTING - 1, true],
+      [MAX_NESTING, false],
+    ] as const) {
+      const d = new Doc();
+      mustApply(d, nestUpdate(5, 0, levels), "APPLIED");
+      mustApply(d, update([group(6, 0, textIn(5, levels - 1, "s"))]), "APPLIED");
+      mustApply(d, update([], ds(6, 0, 1)), "APPLIED"); // the string is deleted: a hidden parent that is no type
+      const x = update([group(7, 0, typeIn(6, 0))]);
+      if (accept) {
+        mustApply(d, x, "APPLIED");
+        expect(d.defAt({ client: 7, clock: 0 })?.depth).toBe(MAX_NESTING);
+      } else wantNesting(d, x);
+    }
+  });
+
+  it("judges an update that is a no-op for good like any other, and gives a struct that 05 [STATE-76] ignores no depth (crdt-type-depth-008, -009)", () => {
+    const d = new Doc();
+    mustApply(d, nestUpdate(5, 0, MAX_NESTING), "APPLIED");
+    wantNesting(d, update([group(6, 0, typeIn(5, MAX_NESTING - 1), skipOf(3))])); // a Skip: a no-op for good, and a 33rd level
+    mustApply(d, update([group(5, MAX_NESTING, textIn(5, MAX_NESTING - 1, "x"))]), "APPLIED");
+    mustApply(d, update([group(5, MAX_NESTING, typeIn(5, MAX_NESTING - 1))]), "NO_EFFECT"); // wholly below the next clock: ignored
+  });
+
+  it("stops at a GC and at a parent that is not present", () => {
+    const d = new Doc();
+    mustApply(d, update([group(5, 0, gcOf(1))]), "APPLIED");
+    mustApply(d, update([group(6, 0, typeIn(5, 0))]), "APPLIED");
+    expect(d.defAt({ client: 6, clock: 0 })?.depth, "a type under a GC").toBe(1);
+    mustApply(d, update([group(7, 0, typeIn(9, 9))]), "NOOP_FOR_GOOD");
+  });
+});
+
+describe("02 [ARC-46], 05 [STATE-71] Nesting: the chain is walked without recursion, and each item once", () => {
+  it("a nest of 300,000 levels in one update is refused, and a fold of the log (which does not judge the bound again) saturates its depths", () => {
+    const n = 300000;
+    const b = nestUpdate(5, 0, n);
+    const t0 = performance.now();
+    wantNesting(new Doc(), b);
+    expect(performance.now() - t0).toBeLessThan(20000);
+    const d = new Doc();
+    mustApply(d, nestUpdate(5, 0, MAX_NESTING), "APPLIED");
+    wantNesting(d, nestUpdate(5, MAX_NESTING, n - MAX_NESTING));
+    const old = new Doc();
+    expect(old.fold(b).verdict).toBe("APPLIED");
+    expect(old.defAt({ client: 5, clock: n - 1 })?.depth, "saturated").toBe(255);
+    wantNesting(old, update([group(6, 0, typeIn(5, n - 1))]));
+  });
+
+  it("a type under the end of a long chain of hidden items costs one lookup in the nesting check, not a walk of the chain", () => {
+    // (The fold's own question, whether the parent is hidden, walks the chain here: this client keeps no memory of it between updates, as the server's hidCache does.)
+    const chain = 60000;
+    const checks = 3000;
+    const d = new Doc();
+    expect(d.fold(update([group(5, 0, rootType("t"), textIn(5, 0, "s"))])).verdict).toBe("APPLIED"); // the type 5:0 and the string 5:1 under it
+    expect(d.fold(update([], ds(5, 1, 1))).verdict).toBe("APPLIED"); // the string is deleted: everything below it is hidden
+    // 5:2.., each the child of the one before it
+    expect(d.fold(bigUpdate(5, 2, chain, (clock) => textIn(5, clock - 1, "x"))).verdict).toBe("APPLIED");
+    const tail = chain + 1;
+    expect(d.defAt({ client: 5, clock: tail })?.depth, "the depth of the tail of the chain").toBe(1);
+    const us = Array.from({ length: checks }, (_, i) => parseUpdate(update([group(6, i, typeIn(5, tail))])));
+    const t0 = performance.now();
+    for (const u of us) d.checkNesting(u);
+    const ms = performance.now() - t0;
+    expect(ms, `${checks} checks under a chain of ${chain} hidden items took ${ms} ms`).toBeLessThan(2000);
+    mustApply(d, update([group(6, 0, typeIn(5, tail))]), "APPLIED");
+    expect(d.defAt({ client: 6, clock: 0 })?.depth).toBe(2);
   });
 });

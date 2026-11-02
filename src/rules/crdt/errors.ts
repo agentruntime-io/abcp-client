@@ -27,7 +27,8 @@ export type RefusalReason =
   | "self-reference" // References
   | "cycle" // References
   | "root-name" // Roots: a root that crdt_roots does not list
-  | "root-type"; // Roots: an item that does not fit its root's type
+  | "root-type" // Roots: an item that does not fit its root's type
+  | "nesting"; // Nesting: a ContentType item at a depth above 32 (round 18, H2); judged with the key's state (Doc.checkNesting)
 
 /** The reasons of an update that is a deterministic no-op for good (05 [STATE-76]). */
 export type NoopReason =
