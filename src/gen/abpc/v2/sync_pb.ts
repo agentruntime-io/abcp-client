@@ -1186,7 +1186,7 @@ export type PresenceEntry = Message<"abpc.v2.PresenceEntry"> & {
   state: Uint8Array;
 
   /**
-   * tabs; Yjs awareness: a map from tab id to that tab's y-protocols state, json/v1 (spec/09 §9.8)
+   * tabs; a Yjs awareness topic (spec/09 [READ-72]): a map from tab id to that tab's y-protocols state, json/v1 (spec/09 §9.8)
    *
    * @generated from field: google.protobuf.Timestamp expires_at = 4;
    */

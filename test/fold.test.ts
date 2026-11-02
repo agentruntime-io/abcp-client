@@ -1,6 +1,6 @@
 // The fold of served records (conformance/vectors/fold.json), under the input mapping of 17 [CONF-9] for a client engine
 // (vector README, "The client engine: the input mapping of 17 [CONF-9]"): for every vector of kind `fold` whose
-// `expect.records` start at seq 1 and run without a gap (189 at draft 15), the `served` form of each record, in the order of
+// `expect.records` start at seq 1 and run without a gap (190 at draft 16), the `served` form of each record, in the order of
 // the list, is folded onto an empty replica, and the per-key state hashes of 05 [STATE-41] equal the entries of `expect.keys`.
 //
 // A client engine compares per-key hashes only (17 [CONF-9]). The replica of this test also keeps prefix versions, so it
@@ -36,8 +36,8 @@ function contiguous(v: Vector): boolean {
 const folds = all.filter((v) => v.kind === "fold");
 
 describe("17 [CONF-9] input mapping on fold.json: per-key state hashes of the fold of the served records", () => {
-  it("189 vectors are run on a client engine, as the README counts them at draft 15", () => {
-    expect(folds.filter(contiguous).length).toBe(189);
+  it("190 vectors are run on a client engine, as the README counts them at draft 16", () => {
+    expect(folds.filter(contiguous).length).toBe(190);
   });
 
   for (const v of all) {

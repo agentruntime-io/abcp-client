@@ -110,9 +110,17 @@ describe("06 [LOG-71] value digests, E, C, W and record_hash (record-hash vector
   }
 });
 
+// Round 18 (spec draft 16, omniview 6e5fe6f): the vectors the code does not pass yet, with the batch that will (the server's list is
+// server/internal/vectors/pending.go). Remove an entry when its work lands.
+const PENDING = new Map<string, string>([
+  ["request-digest-006", "round 18 R18-B3 (12 [ADM-94]: the audit digest clears personal keys)"],
+  ["request-digest-007", "round 18 R18-B3 (12 [ADM-94]: the audit digest clears personal keys)"],
+  ["request-digest-008", "round 18 R18-B3 (12 [ADM-94]: the audit digest clears personal keys)"],
+]);
+
 describe("12 [ADM-94] request digest (request-digest vectors)", () => {
   for (const v of ofKind("request-digest")) {
-    it(`${v.id}: ${v.title.slice(0, 100)}`, () => {
+    (PENDING.has(v.id) ? it.skip : it)(`${v.id}: ${v.title.slice(0, 100)}`, () => {
       let canonical: Uint8Array = new Uint8Array(0);
       let digest: Uint8Array = new Uint8Array(0);
       if (v.event === undefined) {

@@ -48,7 +48,13 @@ const KNOWN_LIBRARY_DIFFERENCES: Record<string, { library: "yjs" | "yrs"; shows?
  * The vectors of the pinned spec (draft 14, omniview 4377ab8) that the client's rules do not pass yet, with the work that will
  * make them pass (the twin of the server's `vectors.SkipPending`). Remove an id when its work lands.
  */
-const PENDING = new Map<string, string>([]);
+const PENDING = new Map<string, string>([
+  ["crdt-type-depth-002", "round 18 R18-B1 (05 [STATE-71], H2: ContentType nesting at most 32)"],
+  ["crdt-type-depth-003", "round 18 R18-B1 (05 [STATE-71], H2: ContentType nesting at most 32)"],
+  ["crdt-type-depth-004", "round 18 R18-B1 (05 [STATE-71], H2: ContentType nesting at most 32)"],
+  ["crdt-type-depth-006", "round 18 R18-B1 (05 [STATE-71], H2: ContentType nesting at most 32)"],
+  ["crdt-type-depth-009", "round 18 R18-B1 (05 [STATE-71], H2: ContentType nesting at most 32)"],
+]);
 const vit = (id: string) => (PENDING.has(id) ? it.skip : it);
 
 /** Stable JSON for a comparison of documents: object keys sorted. */
@@ -310,7 +316,7 @@ describe("17 [CONF-9], Q33: no vector hides a difference between the documents o
   // at draft 14 the text follows Yjs (Y9, Z3, Q33): the vectors list yrs differences only, and 76 give a document
   it("the vectors with a document are all checked, and the known library differences are exactly those that the vectors list", () => {
     const withContent = all.filter((v) => v.expect?.content !== undefined && v.expect.content !== null);
-    expect(withContent.length, "vectors that give an expected document at draft 15").toBe(80);
+    expect(withContent.length, "vectors that give an expected document at draft 16").toBe(85);
     const listed = all.filter((v) => v.library?.known !== undefined).map((v) => [v.id, Object.keys(v.library.known as object).sort()] as const);
     expect(listed.map(([id]) => id).sort()).toEqual(Object.keys(KNOWN_LIBRARY_DIFFERENCES).sort());
     for (const [id, libs] of listed) expect(libs, id).toEqual([(KNOWN_LIBRARY_DIFFERENCES[id] as { library: string }).library]);

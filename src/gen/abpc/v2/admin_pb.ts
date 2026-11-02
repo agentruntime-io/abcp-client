@@ -105,7 +105,7 @@ export type Issuer = Message<"abpc.v2.Issuer"> & {
   jwksUri: string;
 
   /**
-   * allow-list (spec/04 [MAN-70])
+   * allow-list, none twice (spec/04 [MAN-70])
    *
    * @generated from field: repeated string algorithms = 5;
    */
@@ -572,7 +572,7 @@ export type AppConfig = Message<"abpc.v2.AppConfig"> & {
   authorizer?: AuthorizerConfig;
 
   /**
-   * spec/15 §15.2; sent back as read (GetAppConfig), changed only as spec/15 §15.2 allows
+   * spec/15 §15.2; none twice (spec/04 [MAN-83]); sent back as read (GetAppConfig), changed only as spec/15 §15.2 allows
    *
    * @generated from field: repeated string enabled_features = 11;
    */
@@ -2246,7 +2246,8 @@ export type AuditEntry = Message<"abpc.v2.AuditEntry"> & {
   requestDigest: Uint8Array;
 
   /**
-   * contact's address cleared (spec/12 [ADM-94]); of the Mutation, for an override;
+   * contact's address, RedactRequest.keys and the key of every change of an
+   * override of a personal template cleared (spec/12 [ADM-94]); of the Mutation, for an override;
    * empty for an event with no request and for a request refused before it can be
    * encoded; break-glass: of the canonical change (spec/16 [SEC-44])
    *
