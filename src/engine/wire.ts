@@ -9,18 +9,32 @@ import type { DescMessage, Message } from "@bufbuild/protobuf";
 import {
   CancelIntentRequestSchema,
   CancelIntentResponseSchema,
+  CommitBlobRequestSchema,
+  CommitBlobResponseSchema,
   CreateKeyspaceRequestSchema,
   CreateKeyspaceResponseSchema,
+  CreateUploadRequestSchema,
+  CreateUploadResponseSchema,
+  DeleteBlobRequestSchema,
+  DeleteBlobResponseSchema,
+  GetBlobRequestSchema,
+  GetBlobResponseSchema,
   GetManifestRequestSchema,
   GetManifestResponseSchema,
   GetMutationResultRequestSchema,
   GetMutationResultResponseSchema,
   GetMutationResultsRequestSchema,
   GetMutationResultsResponseSchema,
+  JoinPresenceRequestSchema,
+  JoinPresenceResponseSchema,
+  LeavePresenceRequestSchema,
+  LeavePresenceResponseSchema,
   LoadStateRequestSchema,
   LoadStateResponseSchema,
   MutateRequestSchema,
   MutateResponseSchema,
+  PublishPresenceRequestSchema,
+  PublishPresenceResponseSchema,
   RefreshSessionRequestSchema,
   RefreshSessionResponseSchema,
   SubscribeRequestSchema,
@@ -29,18 +43,32 @@ import {
   UpdateSubscriptionResponseSchema,
   type CancelIntentRequest,
   type CancelIntentResponse,
+  type CommitBlobRequest,
+  type CommitBlobResponse,
   type CreateKeyspaceRequest,
   type CreateKeyspaceResponse,
+  type CreateUploadRequest,
+  type CreateUploadResponse,
+  type DeleteBlobRequest,
+  type DeleteBlobResponse,
+  type GetBlobRequest,
+  type GetBlobResponse,
   type GetManifestRequest,
   type GetManifestResponse,
   type GetMutationResultRequest,
   type GetMutationResultResponse,
   type GetMutationResultsRequest,
   type GetMutationResultsResponse,
+  type JoinPresenceRequest,
+  type JoinPresenceResponse,
+  type LeavePresenceRequest,
+  type LeavePresenceResponse,
   type LoadStateRequest,
   type LoadStateResponse,
   type MutateRequest,
   type MutateResponse,
+  type PublishPresenceRequest,
+  type PublishPresenceResponse,
   type RefreshSessionRequest,
   type RefreshSessionResponse,
   type SubscribeRequest,
@@ -126,6 +154,29 @@ export class BytesTransport implements Transport {
   }
   refreshSession(req: RefreshSessionRequest, o?: CallOptions): Promise<RefreshSessionResponse> {
     return this.unary("RefreshSession", RefreshSessionRequestSchema, RefreshSessionResponseSchema, req, o);
+  }
+  // 09 §9.8, §9.9: the answers hold no repeated field but the headers of `CreateUploadResponse` (counts.ts bounds them); every string and every timestamp
+  // is read by the strict decoder, which refuses invalid UTF-8 and a Timestamp out of range (02 [ARC-61])
+  joinPresence(req: JoinPresenceRequest, o?: CallOptions): Promise<JoinPresenceResponse> {
+    return this.unary("JoinPresence", JoinPresenceRequestSchema, JoinPresenceResponseSchema, req, o);
+  }
+  publishPresence(req: PublishPresenceRequest, o?: CallOptions): Promise<PublishPresenceResponse> {
+    return this.unary("PublishPresence", PublishPresenceRequestSchema, PublishPresenceResponseSchema, req, o);
+  }
+  leavePresence(req: LeavePresenceRequest, o?: CallOptions): Promise<LeavePresenceResponse> {
+    return this.unary("LeavePresence", LeavePresenceRequestSchema, LeavePresenceResponseSchema, req, o);
+  }
+  createUpload(req: CreateUploadRequest, o?: CallOptions): Promise<CreateUploadResponse> {
+    return this.unary("CreateUpload", CreateUploadRequestSchema, CreateUploadResponseSchema, req, o);
+  }
+  commitBlob(req: CommitBlobRequest, o?: CallOptions): Promise<CommitBlobResponse> {
+    return this.unary("CommitBlob", CommitBlobRequestSchema, CommitBlobResponseSchema, req, o);
+  }
+  getBlob(req: GetBlobRequest, o?: CallOptions): Promise<GetBlobResponse> {
+    return this.unary("GetBlob", GetBlobRequestSchema, GetBlobResponseSchema, req, o);
+  }
+  deleteBlob(req: DeleteBlobRequest, o?: CallOptions): Promise<DeleteBlobResponse> {
+    return this.unary("DeleteBlob", DeleteBlobRequestSchema, DeleteBlobResponseSchema, req, o);
   }
 
   async *subscribe(req: SubscribeRequest, o?: CallOptions): AsyncIterable<SubscribeResponse> {

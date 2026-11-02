@@ -64,6 +64,11 @@ export abstract class ReactionLayer extends ReplicaLayer {
   protected abstract online(): boolean;
   protected abstract applyResult(e: OutboxEntry, r: import("../gen/abpc/v2/sync_pb.js").MutationResult, source: "mutate" | "poll" | "cancel"): Promise<void>;
   protected abstract rebindSession(): void;
+  /**
+   * 09 [READ-89], 14 [CLI-44]: an action got `Retry{BLOB_PENDING}` or `Reject{BLOB_MISSING}`: the upload of the blobs that it names is completed or repeated with the
+   * bytes that the engine holds (`blobs.ts`). Resolves when that is done, whatever came of it.
+   */
+  protected abstract repairBlobs(e: OutboxEntry): Promise<void>;
   protected abstract requestResumeCheck(f: Follow, cause: string): void;
   protected abstract whenLoaded(f: Follow): Promise<void>;
   protected abstract probeKeyspaceLoad(f: Follow): void;
@@ -178,14 +183,18 @@ export abstract class ReactionLayer extends ReplicaLayer {
         this.deferEntry(e, this.nextDelay(e, retry.afterMs));
         break;
       }
+      case RetryReason.BLOB_PENDING:
+        // 09 [READ-89], 14 [CLI-44]: "the client completes or repeats the upload of the same blob bytes (09 §9.9), then resends": nothing was recorded; the
+        // identical action is resent after the larger of `after_ms` and the client backoff, once the upload is done
+        this.afterBlobRepair(e, this.nextDelay(e, retry.afterMs));
+        break;
       case RetryReason.NOT_PROCESSED:
       case RetryReason.LANE_NOT_READY:
       case RetryReason.CONTENTION:
       case RetryReason.KEYSPACE_SEEDING:
-      case RetryReason.BLOB_PENDING:
       case RetryReason.BLOB_WITHHELD:
-        // TODO(09 §9.9, 14 [CLI-44]): the blob uploads that BLOB_PENDING and BLOB_MISSING ask for come with the blob milestone;
-        // the action is resent unchanged after the larger of `after_ms` and the client backoff
+        // the action is resent unchanged after the larger of `after_ms` and the client backoff. A server never answers a mutation with BLOB_WITHHELD (09 [READ-89]: the
+        // action is accepted, so that no lane waits on a withheld blob); a peer that does is resent to as for any `Retry` (15 [COMPAT-40]), and holds nothing (14 [CLI-44])
         this.deferEntry(e, this.nextDelay(e, retry.afterMs));
         break;
       default:
@@ -194,6 +203,30 @@ export abstract class ReactionLayer extends ReplicaLayer {
         this.deferEntry(e, this.nextDelay(e, retry.afterMs));
     }
     this.markDirty(e);
+  }
+
+  /**
+   * The upload of the blobs that the action names is completed or repeated (09 [READ-89]), and the action is resent after `delayMs` or after the upload, whichever is later
+   * (14 [CLI-44], [CLI-43]). The entry is not sent while the upload is under way.
+   */
+  protected afterBlobRepair(e: OutboxEntry, delayMs: number): void {
+    const rt = this.rt(e.mutationId);
+    const started = this.clock.now();
+    rt.nextAttemptAt = Number.MAX_SAFE_INTEGER; // not before the upload is done
+    this.detach(
+      (async () => {
+        try {
+          await this.repairBlobs(e);
+        } catch (err) {
+          this.noteInternalError(err);
+        }
+        await this.run(() => {
+          if (!this.entries.has(e.mutationId) || e.outcome !== undefined) return;
+          rt.nextAttemptAt = 0;
+          this.deferEntry(e, Math.max(0, delayMs - (this.clock.now() - started)));
+        });
+      })(),
+    );
   }
 
   /** Polls `GetMutationResult` for an action whose intent the server drives (14 [CLI-44]), with the client backoff. */
@@ -342,8 +375,9 @@ export abstract class ReactionLayer extends ReplicaLayer {
     }
     switch (reaction) {
       case "RETRY":
-        // a `Reject` of class RETRY is `BLOB_MISSING`: upload again, then resend (TODO(09 §9.9)); resent unchanged with the backoff
-        this.deferEntry(e, this.nextDelay(e, undefined));
+        // a `Reject` of class RETRY is `BLOB_MISSING` (A.2): "the client re-uploads the same bytes, then resends the identical mutation" (09 [READ-89], 14 [CLI-44], 02
+        // [ARC-51] item 1), with the client backoff
+        this.afterBlobRepair(e, this.nextDelay(e, undefined));
         return;
       case "DEAD_LETTER":
         await this.endAction(e, { sink: "deadLetter", reject, reason: codeName(reject.code), dependents: "fail" });

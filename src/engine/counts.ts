@@ -42,12 +42,21 @@ export const MAX_REDACTIONS_PER_PAGE = 1_000;
 export const LANES = 2;
 /** 10 [AUTH-13], [AUTH-26]: an actor chain holds at most 16 subjects. */
 export const MAX_ACTOR_CHAIN = 16;
+/** 04 Table 4.10a: the protocol maximum of `max_presence_state_bytes` (so that a `PresenceFrame` stays within 16 MiB, 04 [MAN-75]) and of `presence_min_publish_interval_ms`. */
+export const MAX_PRESENCE_STATE_BYTES = 64 << 10;
+export const MAX_PRESENCE_MIN_INTERVAL_MS = 5_000;
 /** 09 §9.9: a record's `blob_refs` hold at most 1,000 entries. */
 export const MAX_BLOB_REFS = 1_000;
 /** 06 [LOG-8], [LOG-18]: a record holds the changes of one action, at most `max_changes_per_action` (2,000), and the intent or decision row that goes with them. */
 export const MAX_CHANGES_PER_RECORD = MAX_CHANGES_PER_ACTION + 2;
 /** A list of feature names (added by this client, as the server's `MaxFeatureNames` for what it receives): a peer names the few features that it knows. */
 export const MAX_FEATURE_NAMES = 256;
+/**
+ * 09 [READ-86]: `CreateUploadResponse.upload_headers` are "the exact headers that the PUT carries besides Content-Length": the headers that a store's signature binds
+ * (a checksum, a length, a content type, an encryption mode), a handful. The text gives no count; a client bounds the list, since the answer is the server's and
+ * what it holds is untrusted input (16 [SEC-1]). SPEC-QUESTION: no bound in the text (see `engine/blobs.ts`).
+ */
+export const MAX_UPLOAD_HEADERS = 32;
 /** 08 [GATE-39]: a gate's `details` hold at most 32 entries; a server's own reject holds a few more (`moved_to`, `effect_key`, ...). */
 export const MAX_REJECT_DETAILS = 64;
 /** The unknown fields that the decoder keeps: for one message, and for the whole of a decoded message. */
@@ -86,6 +95,8 @@ export const BOUNDS: Readonly<Record<string, Bound>> = {
   "abpc.v2.ControlFrame.KeyspaceDropped.successors": MAX_SUCCESSORS,
   "abpc.v2.PresenceFrame.entries": { perOctets: 16 }, // 09 [READ-101], [READ-79]: members are capped by the app's `max_presence_members_per_topic`, whose maximum is the u32
   "abpc.v2.PresenceFrame.left_client_ids": { perOctets: 38 }, // a client_id is a UUID, 36 characters (03 [ID-35])
+  // -- the blob calls (09 §9.9): the one field of an answer that holds many; the calls of 09 §9.8 answer with a timestamp or nothing --
+  "abpc.v2.CreateUploadResponse.upload_headers": MAX_UPLOAD_HEADERS,
   // -- what a message holds --
   "abpc.v2.KeyspaceCursor.interest_prefixes": MAX_INTEREST_PREFIXES, // 04 Table 4.10a: the frame of a `KeyspaceAdded`
   "abpc.v2.Principal.actor_chain": MAX_ACTOR_CHAIN,

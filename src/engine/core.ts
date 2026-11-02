@@ -12,8 +12,9 @@ import { type AppLimits, type KeyChange, KeyChangeSchema } from "../gen/abpc/v2/
 import type { Mutation } from "../gen/abpc/v2/sync_pb.js";
 import { VersionTopology, DEFAULT_FEATURES } from "../rules/fold/index.js";
 import { BoundedSet, pushBounded } from "./bounded.js";
+import { DEFAULT_BLOB_CACHE_BYTES, fetchBlobHttp, MemoryBlobStash, type BlobHttp, type BlobStash } from "./blob-store.js";
 import { systemClock, systemRandom, type Clock, type Random } from "./clock.js";
-import { MAX_CHANGES_PER_ACTION, MAX_INTEREST_PREFIXES } from "./counts.js";
+import { MAX_CHANGES_PER_ACTION, MAX_INTEREST_PREFIXES, MAX_PRESENCE_MIN_INTERVAL_MS, MAX_PRESENCE_STATE_BYTES } from "./counts.js";
 import { CanonError, decodeContent } from "./entry.js";
 import { StorageError } from "./errors.js";
 import { EventBus } from "./events.js";
@@ -102,6 +103,15 @@ export interface EngineConfig {
    * The cursors that do not fit are named in `UpdateSubscription` adds on the new session (09 [READ-57]). A test lowers it.
    */
   maxSubscribeBytes?: number;
+  /** Blobs (09 §9.9): the HTTP of the blob store, where the bytes that actions name are kept, and the size of the cache of downloads. */
+  blobs?: {
+    /** Moves bytes to and from signed URLs; default the platform's `fetch` (`fetchBlobHttp`). */
+    http?: BlobHttp;
+    /** Keeps the bytes of the blobs that actions name until the actions are confirmed (09 [READ-94]); default in memory. */
+    stash?: BlobStash;
+    /** The most octets of downloaded blobs that the engine keeps; default 32 MiB. */
+    cacheBytes?: number;
+  };
 }
 
 /** The limits in force, as the engine uses them (04 Table 4.10a). */
@@ -116,6 +126,16 @@ export interface Limits {
   keyspaceNotFoundWaitMs: number;
   /** Interest prefixes per followed keyspace (09 [READ-22], 04 Table 4.10). */
   maxInterestPrefixes: number;
+  /** One presence state, in octets (09 [READ-74], 04 Table 4.10a): a larger one is refused by the engine before it is sent. */
+  maxPresenceStateBytes: number;
+  /** Members of one presence topic (09 [READ-79]); the server refuses a join over it with `QUOTA_EXCEEDED`. */
+  maxPresenceMembersPerTopic: number;
+  /** The presence TTL (09 [READ-76]): an entry expires this long after its last publish; the engine publishes again at about half of it. */
+  presenceTtlMs: number;
+  /** The shortest interval between two publishes of one member of a topic that the server applies (09 [READ-79]). */
+  presenceMinPublishIntervalMs: number;
+  /** One blob, in octets (09 [READ-86], 04 Table 4.10a). */
+  maxBlobBytes: number;
 }
 
 /**
@@ -136,6 +156,13 @@ export const FLOOR_LIMITS: Limits = {
   maxValueBytes: 64 << 10,
   keyspaceNotFoundWaitMs: 60 * 1000,
   maxInterestPrefixes: 16,
+  maxPresenceStateBytes: 4 << 10,
+  maxPresenceMembersPerTopic: 100,
+  presenceTtlMs: 10_000,
+  // 04 Table 4.10a: "a 0 from a server that does not define the field means the default", 1,000 ms; the field has no other floor than its range's 100 ms
+  presenceMinPublishIntervalMs: 1_000,
+  // no floor and no maximum in 04 Table 4.10a: the default
+  maxBlobBytes: 100 * 1024 * 1024,
 };
 
 /** What the engine keeps of an outbox entry in memory only: its runtime state, rebuilt from the answers of the server after a restart. */
@@ -159,6 +186,11 @@ export abstract class EngineCore {
   readonly author: Author;
   readonly transport: Transport;
   readonly manifests: Manifests;
+  /** Where the bytes that actions name are kept (09 [READ-94]). */
+  readonly blobStash: BlobStash;
+  /** The most octets of downloaded blobs that the cache holds. */
+  protected readonly blobCacheBytes: number;
+  private blobHttpGiven: BlobHttp | undefined;
   storage!: OutboxStorage;
   readonly clock: Clock;
   readonly random: Random;
@@ -231,6 +263,9 @@ export abstract class EngineCore {
     this.author = { issuer: cfg.principal.issuer, sub: cfg.principal.sub, deviceId: cfg.principal.deviceId };
     this.transport = cfg.transport;
     this.manifests = cfg.manifests;
+    this.blobStash = cfg.blobs?.stash ?? new MemoryBlobStash();
+    this.blobCacheBytes = cfg.blobs?.cacheBytes ?? DEFAULT_BLOB_CACHE_BYTES;
+    this.blobHttpGiven = cfg.blobs?.http;
     this.storage = cfg.storage ?? new MemoryStorage();
     this.clock = cfg.clock ?? systemClock;
     this.random = cfg.random ?? systemRandom;
@@ -240,6 +275,11 @@ export abstract class EngineCore {
     this.predictors = cfg.predictors ?? {};
     this.features = cfg.features ?? DEFAULT_FEATURES;
     this.mintClientId = cfg.newClientId ?? ((): string => newUuid(this.random));
+  }
+
+  /** The HTTP of the blob store: the app's, or the platform's `fetch` (09 §9.9). */
+  protected get blobHttp(): BlobHttp {
+    return (this.blobHttpGiven ??= fetchBlobHttp());
   }
 
   /**
@@ -484,8 +524,19 @@ export abstract class EngineCore {
     take("max_inflight_gated_per_client", l.maxInflightGatedPerClient, FLOOR_LIMITS.maxInflightGated, (n) => (next.maxInflightGated = n));
     take("keyspace_not_found_wait_seconds", l.keyspaceNotFoundWaitSeconds, FLOOR_LIMITS.keyspaceNotFoundWaitMs / 1000, (n) => (next.keyspaceNotFoundWaitMs = n * 1000));
     take("max_interest_prefixes", l.maxInterestPrefixes, FLOOR_LIMITS.maxInterestPrefixes, (n) => (next.maxInterestPrefixes = n), MAX_INTEREST_PREFIXES);
+    // 09 §9.8, §9.9 (04 Table 4.10a): the presence and blob limits. Floors: the state size 4 KiB, the members 100, the TTL 10 s; a field with no floor
+    // (the blob size) takes its default. 07 [MUT-75]: `presence_min_publish_interval_ms` is 0 from a server whose revision does not define it, and the client
+    // then uses its default and reports no protocol error; a value above its maximum of 5,000 is reported and held to the maximum, as the others are.
+    take("max_presence_state_bytes", l.maxPresenceStateBytes, FLOOR_LIMITS.maxPresenceStateBytes, (n) => (next.maxPresenceStateBytes = n), MAX_PRESENCE_STATE_BYTES);
+    take("max_presence_members_per_topic", l.maxPresenceMembersPerTopic, FLOOR_LIMITS.maxPresenceMembersPerTopic, (n) => (next.maxPresenceMembersPerTopic = n));
+    take("presence_ttl_seconds", l.presenceTtlSeconds, FLOOR_LIMITS.presenceTtlMs / 1000, (n) => (next.presenceTtlMs = n * 1000));
+    take("max_blob_bytes", l.maxBlobBytes, FLOOR_LIMITS.maxBlobBytes, (n) => (next.maxBlobBytes = n));
+    if (l.presenceMinPublishIntervalMs === 0) next.presenceMinPublishIntervalMs = FLOOR_LIMITS.presenceMinPublishIntervalMs;
+    else take("presence_min_publish_interval_ms", l.presenceMinPublishIntervalMs, FLOOR_LIMITS.presenceMinPublishIntervalMs, (n) => (next.presenceMinPublishIntervalMs = n), MAX_PRESENCE_MIN_INTERVAL_MS);
     const changed = next.maxOfflineMs !== this.limits.maxOfflineMs;
+    const presenceChanged = next.presenceTtlMs !== this.limits.presenceTtlMs || next.presenceMinPublishIntervalMs !== this.limits.presenceMinPublishIntervalMs;
     this.limits = next;
+    if (presenceChanged) this.onPresenceLimitsChanged();
     if (changed) {
       // 14 [CLI-54]: the horizon is kept with the stored state, so that it applies while the client is offline
       if (this.role === "flusher") this.post(() => this.tx([{ op: "setMeta", key: "maxOfflineSeconds", value: next.maxOfflineMs / 1000 }]).catch(() => undefined));
@@ -505,6 +556,11 @@ export abstract class EngineCore {
 
   /** The limits changed in a way that other layers read (the offline horizon, 14 [CLI-56]); a layer that does overrides it. */
   protected onLimitsChanged(): void {
+    // nothing here
+  }
+
+  /** The presence TTL or the publish interval changed (09 [READ-76], [READ-79]); the presence layer overrides it. */
+  protected onPresenceLimitsChanged(): void {
     // nothing here
   }
 

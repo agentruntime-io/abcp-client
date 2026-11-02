@@ -3,6 +3,7 @@
 
 export { Queries, createQueries, type QueryEngine } from "./layer.js";
 export { QueryError, type QueryErrorCode } from "./errors.js";
+export { PresenceView, type PresenceEntry, type PresenceSource, type PresenceUpdate, type PresenceWatcher } from "./presence.js";
 export { compileFilter } from "./filter.js";
 export { parsePath, getAt } from "./json.js";
 export type {

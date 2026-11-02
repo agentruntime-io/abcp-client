@@ -25,7 +25,7 @@ import type { Transport } from "../engine/transport.js";
 import { decodeMessage, encodeMessage } from "../engine/wire.js";
 import { sha256 } from "../rules/crypto.js";
 import type { Roots, RootType } from "../rules/crdt/index.js";
-import { expandKeyTemplate, parseKeyTemplate, type KeyTemplate, type Rule, type Template } from "../rules/fold/index.js";
+import { expandKeyTemplate, matchKeyTemplate, parseKeyTemplate, type KeyTemplate, type Rule, type Template } from "../rules/fold/index.js";
 import { JsonV1Error, getMember, intRange, parseDocument, schemaFromValue, type JsonValue, type Range } from "../rules/jsonv1/index.js";
 
 const ROOT_TYPES: ReadonlySet<string> = new Set(["text", "map", "array", "xml_fragment"]);
@@ -51,6 +51,8 @@ interface Compiled {
 export class ParsedManifest implements EngineManifest {
   private readonly index = new TemplateIndex<Compiled>();
   private readonly ops = new Map<string, OpTypeInfo>();
+  /** The presence topic templates of each kind that declares presence (04 [MAN-15]). */
+  private readonly presence = new Map<string, KeyTemplate[]>();
 
   constructor(
     readonly version: number,
@@ -82,6 +84,23 @@ export class ParsedManifest implements EngineManifest {
     }
     // 04 [MAN-20]: the parent of a template is the longest proper prefix of it, by segments, that is an entity template: read after every template is indexed
     for (const c of compiled) c.template.parent = this.index.nearestAncestor(c.tpl, (x) => x.template.entity)?.tpl.text ?? "";
+    // 04 [MAN-15]: the presence section of a kind: its topic templates (the client does not read the schema: the server judges a state against it)
+    const kinds = getMember(doc, "keyspace_kinds");
+    if (kinds instanceof Map) {
+      for (const [kind, k] of kinds) {
+        const pres = getMember(k, "presence");
+        if (pres === undefined) continue;
+        const topics = getMember(pres, "topics");
+        const parsed: KeyTemplate[] = [];
+        if (Array.isArray(topics)) {
+          for (const text of topics) {
+            const t = typeof text === "string" ? parseKeyTemplate(text) : undefined;
+            if (t !== undefined) parsed.push(t);
+          }
+        }
+        this.presence.set(kind, parsed);
+      }
+    }
     const ops = getMember(doc, "op_types");
     if (ops instanceof Map) for (const [name, o] of ops) this.ops.set(name, opInfo(name, o, this.index));
     // 03 [ID-51]: `abpc.Override` exists in every manifest version, SEQUENCED
@@ -129,6 +148,13 @@ export class ParsedManifest implements EngineManifest {
     const f = this.find(key);
     if (f?.c.fencedBy === undefined) return undefined;
     return expandKeyTemplate(f.c.fencedBy, f.bindings);
+  }
+
+  presenceTopicKind(kind: string, topic: string): "plain" | "awareness" | undefined {
+    const topics = this.presence.get(kind);
+    if (topics === undefined) return undefined;
+    if (topics.some((t) => matchKeyTemplate(t, topic) !== undefined)) return "plain";
+    return this.find(topic)?.c.template.rule === "crdt" ? "awareness" : undefined;
   }
 }
 

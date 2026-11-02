@@ -23,6 +23,7 @@ import {
   type ControlFrame_KeyspaceDropped,
   type GetMutationResultResponse,
   type LoadStateResponse,
+  type PresenceFrame,
   type SubscribeResponse,
 } from "../gen/abpc/v2/sync_pb.js";
 import {
@@ -140,6 +141,20 @@ export abstract class SessionLayer extends SenderLayer {
     this.post(() => this.onSubjectRevoked());
     return true;
   }
+  // -- presence (09 §9.8), which `presence.ts` implements: what the session tells the topics of the engine --
+  /** A `PresenceFrame` of the stream: applied to the view of its topic, outside the log (09 [READ-81]). */
+  protected abstract applyPresenceFrame(frame: PresenceFrame): void;
+  /** A new session is live: the memberships and the entries of the earlier one are gone, and the topics join again (09 [READ-73], 02 [ARC-51] item 4). */
+  protected abstract presenceSessionStarted(): void;
+  /** The session ended: the server removed the memberships and the entries with it (09 [READ-77]). */
+  protected abstract presenceSessionEnded(): void;
+  /** A keyspace was added to the session: the topics that wait for it join (09 [READ-73]). */
+  protected abstract presenceKick(keyspaceId?: string): void;
+  /** A keyspace was dropped on the session: its memberships and entries ended (09 [READ-69], [READ-77]). */
+  protected abstract presenceKeyspaceDropped(keyspaceId: string): void;
+  /** The server accepted the rebind of the session's `client_id`: the entries of the earlier instance ended, and the engine publishes again at once (14 [CLI-78]). */
+  protected abstract presenceRebound(): void;
+
   /** The followed keyspaces and their interest are kept with the stored state, so that a restart or a handover follows them again (14 [CLI-70]). */
   protected abstract persistFollowed(): Promise<void>;
   /** A widening of the interest is due (14 [CLI-72]). */
@@ -393,6 +408,7 @@ export abstract class SessionLayer extends SenderLayer {
     if (livedMs >= SESSION_LIVE_RESET_MS) s.attempts = 0;
     else s.attempts++;
     s.liveSince = undefined;
+    this.presenceSessionEnded(); // 09 [READ-77]: the memberships and the entries end with the session
     s.retrying = undefined; // set again below when this end is the `Retry{KEYSPACE_SEEDING}` of a `Subscribe` (14 [CLI-44])
     for (const f of this.followList()) {
       // 14 [CLI-56]: the time since the last successful sync of a keyspace counts from the end of the session that carried it
@@ -486,8 +502,12 @@ export abstract class SessionLayer extends SenderLayer {
       case "control":
         await this.onControl(body.value);
         return;
+      case "presence":
+        // 09 [READ-81]: a presence frame carries no seq and changes no cursor, delivery watermark or lane watermark
+        this.applyPresenceFrame(body.value);
+        return;
       default:
-        return; // a frame that the client does not know, and presence, change no cursor, keyspace or session state (09 [READ-53])
+        return; // a frame that the client does not know changes no cursor, keyspace or session state (09 [READ-53])
     }
   }
 
@@ -503,6 +523,8 @@ export abstract class SessionLayer extends SenderLayer {
         s.id = body.value.sessionId;
         s.hbMs = body.value.heartbeatIntervalMs > 0 ? body.value.heartbeatIntervalMs : 15_000;
         this.applyLimits(body.value.limits);
+        // 09 [READ-73]: a new session: the topics of the engine join again and publish their entries again
+        this.presenceSessionStarted();
         // 14 Table 14.1: a Subscribe that succeeds clears the holds that waited for one
         for (const kind of ["SESSION_CAP", "AUTHORIZER_UNAVAILABLE", "APP_SUSPENDED", "NO_TOKEN", "CLIENT_TOO_OLD", "SUBJECT_REVOKED"] as HoldKind[]) this.stopHold(kind);
         this.armWatchdogFromSession();
@@ -562,6 +584,7 @@ export abstract class SessionLayer extends SenderLayer {
       await this.persistHead(f, 0, true);
       await this.afterCursorMoved(f);
     } else await this.persistHead(f, 0, true);
+    this.presenceKick(f.id); // 09 [READ-73]: the session follows the keyspace now: its topics join
   }
 
   /** The drop reasons of A.6 (14 [CLI-51], [CLI-52], [CLI-80], 15 [COMPAT-42]). */
@@ -571,6 +594,7 @@ export abstract class SessionLayer extends SenderLayer {
     f.onSession = false;
     f.resuming = false;
     f.awaitingAdd = false; // the drop reason decides what the client does with the keyspace now
+    this.presenceKeyspaceDropped(f.id); // 09 [READ-69], [READ-77]: the memberships and the entries of the keyspace ended with the drop
     const successors: SuccessorRule[] = [...d.successors];
     switch (d.reason) {
       case DropReason.GRANT_CHANGED:
@@ -796,8 +820,11 @@ export abstract class SessionLayer extends SenderLayer {
           await this.transport.updateSubscription(create(UpdateSubscriptionRequestSchema, { sessionId: this.sess.id, clientId: this.clientId }));
         } catch {
           this.sess.abort?.abort();
+          return;
         }
-        // TODO(09 §9.8, 14 [CLI-78]): publish presence again at once, in every topic where the client has an entry
+        // 14 [CLI-78]: "once the rebind succeeds it MUST publish its presence again at once, in every topic where it has an entry, because the rebind ended the
+        // earlier instance's entries"
+        await this.run(() => this.presenceRebound());
       })(),
     );
   }

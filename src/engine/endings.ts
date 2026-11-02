@@ -55,6 +55,9 @@ export abstract class EndingLayer extends EngineCore {
   /** Waiters for the cursor of a keyspace to reach a seq (the hold `CONFLICT_WAIT`). */
   protected readonly cursorWaiters = new Map<string, Set<{ need: bigint; wake: () => void }>>();
 
+  /** The action retired: the bytes that it staged for its blobs go (09 [READ-94], `blobs.ts`). */
+  protected abstract onActionRetiredBlobs(e: OutboxEntry): void;
+
   protected isExcludedFromOverlay(e: OutboxEntry): boolean {
     return this.ending.has(e.mutationId) || e.stuck !== undefined;
   }
@@ -395,6 +398,7 @@ export abstract class EndingLayer extends EngineCore {
       throw err;
     }
     this.entries.delete(e.mutationId);
+    this.onActionRetiredBlobs(e); // 09 [READ-94]: "until the action that references it is confirmed"
     if (keepJournal) this.journal.set(e.mutationId, journal);
     this.dropRuntime(e.mutationId); // the slot is consumed: it stays with the lane until the watermark passes it (14 [CLI-27])
     f?.invalidate();

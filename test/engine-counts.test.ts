@@ -22,6 +22,13 @@ import {
   HeartbeatFrameSchema,
   PresenceFrameSchema,
   ControlFrameSchema,
+  CommitBlobResponseSchema,
+  CreateUploadResponseSchema,
+  DeleteBlobResponseSchema,
+  GetBlobResponseSchema,
+  JoinPresenceResponseSchema,
+  LeavePresenceResponseSchema,
+  PublishPresenceResponseSchema,
 } from "../src/gen/abpc/v2/sync_pb.js";
 import { KeyEntrySchema, RecordSchema, RejectSchema } from "../src/gen/abpc/v2/types_pb.js";
 import { encode } from "../src/rules/canon/index.js";
@@ -208,6 +215,14 @@ describe("16 [SEC-1]: the counts of a received message are bounded on its octets
       ControlFrameSchema,
       PresenceFrameSchema,
       RejectSchema,
+      // 09 §9.8, §9.9: the answers of the presence and blob calls
+      JoinPresenceResponseSchema,
+      PublishPresenceResponseSchema,
+      LeavePresenceResponseSchema,
+      CreateUploadResponseSchema,
+      CommitBlobResponseSchema,
+      GetBlobResponseSchema,
+      DeleteBlobResponseSchema,
     ];
     const seen = new Set<string>();
     const missing: string[] = [];

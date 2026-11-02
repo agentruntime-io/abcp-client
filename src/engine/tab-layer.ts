@@ -37,6 +37,7 @@ import { KeyspaceLifecycle } from "../gen/abpc/v2/types_pb.js";
 import { LocalRefusal, type LocalRefusalCode, type StorageCause } from "./errors.js";
 import type { EngineConfig } from "./core.js";
 import { Follow } from "./follow.js";
+import type { PresenceEntryRaw, PresenceEvent } from "./presence.js";
 import { RevocationLayer } from "./revocation.js";
 import type { ReplicaImage, ReplicaSummary } from "./storage.js";
 import type { LockLease, PartitionKey, StorageProvider, TabChannel, TabHost } from "./tabs.js";
@@ -78,6 +79,10 @@ type TabMessage =
   | { t: "claimed"; from: string }
   | { t: "state"; from: string; rt: RuntimeSnapshot }
   | { t: "event"; from: string; event: EngineEvent }
+  /** The flusher's view of a presence topic (09 §9.8, 14 [CLI-61]): the other tabs read it here; a presence entry is one for all the tabs of the engine. */
+  | { t: "presence"; from: string; keyspaceId: string; topic: string; entries: PresenceEntryRaw[] }
+  /** Any other presence event of the flusher (`joined`, `published`, `refused`, `ended`), for the tabs whose calls it concerns. */
+  | { t: "presence-event"; from: string; event: PresenceEvent }
   | { t: "cmd"; from: string; id: number; name: string; args: unknown[] }
   | { t: "reply"; from: string; to: string; id: number; ok: true; value: unknown }
   | { t: "reply"; from: string; to: string; id: number; ok: false; error: { name: string; code?: string; cause?: string; detail: string; message: string } };
@@ -228,6 +233,7 @@ export abstract class TabLayer extends RevocationLayer {
           this.announce();
           this.queueState();
           this.runOwnWaits();
+          this.onFlusherChanged();
         }).catch((e: unknown) => this.noteInternalError(e));
       },
       () => undefined, // aborted: this tab stopped waiting
@@ -298,6 +304,8 @@ export abstract class TabLayer extends RevocationLayer {
         return;
       case "gone":
         this.peers.delete(m.from);
+        // 09 [READ-74]: "The engine MUST NOT leave a topic while any of its tabs is still in it": a tab that left, left its topics
+        if (this.role === "flusher") this.post(() => this.presenceTabGone(m.from));
         return;
       case "offer":
         // 14 [CLI-61]: a tab that is alive, a follower in the lock's queue and visible takes the role that a hidden flusher offers
@@ -314,7 +322,10 @@ export abstract class TabLayer extends RevocationLayer {
       case "claimed":
         if (this.handoff?.to === m.from) this.handoff = undefined;
         // the flusher that the calls of this tab went to is gone, and this is the next: they are carried to it, as ones that may have been answered
-        if (this.role === "follower") for (const [id, w] of [...this.waits]) this.postCommand(id, w);
+        if (this.role === "follower") {
+          for (const [id, w] of [...this.waits]) this.postCommand(id, w);
+          this.onFlusherChanged();
+        }
         return;
       case "state":
         if (this.role !== "follower") return;
@@ -324,6 +335,12 @@ export abstract class TabLayer extends RevocationLayer {
       case "event":
         if (this.role !== "follower") return;
         this.bus.emit(m.event); // the flusher's event, as the app of this tab hears it
+        return;
+      case "presence":
+        if (this.role === "follower") this.presenceMirrorSet(m.keyspaceId, m.topic, m.entries);
+        return;
+      case "presence-event":
+        if (this.role === "follower") this.deliverPresence(m.event);
         return;
       case "cmd":
         if (this.role === "flusher" && !this.stopped) this.runCommand(m);
@@ -355,6 +372,19 @@ export abstract class TabLayer extends RevocationLayer {
     // `role` is the tab's own: a follower does not hear that another tab became the flusher as a change of its own role
     if (e.type !== "role" && this.role === "flusher" && this.channel !== undefined && this.tabHost !== undefined) this.send({ t: "event", from: this.tabHost.tabId, event: e });
   }
+
+  /** A presence event of the flusher goes to the followers too (14 [CLI-61]). */
+  protected onPresenceEmitted(e: PresenceEvent): void {
+    if (this.role !== "flusher" || this.channel === undefined || this.tabHost === undefined || this.stopped) return;
+    if (e.type === "changed") this.send({ t: "presence", from: this.tabHost.tabId, keyspaceId: e.keyspaceId, topic: e.topic, entries: this.presenceEntries(e.keyspaceId, e.topic) });
+    else this.send({ t: "presence-event", from: this.tabHost.tabId, event: e });
+  }
+
+  /**
+   * Another tab is the flusher now (it claimed the role), or this one is: what the tabs asked of the engine's session, such as their presence memberships and states, was the
+   * old flusher's and is told to the new one again (09 [READ-73], 02 [ARC-51] item 4: after a new session a client joins its topics again). `Engine` implements it.
+   */
+  protected abstract onFlusherChanged(): void;
 
   protected touchPersisted(): void {
     this.queueState();

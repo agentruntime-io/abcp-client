@@ -17,7 +17,9 @@ import type { KeyspaceView } from "../engine/overlay.js";
 import type { PurgeHook } from "../engine/revocation.js";
 import type { EngineEvent, EngineEventListener } from "../engine/types.js";
 import type { ViewChange, ViewChangeListener } from "../engine/view-feed.js";
+import type { JoinOptions, PresenceEntryRaw, PresenceEvent } from "../engine/presence.js";
 import { QueryError } from "./errors.js";
+import { PresenceView } from "./presence.js";
 import { evaluate, resultOf, stateOf, unavailableResult, type Ctx, type Reader } from "./eval.js";
 import { KeyIndex, mergeSorted, ScopeIndex } from "./key-index.js";
 import { Live, type Reading, type Services, type Touch } from "./live.js";
@@ -36,6 +38,14 @@ export interface QueryEngine {
   registerPurgeHook(hook: PurgeHook): () => void;
   flushViewChanges(): void;
   readonly manifests: Manifests;
+  // -- presence (09 §9.8, `presence.ts`) --
+  joinPresence(keyspaceId: string, topic: string, opts?: JoinOptions): Promise<void>;
+  publishPresence(keyspaceId: string, topic: string, state: unknown): Promise<void>;
+  leavePresence(keyspaceId: string, topic: string): Promise<void>;
+  presenceEntries(keyspaceId: string, topic: string): PresenceEntryRaw[];
+  presenceAwareness(keyspaceId: string, topic: string): boolean;
+  onPresence(listener: (event: PresenceEvent) => void): () => void;
+  readonly clientId: string;
 }
 
 /** What the layer keeps of one keyspace. */
@@ -48,6 +58,7 @@ class KsState {
 
 export class Queries {
   private readonly states = new Map<string, KsState>();
+  private readonly presenceViews = new Set<PresenceView>();
   private readonly offs: (() => void)[] = [];
   private isClosed = false;
   private readonly reader: Reader;
@@ -124,6 +135,18 @@ export class Queries {
     return this.engine.loadKeys(result.keyspaceId, result.notLoaded);
   }
 
+  /**
+   * The view of a presence topic of a followed keyspace (09 §9.8): the entries that the other members publish, decoded, with their changes, and the calls of this tab into the topic
+   * (`join`, `publish`, `leave`). Presence is no part of the log: the view reads no key and moves no cursor. `opts.awareness` marks a Yjs awareness topic (09 [READ-83]); by default
+   * the manifest says. Close it when it is no longer shown: it leaves the topic.
+   */
+  presence(keyspaceId: string, topic: string, opts: JoinOptions = {}): PresenceView {
+    this.assertOpen();
+    const v = new PresenceView(this.engine, keyspaceId, topic, opts, (x) => this.presenceViews.delete(x));
+    this.presenceViews.add(v);
+    return v;
+  }
+
   /** What the layer holds of a keyspace: the keys of its index, and its live queries; nothing for a keyspace whose copy was purged (14 [CLI-66]). */
   holds(keyspaceId: string): { keys: number; live: number } {
     const st = this.states.get(keyspaceId);
@@ -137,6 +160,7 @@ export class Queries {
     for (const off of this.offs) off();
     for (const st of this.states.values()) for (const l of [...st.lives]) l.close();
     this.states.clear();
+    for (const v of [...this.presenceViews]) void v.close();
   }
 
   // -------------------------------------------------------------------------------------------------------------------

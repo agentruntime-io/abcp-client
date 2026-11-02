@@ -116,8 +116,12 @@ export abstract class ReplicaStoreLayer extends EndingLayer {
     f.crdt.apply(plan);
     f.crdt.reconcile(st);
     for (const c of rec.changes) if (c.key.startsWith("abpc.saga.v1/")) this.sagaKeyChanged(f, c.key); // the sagas that the client follows (14 [CLI-14], `sagas.ts`)
+    this.blobDeletedRecord(f, rec); // 14 [CLI-76]: a `BLOB_DELETED` record drops the cached bytes of its blob
     return { plan, anomalies };
   }
+
+  /** A `BLOB_DELETED` record was applied (06 [LOG-79]): the cached bytes of the blob go (14 [CLI-76]); `blobs.ts`. */
+  protected abstract blobDeletedRecord(f: Follow, rec: RecordMessage): void;
 
   /** A key of the saga state changed in the confirmed state of the keyspace (14 [CLI-14]); the saga layer follows the runs. */
   protected sagaKeyChanged(_f: Follow, _key: string): void {

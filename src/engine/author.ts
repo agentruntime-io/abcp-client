@@ -6,7 +6,9 @@ import { CasExpectSchema, ChangeKind, KeyChangeSchema, PreconditionSchema, type 
 import { Lane } from "../gen/abpc/v2/types_pb.js";
 import { MutationSchema, type Mutation } from "../gen/abpc/v2/sync_pb.js";
 import { isReservedKey, type Rule } from "../rules/fold/index.js";
+import { isBlobId } from "./blob-store.js";
 import { checkJsonV1Bytes } from "./changes.js";
+import { MAX_BLOB_REFS } from "./counts.js";
 import { LocalRefusal } from "./errors.js";
 import type { EngineManifest, OpTypeInfo } from "./manifests.js";
 import type { ActionInput, ChangeInput, PreconditionInput } from "./types.js";
@@ -152,6 +154,9 @@ export function checkAction(m: Mutation, manifest: EngineManifest, op: OpTypeInf
   if (m.changes.length === 0) return "an action has at least one change (07 Table 7-2)";
   if (m.changes.length > limits.maxChangesPerAction) return `more than ${limits.maxChangesPerAction} changes`;
   if (size > limits.maxActionBytes) return `the action is larger than max_action_bytes (${limits.maxActionBytes})`;
+  // 09 [READ-84], 03 [ID-23]: a `blob_refs` entry has the blob-id syntax (the server answers `INVALID_ENVELOPE`), and an action names at most 1,000 blobs
+  if (m.blobRefs.length > MAX_BLOB_REFS) return `more than ${MAX_BLOB_REFS} blob_refs (09 §9.9)`;
+  for (const id of m.blobRefs) if (!isBlobId(id)) return `the blob_refs entry "${id}" is not a blob id, [A-Za-z0-9_-]{21,64} (09 [READ-84], 03 [ID-23])`;
   const seen = new Set<string>();
   for (const c of m.changes) {
     if (seen.has(c.key)) return `key "${c.key}" is changed twice (05 [STATE-5])`;

@@ -82,15 +82,16 @@ export class Env {
     readonly issuers: IssuerServer,
     public server: ServerProcess,
     readonly proxy: Proxy,
+    private readonly startOptions: { manifest?: unknown; config?: Record<string, unknown> } = {},
   ) {}
 
-  static async start(): Promise<Env> {
+  static async start(opts: { manifest?: unknown; config?: Record<string, unknown> } = {}): Promise<Env> {
     const issuers = await IssuerServer.start(APP);
     let server: ServerProcess | undefined;
     try {
-      server = await startServer({ issuers });
+      server = await startServer({ issuers, ...opts });
       const proxy = await Proxy.start(server.port);
-      return new Env(issuers, server, proxy);
+      return new Env(issuers, server, proxy, opts);
     } catch (e) {
       await server?.kill();
       await issuers.close();
@@ -112,7 +113,7 @@ export class Env {
   /** Kills the server and starts another one on the same configuration: the store is in memory, so nothing it held is left. */
   async restartServer(): Promise<void> {
     await this.server.kill();
-    this.server = await startServer({ issuers: this.issuers });
+    this.server = await startServer({ issuers: this.issuers, ...this.startOptions });
     this.proxy.target(this.server.port);
     for (const p of this.extraProxies) p.target(this.server.port);
   }
@@ -199,6 +200,13 @@ function spy(t: Transport, calls: Calls, refreshed: TestClient["refreshed"]): Tr
     loadState: count("loadState", (r, o) => t.loadState(r, o)),
     subscribe: count("subscribe", (r, o) => t.subscribe(r, o)),
     updateSubscription: count("updateSubscription", (r, o) => t.updateSubscription(r, o)),
+    joinPresence: count("joinPresence", (r, o) => t.joinPresence(r, o)),
+    publishPresence: count("publishPresence", (r, o) => t.publishPresence(r, o)),
+    leavePresence: count("leavePresence", (r, o) => t.leavePresence(r, o)),
+    createUpload: count("createUpload", (r, o) => t.createUpload(r, o)),
+    commitBlob: count("commitBlob", (r, o) => t.commitBlob(r, o)),
+    getBlob: count("getBlob", (r, o) => t.getBlob(r, o)),
+    deleteBlob: count("deleteBlob", (r, o) => t.deleteBlob(r, o)),
     refreshSession: count("refreshSession", async (r, o) => {
       const resp = await t.refreshSession(r, o);
       refreshed.push({

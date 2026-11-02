@@ -48,6 +48,11 @@ import { timestampFromMs } from "@bufbuild/protobuf/wkt";
 import * as Y from "yjs";
 import {
   AppendedSchema,
+  CommitBlobResponseSchema,
+  DeleteBlobResponseSchema,
+  JoinPresenceResponseSchema,
+  LeavePresenceResponseSchema,
+  PublishPresenceResponseSchema,
   ControlFrame_ClosingSchema,
   ControlFrame_KeyspaceAddedSchema,
   ControlFrame_KeyspaceDroppedSchema,
@@ -76,10 +81,24 @@ import {
   type CancelIntentRequest,
   type CancelIntentResponse,
   type CloseReason,
+  type CommitBlobRequest,
+  type CommitBlobResponse,
   type ControlFrame,
   type CreateKeyspaceRequest,
   type CreateKeyspaceResponse,
+  type CreateUploadRequest,
+  type CreateUploadResponse,
+  type DeleteBlobRequest,
+  type DeleteBlobResponse,
   type DropReason,
+  type GetBlobRequest,
+  type GetBlobResponse,
+  type JoinPresenceRequest,
+  type JoinPresenceResponse,
+  type LeavePresenceRequest,
+  type LeavePresenceResponse,
+  type PublishPresenceRequest,
+  type PublishPresenceResponse,
   type GetManifestRequest,
   type GetManifestResponse,
   type GetMutationResultRequest,
@@ -142,6 +161,8 @@ import { sha256 } from "../rules/crypto.js";
 import { setHashProvider } from "../rules/crypto.js";
 import { nodeHashProvider } from "../rules/node-crypto.js";
 import { DEFAULT_CLASS } from "../engine/codes.js";
+import { FakeBlobs } from "./blobs.js";
+import { FakePresence, type FakePresenceOptions } from "./presence.js";
 import { appliedIndexes, planCrdt } from "../engine/crdt-view.js";
 import { matchSuccessor } from "../engine/successors.js";
 import { encodeContent } from "../engine/entry.js";
@@ -155,7 +176,24 @@ setHashProvider(nodeHashProvider);
 // ---------------------------------------------------------------------------------------------------------------------
 // Scripting
 
-export type Method = "mutate" | "getMutationResult" | "getMutationResults" | "cancelIntent" | "createKeyspace" | "loadState" | "subscribe" | "updateSubscription" | "refreshSession" | "getManifest";
+export type Method =
+  | "mutate"
+  | "getMutationResult"
+  | "getMutationResults"
+  | "cancelIntent"
+  | "createKeyspace"
+  | "loadState"
+  | "subscribe"
+  | "updateSubscription"
+  | "refreshSession"
+  | "getManifest"
+  | "joinPresence"
+  | "publishPresence"
+  | "leavePresence"
+  | "createUpload"
+  | "commitBlob"
+  | "getBlob"
+  | "deleteBlob";
 
 /** What an injection does to a call (17 [CONF-4]). */
 export type Behavior =
@@ -208,6 +246,10 @@ export interface FakeOptions {
   pageSize?: number;
   /** The per-principal session cap (09 [READ-35]); default none. */
   maxSessions?: number;
+  /** Presence (09 §9.8): how a publish over the rate is answered, and the presence schema. */
+  presence?: Pick<FakePresenceOptions, "mode" | "validate">;
+  /** Blobs (09 §9.9): the validity of the signed URLs, in ms. */
+  blobs?: { uploadValidityMs?: number; downloadValidityMs?: number };
 }
 
 interface AppLimitsInit {
@@ -220,6 +262,11 @@ interface AppLimitsInit {
   maxValueBytes: number;
   keyspaceNotFoundWaitSeconds: number;
   maxInterestPrefixes: number;
+  maxPresenceStateBytes: number;
+  maxPresenceMembersPerTopic: number;
+  presenceTtlSeconds: number;
+  presenceMinPublishIntervalMs: number;
+  maxBlobBytes: number;
 }
 
 const DEFAULT_LIMITS: AppLimitsInit = {
@@ -232,6 +279,11 @@ const DEFAULT_LIMITS: AppLimitsInit = {
   maxValueBytes: 1 << 20,
   keyspaceNotFoundWaitSeconds: 3600,
   maxInterestPrefixes: 64,
+  maxPresenceStateBytes: 4 << 10,
+  maxPresenceMembersPerTopic: 100,
+  presenceTtlSeconds: 30,
+  presenceMinPublishIntervalMs: 1000,
+  maxBlobBytes: 100 << 20,
 };
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -321,10 +373,20 @@ interface FrameState {
 
 const END = Symbol("end");
 
+/** The keyspaces that a session follows: removing one ends the session's presence there (09 [READ-63], [READ-69], [READ-77]). */
+class Follows extends Map<string, FrameState> {
+  onEnd: ((keyspaceId: string) => void) | undefined;
+  delete(key: string): boolean {
+    const had = super.delete(key);
+    if (had) this.onEnd?.(key);
+    return had;
+  }
+}
+
 class FakeSession {
   readonly queue: (SubscribeResponse | typeof END | { error: unknown })[] = [];
   private waiter: (() => void) | undefined;
-  readonly follows = new Map<string, FrameState>();
+  readonly follows = new Follows();
   closed = false;
   heldFrames: SubscribeResponse[] = [];
   reorderHeld: SubscribeResponse | undefined;
@@ -442,12 +504,20 @@ export class FakeServer {
   /** The recovery marks of 10 [AUTH-51]: the device binding (`sub|device_id`) and the recording time of the revocation that it has recovered from. */
   private readonly marks = new Map<string, number>();
   private readonly denied = new Set<string>();
+  private readonly presenceDenied = new Set<string>();
+  /** The presence of the fake (09 §9.8): its entries and frames are for a test to read. */
+  readonly presence: FakePresence;
+  /** The blobs of the fake (09 §9.9) and its blob store. */
+  readonly blobs: FakeBlobs;
 
   constructor(opts: FakeOptions) {
     this.appId = opts.appId ?? "app";
     this.clock = opts.clock;
     this.manifests = opts.manifests;
-    this.limits = create(AppLimitsSchema, { ...DEFAULT_LIMITS, ...(opts.limits ?? {}) });
+    const init = { ...DEFAULT_LIMITS, ...(opts.limits ?? {}) };
+    this.limits = create(AppLimitsSchema, { ...init, maxBlobBytes: BigInt(init.maxBlobBytes) });
+    this.presence = new FakePresence({ clock: opts.clock, limits: () => this.limits, ...(opts.presence ?? {}) });
+    this.blobs = new FakeBlobs({ clock: opts.clock, maxBlobBytes: () => this.limits.maxBlobBytes, ...(opts.blobs ?? {}) });
     this.pageSize = opts.pageSize ?? 1000;
     this.heartbeatMs = opts.heartbeatMs ?? 0;
     this.maxSessions = opts.maxSessions;
@@ -556,6 +626,15 @@ export class FakeServer {
     this.denied.delete(`${sub}|${keyspaceId}`);
   }
 
+  /** The principal holds no `presence` grant on the keyspace (10 §10.5): `PublishPresence` is PermissionDenied; observing still needs only `read`. */
+  denyPresence(sub: string, keyspaceId: string): void {
+    this.presenceDenied.add(`${sub}|${keyspaceId}`);
+  }
+
+  allowPresence(sub: string, keyspaceId: string): void {
+    this.presenceDenied.delete(`${sub}|${keyspaceId}`);
+  }
+
   /** Whether the token of the principal grants `read` on the keyspace now. */
   private readable(principal: Principal, keyspaceId: string): boolean {
     if (this.denied.has(`${principal.sub}|${keyspaceId}`)) return false;
@@ -649,14 +728,14 @@ export class FakeServer {
    * unknown kind, a required feature it lacks, an unknown SYSTEM kind that must be understood, 06 [LOG-11]). The server's state is
    * only moved to its seq.
    */
-  appendRaw(id: string, init: { kind?: number; requiredFeatures?: readonly string[]; system?: { kind: number; mustUnderstand: boolean }; changes?: KeyChange[] }): bigint {
+  appendRaw(id: string, init: { kind?: number; requiredFeatures?: readonly string[]; system?: { kind: number; mustUnderstand: boolean; body?: Uint8Array }; changes?: KeyChange[] }): bigint {
     const k = this.ks(id);
     const rec = this.record(k, (init.kind ?? RecordKind.OP) as RecordKind, {
       principal: this.principal("other"),
       mutationId: init.kind === RecordKind.SYSTEM || init.system !== undefined ? "" : `other-${++this.principalCounter}`,
       opType: "op",
       changes: init.changes ?? [],
-      ...(init.system !== undefined ? { system: create(SystemEventSchema, { kind: init.system.kind as SystemKind, mustUnderstand: init.system.mustUnderstand, body: new Uint8Array(), encoding: "json/v1" }) } : {}),
+      ...(init.system !== undefined ? { system: create(SystemEventSchema, { kind: init.system.kind as SystemKind, mustUnderstand: init.system.mustUnderstand, body: init.system.body ?? new Uint8Array(), encoding: "json/v1" }) } : {}),
     });
     rec.requiredFeatures = [...(init.requiredFeatures ?? [])];
     k.log.push(rec);
@@ -1339,6 +1418,8 @@ export class FakeServer {
     }
     if (req.clientId !== "") this.bindClient(req.clientId, subjectOf(principal));
     const session = new FakeSession(`session-${this.nextSession++}`, principal, req.clientId);
+    session.follows.onEnd = (ks): void => this.presence.endKeyspace(session, ks);
+    this.presence.carry(session); // 09 [READ-74]: the later session of a client instance carries its presence
     this.sessions.add(session);
     const hb = this.heartbeatMs > 0 ? this.heartbeatMs : 15_000;
     session.push(this.control({ case: "subscribed", value: create(ControlFrame_SubscribedSchema, { sessionId: session.id, limits: this.limits, serverInfo: create(ServerInfoSchema, { protocolName: "abpc.v2" }), heartbeatIntervalMs: hb }) }));
@@ -1353,6 +1434,7 @@ export class FakeServer {
     } finally {
       session.close();
       this.sessions.delete(session);
+      this.presence.endSession(session); // 09 [READ-77]: the memberships and the entries end with the session
     }
   }
 
@@ -1387,7 +1469,9 @@ export class FakeServer {
       const bound = this.clients.get(req.clientId);
       if (bound !== undefined && bound !== subjectOf(principal)) throw new RpcError("PermissionDenied", "actor mismatch", { reject: mkReject(Code.ACTOR_MISMATCH) });
       this.bindClient(req.clientId, subjectOf(principal));
+      const earlier = s.clientId;
       s.clientId = req.clientId;
+      this.presence.rebind(s, earlier); // 09 [READ-77]: the entries of the earlier instance end, the memberships stay
     }
     for (const id of req.remove) s.follows.delete(id);
     const rejected = [];
@@ -1425,6 +1509,94 @@ export class FakeServer {
       }
     }
     return create(UpdateSubscriptionResponseSchema, { rejected });
+  }
+
+  // ---------------------------------------------------------------------------------------------------------------------
+  // Presence (09 §9.8)
+
+  /** The session of a call that names one (09 [READ-34]): NotFound with no detail when it does not exist, has ended or belongs to another subject. */
+  private sessionOf(principal: Principal, id: string): FakeSession {
+    const s = [...this.sessions].find((x) => x.id === id && subjectOf(x.principal) === subjectOf(principal));
+    if (s === undefined) throw new RpcError("NotFound", "no such session");
+    return s;
+  }
+
+  async joinPresence(principal: Principal, req: JoinPresenceRequest): Promise<JoinPresenceResponse> {
+    await this.prologue("joinPresence", req, principal);
+    const s = this.sessionOf(principal, req.sessionId);
+    if (!this.readable(s.principal, req.keyspaceId)) throw new RpcError("PermissionDenied", "no grant", { reject: mkReject(Code.PERMISSION_DENIED) }); // observing needs `read`
+    if (!s.follows.has(req.keyspaceId)) throw new RpcError("FailedPrecondition", "the session does not follow the keyspace"); // 09 [READ-73]: no detail
+    const k = this.ks(req.keyspaceId);
+    const kind = this.manifests.get(k.manifestVersion)?.presenceTopicKind?.(k.kind, req.topic);
+    if (kind === undefined) throw new RpcError("InvalidArgument", "the topic matches no presence topic of the kind", { reject: mkReject(Code.INVALID_KEY) }); // 09 [READ-72]
+    this.presence.join(s, req.keyspaceId, req.topic, kind === "awareness");
+    return create(JoinPresenceResponseSchema, {});
+  }
+
+  async publishPresence(principal: Principal, req: PublishPresenceRequest): Promise<PublishPresenceResponse> {
+    const inj = await this.prologue("publishPresence", req, principal);
+    const s = this.sessionOf(principal, req.sessionId);
+    if (this.presenceDenied.has(`${s.principal.sub}|${req.keyspaceId}`) || !this.readable(s.principal, req.keyspaceId)) throw new RpcError("PermissionDenied", "no grant", { reject: mkReject(Code.PERMISSION_DENIED) });
+    const expires = this.presence.publish(s, req.keyspaceId, req.topic, req.state);
+    if (inj?.behavior.kind === "lose") throw new RpcError(inj.behavior.status ?? "Unavailable", "the response was lost");
+    return create(PublishPresenceResponseSchema, { expiresAt: timestampFromMs(expires) });
+  }
+
+  async leavePresence(principal: Principal, req: LeavePresenceRequest): Promise<LeavePresenceResponse> {
+    await this.prologue("leavePresence", req, principal);
+    const s = this.sessionOf(principal, req.sessionId);
+    this.presence.leave(s, req.keyspaceId, req.topic);
+    return create(LeavePresenceResponseSchema, {});
+  }
+
+  // ---------------------------------------------------------------------------------------------------------------------
+  // Blobs (09 §9.9)
+
+  /** The rows of 09 [READ-4] above the state of the blob: the grant, then the keyspace (not found, deleted, archived or split for a call that writes, frozen but for `GetBlob`). */
+  private blobKeyspace(principal: Principal, keyspaceId: string, call: "write" | "read"): FakeKeyspace {
+    if (!this.readable(principal, keyspaceId)) throw new RpcError("PermissionDenied", "no grant", { reject: mkReject(Code.PERMISSION_DENIED) });
+    const k = this.keyspaces.get(keyspaceId);
+    if (k === undefined) throw new RpcError("NotFound", "no such keyspace", { reject: mkReject(Code.KEYSPACE_NOT_FOUND) });
+    if (k.deleted) throw new RpcError("NotFound", "the keyspace was deleted", { reject: mkReject(Code.KEYSPACE_DELETED) });
+    if (call === "write" && k.lifecycle !== KeyspaceLifecycle.ACTIVE) {
+      throw new RpcError("FailedPrecondition", "the keyspace is archived or split", { reject: mkReject(Code.KEYSPACE_ARCHIVED, { details: { lifecycle: k.lifecycle === KeyspaceLifecycle.SPLIT ? "SPLIT" : "ARCHIVED" }, successors: k.successors }) });
+    }
+    if (call === "write" && k.frozen) throw new RpcError("FailedPrecondition", "the keyspace is frozen", { reject: mkReject(Code.HISTORY_DIVERGED) });
+    return k;
+  }
+
+  async createUpload(principal: Principal, req: CreateUploadRequest): Promise<CreateUploadResponse> {
+    await this.prologue("createUpload", req, principal);
+    this.blobKeyspace(principal, req.keyspaceId, "write");
+    return this.blobs.createUpload(principal.sub, req);
+  }
+
+  async commitBlob(principal: Principal, req: CommitBlobRequest): Promise<CommitBlobResponse> {
+    await this.prologue("commitBlob", req, principal);
+    const k = this.blobKeyspace(principal, req.keyspaceId, "read"); // the lifecycle of a commit is judged below, for a pending blob only (09 [READ-88])
+    if (k.lifecycle !== KeyspaceLifecycle.ACTIVE && this.blobs.row(req.keyspaceId, req.blobId)?.state === "pending") {
+      throw new RpcError("FailedPrecondition", "the keyspace is archived or split", { reject: mkReject(Code.KEYSPACE_ARCHIVED, { details: { lifecycle: k.lifecycle === KeyspaceLifecycle.SPLIT ? "SPLIT" : "ARCHIVED" }, successors: k.successors }) });
+    }
+    if (k.frozen) throw new RpcError("FailedPrecondition", "the keyspace is frozen", { reject: mkReject(Code.HISTORY_DIVERGED) });
+    this.blobs.commitBlob(req);
+    return create(CommitBlobResponseSchema, {});
+  }
+
+  async getBlob(principal: Principal, req: GetBlobRequest): Promise<GetBlobResponse> {
+    await this.prologue("getBlob", req, principal);
+    this.blobKeyspace(principal, req.keyspaceId, "read"); // a frozen keyspace serves `GetBlob` (09 [READ-90])
+    return this.blobs.getBlob(req);
+  }
+
+  async deleteBlob(principal: Principal, req: DeleteBlobRequest): Promise<DeleteBlobResponse> {
+    await this.prologue("deleteBlob", req, principal);
+    const k = this.blobKeyspace(principal, req.keyspaceId, "read"); // an archived or split keyspace serves it (09 [READ-91])
+    if (k.frozen) throw new RpcError("FailedPrecondition", "the keyspace is frozen", { reject: mkReject(Code.HISTORY_DIVERGED) });
+    if (this.blobs.deleteBlob(principal.sub, req)) {
+      // 09 [READ-91], 06 [LOG-79]: the record that names the deleted blob, which every client that follows the keyspace reads
+      this.appendRaw(req.keyspaceId, { kind: RecordKind.SYSTEM, system: { kind: SystemKind.BLOB_DELETED, mustUnderstand: false, body: new TextEncoder().encode(JSON.stringify({ blob_id: req.blobId })) } });
+    }
+    return create(DeleteBlobResponseSchema, {});
   }
 
   // ---------------------------------------------------------------------------------------------------------------------
@@ -1645,6 +1817,12 @@ export class FakeServer {
     if (err !== undefined) return this.final(k, principal, m, content, err, passed);
     const stale = this.checkPreconditions(k, m);
     if (stale !== undefined) return this.final(k, principal, m, content, stale, passed);
+    // 07 Table 7-1 row 16, 09 [READ-89]: each id of `blob_refs` names a committed blob of the keyspace, the first failure in the order of the refs deciding
+    if (m.blobRefs.length > 0) {
+      const j = this.blobs.judgeRefs(k.id, m.blobRefs);
+      if (j.retry !== undefined) return { result: retryResult(id, j.retry.reason, j.retry.afterMs), passed };
+      if (j.reject !== undefined) return j.reject.code === Code.BLOB_DELETED ? this.final(k, principal, m, content, j.reject, passed) : rej(j.reject, passed);
+    }
     if (m.lane === Lane.GATED) return this.registerIntent(k, principal, m, content, laneMap, op.logIntent);
     // 07 §7.8: the SEQUENCED commit
     return this.commitOp(k, principal, m, content, laneMap);
@@ -1908,5 +2086,26 @@ export class FakeTransport implements Transport {
   }
   refreshSession(req: RefreshSessionRequest): Promise<RefreshSessionResponse> {
     return this.server.refreshSession(this.principal, req);
+  }
+  joinPresence(req: JoinPresenceRequest): Promise<JoinPresenceResponse> {
+    return this.server.joinPresence(this.principal, req);
+  }
+  publishPresence(req: PublishPresenceRequest): Promise<PublishPresenceResponse> {
+    return this.server.publishPresence(this.principal, req);
+  }
+  leavePresence(req: LeavePresenceRequest): Promise<LeavePresenceResponse> {
+    return this.server.leavePresence(this.principal, req);
+  }
+  createUpload(req: CreateUploadRequest): Promise<CreateUploadResponse> {
+    return this.server.createUpload(this.principal, req);
+  }
+  commitBlob(req: CommitBlobRequest): Promise<CommitBlobResponse> {
+    return this.server.commitBlob(this.principal, req);
+  }
+  getBlob(req: GetBlobRequest): Promise<GetBlobResponse> {
+    return this.server.getBlob(this.principal, req);
+  }
+  deleteBlob(req: DeleteBlobRequest): Promise<DeleteBlobResponse> {
+    return this.server.deleteBlob(this.principal, req);
   }
 }

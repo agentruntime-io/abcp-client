@@ -24,12 +24,12 @@
 // is a load only. B cannot be told from A by an app that keeps the first warning on screen, and it multiplies events while the user is away.
 
 import type { Follow } from "./follow.js";
-import { SessionLayer } from "./session.js";
+import { BlobLayer } from "./blobs.js";
 
 /** The default warning threshold of 14 [CLI-56]: 80% of `max_offline`. */
 export const DEFAULT_HORIZON_WARNING = 0.8;
 
-export abstract class HorizonLayer extends SessionLayer {
+export abstract class HorizonLayer extends BlobLayer {
   /** The share of `max_offline` at which the warning is emitted, below 1 (14 [CLI-56]). */
   protected horizonWarning = DEFAULT_HORIZON_WARNING;
   private horizonTimer: (() => void) | undefined;

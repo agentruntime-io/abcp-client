@@ -54,6 +54,8 @@ export abstract class ReplicaLayer extends ReplicaStoreLayer {
   protected abstract onProtocolViolation(v: ProtocolViolation, keyspaces?: readonly string[]): void;
   protected abstract needEpochResolution(f: Follow): void;
   protected abstract onEpochMismatch(f: Follow): void;
+  /** A load with `resumed = false` installed confirmed state: the downloaded blob bytes of the keyspace go (14 [CLI-76], `blobs.ts`). */
+  protected abstract blobCacheLoadReplaced(f: Follow): void;
 
   // ---------------------------------------------------------------------------------------------------------------------
   // Lane watermarks (14 [CLI-78])
@@ -153,6 +155,8 @@ export abstract class ReplicaLayer extends ReplicaStoreLayer {
     }
     f.invalidate();
     this.noteWatermarks(first.laneWatermarks);
+    // 14 [CLI-76]: a load with `resumed = false` passes over the `BLOB_DELETED` records below its checkpoint: "it MUST drop its cache of the keyspace's downloaded blob bytes"
+    this.blobCacheLoadReplaced(f);
     this.sagaScan(f); // the moved keys and run keys of the new state (14 [CLI-14])
     this.emit({ type: "reloaded", keyspaceId: f.id, cause, logEpoch: first.logEpoch, checkpointSeq: first.checkpointSeq });
     for (const r of rebuilds) {

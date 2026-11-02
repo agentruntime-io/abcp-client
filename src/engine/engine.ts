@@ -1,7 +1,8 @@
 // The client engine of ABPC v2 (14 §14.1 to §14.10): the engine model, prediction, the durable outbox, ordering and dependencies,
 // events, the reactions by class and cause, the offline horizon, principals, tabs and devices, revocation and quarantine, and interest
-// and storage. The public API is this class; the behaviour is in the layers it extends (core, endings, replica-store, replica,
-// reactions, sender, session, horizon, interest, revocation, tab-layer).
+// and storage, and (C6) presence (09 §9.8: `presence.ts`) and blobs (09 §9.9: `blobs.ts`, with `blob-store.ts`). The public API is this class; the
+// behaviour is in the layers it extends (core, endings, replica-store, replica, reactions, sender, session, presence, blobs, horizon, interest,
+// revocation, tab-layer).
 //
 // Out of scope here, each a TODO that names its rule: the local query layer (C4), the real network (C5), a redaction's purge of the
 // journal and the dead-letter store (14 [CLI-76], R2).
@@ -11,12 +12,15 @@ import type * as Y from "yjs";
 import { CreateKeyspaceRequestSchema, UpdateSubscriptionRequestSchema } from "../gen/abpc/v2/sync_pb.js";
 import { ChangeKind } from "../gen/abpc/v2/types_pb.js";
 import { CrdtKey } from "./crdt-view.js";
+import type { BlobCallOptions, BlobRef, StageOptions } from "./blob-store.js";
+import { jsonBytes } from "./changes.js";
 import { decodeContent, CanonError } from "./entry.js";
 import { makeReject } from "./endings.js";
 import type { EngineConfig } from "./core.js";
 import { LocalRefusal } from "./errors.js";
 import { newUuid } from "./ids.js";
 import { Follow } from "./follow.js";
+import type { JoinOptions } from "./presence.js";
 import type { KeyspaceView } from "./overlay.js";
 import { checkInterest, covers } from "./replica-store.js";
 import { getMember, parse as parseJson } from "../rules/jsonv1/index.js";
@@ -96,9 +100,27 @@ export interface SignOutOptions {
   unsynced?: "keep-locked" | "discard";
 }
 
+/** The presence registrations of this tab (09 [READ-73], [READ-74]): kept whatever the tab's role, to be told to a new flusher (`onFlusherChanged`). */
+interface OwnPresence {
+  keyspaceId: string;
+  topic: string;
+  opts: JoinOptions;
+  state: Uint8Array | undefined;
+}
+
 export class Engine extends TabLayer {
+  private readonly ownPresence = new Map<string, OwnPresence>();
+
   private constructor(cfg: EngineConfig) {
     super(cfg);
+    // 14 [CLI-66], [CLI-77]: the purge list of a keyspace holds the blob cache and the presence state: they go with the rest
+    this.registerPurgeHook(async (keyspaceId, cause) => {
+      this.blobsPurge(keyspaceId);
+      await this.run(() => {
+        this.presencePurge(keyspaceId, cause);
+        for (const [k, p] of [...this.ownPresence]) if (p.keyspaceId === keyspaceId) this.ownPresence.delete(k);
+      });
+    });
   }
 
   /**
@@ -269,6 +291,13 @@ export class Engine extends TabLayer {
       setInterest: (a) => super.setInterest(a[0] as string, a[1] as string[]),
       createKeyspace: (a) => this.createKeyspaceHere(a[0] as string, a[1] as string),
       removeKeyspace: (a) => this.removeKeyspaceHere(a[0] as string),
+      presenceJoin: (a) => this.guarded(() => this.presenceJoin(a[0] as string, a[1] as string, a[2] as string, a[3] as JoinOptions | undefined)),
+      presenceSet: (a) => this.guarded(() => this.presenceSet(a[0] as string, a[1] as string, a[2] as string, a[3] as Uint8Array)),
+      presenceLeave: (a) => this.guarded(() => this.presenceLeave(a[0] as string, a[1] as string, a[2] as string)),
+      blobStage: (a) => this.stageBlobNow(a[0] as string, a[1] as Uint8Array, a[2] as StageOptions | undefined).then((r) => this.afterStage(r)),
+      blobUpload: (a) => this.uploadBlobNow(a[0] as string, a[1] as Uint8Array, a[2] as StageOptions | undefined),
+      blobDelete: (a) => this.deleteBlobNow(a[0] as string, a[1] as string, a[2] as string),
+      blobRelease: (a) => this.releaseBlobNow(a[0] as string, a[1] as string),
     };
   }
 
@@ -371,6 +400,9 @@ export class Engine extends TabLayer {
       if (f.revoked) f.revoked = false; // the app lets go of a keyspace that a revocation stopped: nothing is left of it to follow, or to finish
       f.crdt.destroy();
       this.follows.delete(id);
+      this.presencePurge(id, "REMOVED"); // 09 [READ-63]: the session's memberships end with the removal; the engine follows the keyspace no more
+      this.blobsPurge(id);
+      for (const [k, p] of [...this.ownPresence]) if (p.keyspaceId === id) this.ownPresence.delete(k);
       await this.tx([{ op: "deleteReplica", keyspaceId: id }, ...this.followedOps()]);
       this.touchPersisted();
       if (this.online() && f.onSession) {
@@ -447,6 +479,116 @@ export class Engine extends TabLayer {
   interest(keyspaceId: string): string[] | undefined {
     const f = this.follows.get(keyspaceId);
     return f === undefined ? undefined : [...f.interest];
+  }
+
+  // ---------------------------------------------------------------------------------------------------------------------
+  // Presence (09 §9.8): one entry per topic for all the tabs of the engine, published through its one session (14 [CLI-61]); `presence.ts`
+
+  private tabKey(): string {
+    return this.tabId === "" ? "main" : this.tabId;
+  }
+
+  /** Runs a change of the presence registrations as a task of the engine; a local refusal reaches the caller and is no internal error of the engine. */
+  private async guarded(fn: () => void): Promise<void> {
+    const refused = await this.run(() => {
+      try {
+        fn();
+        return undefined;
+      } catch (e) {
+        return e;
+      }
+    });
+    if (refused !== undefined) throw refused;
+  }
+
+  /**
+   * This tab joins a presence topic of a followed keyspace (09 [READ-73]). The engine joins the topic on its session as soon as the session follows the keyspace, joins again after
+   * every new session, and leaves it when the last tab of the engine has left (09 [READ-74]). `opts.awareness` marks a Yjs awareness topic (09 [READ-83]); by default the manifest says.
+   * Resolves when the tab is registered; what the server answers comes as presence events (`onPresence`).
+   */
+  async joinPresence(keyspaceId: string, topic: string, opts: JoinOptions = {}): Promise<void> {
+    const tab = this.tabKey();
+    const key = `${keyspaceId}\u0000${topic}`;
+    const had = this.ownPresence.get(key);
+    this.ownPresence.set(key, { keyspaceId, topic, opts, state: had?.state });
+    try {
+      await this.viaFlusher("presenceJoin", [tab, keyspaceId, topic, opts], () => this.guarded(() => this.presenceJoin(tab, keyspaceId, topic, opts)));
+    } catch (e) {
+      if (had === undefined) this.ownPresence.delete(key);
+      throw e;
+    }
+  }
+
+  /**
+   * Sets the state of this tab in a topic that it has joined (09 [READ-74]): any JSON value of json/v1 (14 [CLI-22]); it is published at once, or after the interval of the topic
+   * (09 [READ-79]), and again at about half the TTL (09 [READ-76]) while the tab is in the topic. For a Yjs awareness topic the state of the entry maps the tab ids to their
+   * states (09 [READ-83]). A state over `max_presence_state_bytes` is refused here (`LocalRefusal`, `INVALID`).
+   */
+  async publishPresence(keyspaceId: string, topic: string, state: unknown): Promise<void> {
+    const tab = this.tabKey();
+    const bytes = jsonBytes(state);
+    await this.viaFlusher("presenceSet", [tab, keyspaceId, topic, bytes], () => this.guarded(() => this.presenceSet(tab, keyspaceId, topic, bytes)));
+    const own = this.ownPresence.get(`${keyspaceId}\u0000${topic}`);
+    if (own !== undefined) own.state = bytes;
+  }
+
+  /** This tab leaves a topic. The engine sends `LeavePresence` when no tab of it is in the topic any more (09 [READ-74], [READ-77]). */
+  async leavePresence(keyspaceId: string, topic: string): Promise<void> {
+    const tab = this.tabKey();
+    this.ownPresence.delete(`${keyspaceId}\u0000${topic}`);
+    await this.viaFlusher("presenceLeave", [tab, keyspaceId, topic], () => this.guarded(() => this.presenceLeave(tab, keyspaceId, topic)));
+  }
+
+  /** A new flusher: the memberships and the states of this tab are told to it again (09 [READ-73]; the session of the old flusher ended with it). */
+  protected onFlusherChanged(): void {
+    const tab = this.tabKey();
+    for (const p of [...this.ownPresence.values()]) {
+      const tell = (name: string, args: unknown[], local: () => void): void => {
+        this.viaFlusher(name, args, () => this.guarded(local)).catch(() => undefined);
+      };
+      tell("presenceJoin", [tab, p.keyspaceId, p.topic, p.opts], () => this.presenceJoin(tab, p.keyspaceId, p.topic, p.opts));
+      if (p.state !== undefined) {
+        const state = p.state;
+        tell("presenceSet", [tab, p.keyspaceId, p.topic, state], () => this.presenceSet(tab, p.keyspaceId, p.topic, state));
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------------------------------------------------
+  // Blobs (09 §9.9): `blobs.ts`. A call of a follower tab that touches the bytes that actions name goes to the flusher, which keeps them (14 [CLI-61]).
+
+  /**
+   * Keeps the bytes for the actions that will name the blob in `blob_refs`, and returns the blob's reference; nothing is sent now. The engine uploads the bytes in the background while it
+   * is online, and again when an action that names the blob gets `BLOB_PENDING` or `BLOB_MISSING` (14 [CLI-44]); it keeps them until that action is confirmed (09 [READ-94]).
+   */
+  stageBlob(keyspaceId: string, bytes: Uint8Array, opts: StageOptions = {}): Promise<BlobRef> {
+    const o: StageOptions = { ...opts, blobId: opts.blobId ?? this.mintBlobId() }; // a follower mints the id: the flusher stages once under it, whoever asks again
+    return this.viaFlusher("blobStage", [keyspaceId, bytes, o], () => this.stageBlobNow(keyspaceId, bytes, o).then((r) => this.afterStage(r)));
+  }
+
+  private afterStage(ref: BlobRef): BlobRef {
+    this.backgroundUpload(ref);
+    return ref;
+  }
+
+  /**
+   * Stages the bytes and uploads them: `CreateUpload`, the PUT to the signed URL with the headers that it gives, `CommitBlob` (09 [READ-86], [READ-88]); resolves with the blob's
+   * reference once the blob is committed. The `signal` and `onWait` of a call that a follower tab makes do not reach the flusher.
+   */
+  uploadBlob(keyspaceId: string, bytes: Uint8Array, opts: StageOptions & BlobCallOptions = {}): Promise<BlobRef> {
+    const { signal, onWait, ...stage } = opts;
+    const o: StageOptions = { ...stage, blobId: stage.blobId ?? this.mintBlobId() };
+    return this.viaFlusher("blobUpload", [keyspaceId, bytes, o], () => this.uploadBlobNow(keyspaceId, bytes, { ...o, ...(signal !== undefined ? { signal } : {}), ...(onWait !== undefined ? { onWait } : {}) }));
+  }
+
+  /** `DeleteBlob` (09 [READ-91]); the cached and staged bytes of the blob go with it. */
+  deleteBlob(keyspaceId: string, blobId: string, reason: string, opts: BlobCallOptions = {}): Promise<void> {
+    return this.viaFlusher("blobDelete", [keyspaceId, blobId, reason], () => this.deleteBlobNow(keyspaceId, blobId, reason, opts));
+  }
+
+  /** Lets go of the bytes of a staged blob that no action will name (the server's blob stays until the sweep of 09 [READ-92]; the engine never deletes one on its own, [READ-94]). */
+  releaseBlob(keyspaceId: string, blobId: string): Promise<void> {
+    return this.viaFlusher("blobRelease", [keyspaceId, blobId], () => this.releaseBlobNow(keyspaceId, blobId));
   }
 
   /** Opens a CRDT key for the user: its view document (14 [CLI-13]). Only the flusher holds the documents of a device's engine. */

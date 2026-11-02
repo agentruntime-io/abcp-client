@@ -40,9 +40,9 @@ export interface OpenOptions {
   noAdd?: boolean;
 }
 
-export function tabsRig(opts: { keyspaces?: string[]; heartbeatMs?: number; serverLimits?: Record<string, number>; storageOptions?: ConstructorParameters<typeof MemoryDevice>[0] } = {}): TabsRig {
+export function tabsRig(opts: { keyspaces?: string[]; heartbeatMs?: number; serverLimits?: Record<string, number>; storageOptions?: ConstructorParameters<typeof MemoryDevice>[0]; manifests?: StaticManifests } = {}): TabsRig {
   const clock = new ManualClock();
-  const manifests = new StaticManifests(MANIFEST);
+  const manifests = opts.manifests ?? new StaticManifests(MANIFEST);
   const server = new FakeServer({ manifests, clock, heartbeatMs: opts.heartbeatMs ?? 15_000, ...(opts.serverLimits !== undefined ? { limits: opts.serverLimits } : {}) });
   for (const k of opts.keyspaces ?? [KS]) server.createKeyspaceNow(k);
   const device = new MemoryDevice(opts.storageOptions);

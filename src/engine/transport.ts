@@ -1,5 +1,7 @@
 // The transport the engine talks through: `Mutate`, `GetMutationResult(s)`, `CancelIntent`, `CreateKeyspace`, `LoadState`,
-// `Subscribe` (an async iterator of frames), `UpdateSubscription`, `RefreshSession` and `GetManifest`. The fake server of
+// `Subscribe` (an async iterator of frames), `UpdateSubscription`, `RefreshSession`, `GetManifest`, the presence calls (09 §9.8:
+// `JoinPresence`, `PublishPresence`, `LeavePresence`) and the blob calls (09 §9.9: `CreateUpload`, `CommitBlob`, `GetBlob`,
+// `DeleteBlob`). The fake server of
 // `src/fake` implements it, and so does the adapter over raw bytes of wire.ts; a later milestone (C5) implements it over
 // connect-es.
 //
@@ -9,18 +11,32 @@
 import type {
   CancelIntentRequest,
   CancelIntentResponse,
+  CommitBlobRequest,
+  CommitBlobResponse,
   CreateKeyspaceRequest,
   CreateKeyspaceResponse,
+  CreateUploadRequest,
+  CreateUploadResponse,
+  DeleteBlobRequest,
+  DeleteBlobResponse,
+  GetBlobRequest,
+  GetBlobResponse,
   GetManifestRequest,
   GetManifestResponse,
   GetMutationResultRequest,
   GetMutationResultResponse,
   GetMutationResultsRequest,
   GetMutationResultsResponse,
+  JoinPresenceRequest,
+  JoinPresenceResponse,
+  LeavePresenceRequest,
+  LeavePresenceResponse,
   LoadStateRequest,
   LoadStateResponse,
   MutateRequest,
   MutateResponse,
+  PublishPresenceRequest,
+  PublishPresenceResponse,
   RefreshSessionRequest,
   RefreshSessionResponse,
   SubscribeRequest,
@@ -55,4 +71,13 @@ export interface Transport {
   subscribe(req: SubscribeRequest, o?: CallOptions): AsyncIterable<SubscribeResponse>;
   updateSubscription(req: UpdateSubscriptionRequest, o?: CallOptions): Promise<UpdateSubscriptionResponse>;
   refreshSession(req: RefreshSessionRequest, o?: CallOptions): Promise<RefreshSessionResponse>;
+  // -- presence (09 §9.8): the calls name the session that `Subscribe` opened --
+  joinPresence(req: JoinPresenceRequest, o?: CallOptions): Promise<JoinPresenceResponse>;
+  publishPresence(req: PublishPresenceRequest, o?: CallOptions): Promise<PublishPresenceResponse>;
+  leavePresence(req: LeavePresenceRequest, o?: CallOptions): Promise<LeavePresenceResponse>;
+  // -- blobs (09 §9.9) --
+  createUpload(req: CreateUploadRequest, o?: CallOptions): Promise<CreateUploadResponse>;
+  commitBlob(req: CommitBlobRequest, o?: CallOptions): Promise<CommitBlobResponse>;
+  getBlob(req: GetBlobRequest, o?: CallOptions): Promise<GetBlobResponse>;
+  deleteBlob(req: DeleteBlobRequest, o?: CallOptions): Promise<DeleteBlobResponse>;
 }

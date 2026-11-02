@@ -50,6 +50,12 @@ export interface EngineManifest extends Rules {
   counterRange(key: string): Range | undefined;
   /** The owning key of a fenced key (11 §11.2.4): the key that a write to this key is fenced by, or undefined. */
   fencedBy(key: string): string | undefined;
+  /**
+   * How a presence topic of a keyspace of the kind is judged (09 [READ-72], [READ-83], 04 [MAN-15]): `plain` when it matches a presence topic template of the kind,
+   * `awareness` when it is a key of a `crdt:*` template of the kind (a topic that matches both is a plain one, as the server reads it), undefined when it is
+   * neither or when the kind declares no presence. A manifest that cannot say leaves this out, and the engine takes a topic for a plain one.
+   */
+  presenceTopicKind?(kind: string, topic: string): "plain" | "awareness" | undefined;
 }
 
 /** The manifests of an app, by version. */
@@ -89,6 +95,8 @@ export interface StaticManifestSpec {
   version: number;
   templates: Record<string, StaticTemplate>;
   opTypes?: Record<string, StaticOpType>;
+  /** The presence topic templates of each keyspace kind (04 [MAN-15]); a kind that is not listed declares no presence. */
+  presence?: Record<string, string[]>;
 }
 
 interface Compiled {
@@ -100,8 +108,18 @@ interface Compiled {
 class StaticVersion implements EngineManifest {
   private readonly list: Compiled[] = [];
   private readonly ops = new Map<string, OpTypeInfo>();
+  private readonly presence = new Map<string, KeyTemplate[]>();
 
   constructor(spec: StaticManifestSpec) {
+    for (const [kind, topics] of Object.entries(spec.presence ?? {})) {
+      const parsed: KeyTemplate[] = [];
+      for (const text of topics) {
+        const t = parseKeyTemplate(text);
+        if (t === undefined) throw new Error(`presence topic template "${text}" is not a key template`);
+        parsed.push(t);
+      }
+      this.presence.set(kind, parsed);
+    }
     const entity = new Set(Object.entries(spec.templates).filter(([, t]) => t.entity === true).map(([p]) => p));
     for (const [pattern, t] of Object.entries(spec.templates)) {
       const tpl = parseKeyTemplate(pattern);
@@ -164,6 +182,13 @@ class StaticVersion implements EngineManifest {
     if (f === undefined || f.c.spec.fencedBy === undefined) return undefined;
     const owner = parseKeyTemplate(f.c.spec.fencedBy);
     return owner === undefined ? undefined : expandKeyTemplate(owner, f.bindings);
+  }
+
+  presenceTopicKind(kind: string, topic: string): "plain" | "awareness" | undefined {
+    const topics = this.presence.get(kind);
+    if (topics === undefined) return undefined;
+    if (topics.some((t) => matchKeyTemplate(t, topic) !== undefined)) return "plain";
+    return this.find(topic)?.c.template.rule === "crdt" ? "awareness" : undefined;
   }
 }
 

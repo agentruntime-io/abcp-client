@@ -11,6 +11,7 @@ import type { MemoryStorageOptions } from "../engine/memory-storage.js";
 import type { CrossTabLocks, StorageProvider, TabChannel, TabHost } from "../engine/tabs.js";
 import { BroadcastTabChannel, type BroadcastChannelConstructor } from "./channel.js";
 import { FileStorageProvider } from "./file-storage.js";
+export { FileBlobStash } from "./file-blob-stash.js";
 import { InProcessLocks } from "./locks.js";
 
 export interface NodeHostOptions extends MemoryStorageOptions {

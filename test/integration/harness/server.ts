@@ -147,6 +147,13 @@ export const MANIFEST = {
   app: APP,
   keyspace_kinds: {
     team: { keys: ["note/**", "count/**", "doc/**", "task/**"], op_types: ["Set", "Bump", "DocEdit", "Approve"], retention_class: "standard" },
+    // presence (04 [MAN-15], 09 §9.8): the topics `note/{id}` (04 [MAN-15]: the shape of the first segments of a template of the kind), and the keys of `doc/{id}` (a `crdt` template) as Yjs awareness topics; a state is an object of these members
+    room: {
+      keys: ["note/**", "doc/**"],
+      op_types: ["Set", "DocEdit"],
+      retention_class: "standard",
+      presence: { topics: ["note/{id}"], state: { type: "object", fields: { viewing: { type: "bool" }, cursor: { type: "string", max_len: 32 }, n: { type: "int" } } } },
+    },
   },
   keys: {
     "note/{id}": { merge: "lww", value_schema: { type: "string", max_len: 300 } },

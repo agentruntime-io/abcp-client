@@ -9,6 +9,27 @@ export { type Clock, type Random, systemClock, systemRandom } from "./clock.js";
 export type { Transport, CallOptions } from "./transport.js";
 export { BytesTransport, decodeMessage, encodeMessage, type RawCaller } from "./wire.js";
 export {
+  BlobCache,
+  BlobError,
+  DEFAULT_BLOB_CACHE_BYTES,
+  MAX_UPLOAD_ROUNDS,
+  MemoryBlobStash,
+  digestSha256,
+  fetchBlobHttp,
+  isBlobId,
+  newBlobId,
+  type BlobCallOptions,
+  type BlobData,
+  type BlobErrorCode,
+  type BlobHttp,
+  type BlobRef,
+  type BlobStash,
+  type BlobWait,
+  type StageOptions,
+  type StagedBlob,
+} from "./blob-store.js";
+export type { JoinOptions, PresenceEntryRaw, PresenceEvent, PresenceListener } from "./presence.js";
+export {
   StaticManifests,
   type EngineManifest,
   type Manifests,

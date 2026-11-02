@@ -456,6 +456,13 @@ describe("a purge (14 [CLI-66])", () => {
       registerPurgeHook: (h) => e.registerPurgeHook(h),
       flushViewChanges: () => undefined,
       manifests: e.manifests,
+      joinPresence: (k, t, o) => e.joinPresence(k, t, o),
+      publishPresence: (k, t, s) => e.publishPresence(k, t, s),
+      leavePresence: (k, t) => e.leavePresence(k, t),
+      presenceEntries: (k, t) => e.presenceEntries(k, t),
+      presenceAwareness: (k, t) => e.presenceAwareness(k, t),
+      onPresence: (l) => e.onPresence(l),
+      clientId: e.clientId,
     };
     const q = createQueries(wrapped);
     const seen: string[] = [];
