@@ -105,6 +105,23 @@ describe("09 [READ-57]: cursors that would make the `SubscribeRequest` longer th
     for (const [i, k] of KSS.entries()) expect(r.engine.confirmed(k).has(`${bigInterest(i)[0]}/title`), k).toBe(true);
   });
 
+  it("02 [ARC-63]: a Subscribe names at most `max_keyspaces_per_session`'s protocol maximum of cursors (a test lowers it to two); the rest are added on the live session, one entry each", async () => {
+    const r = await rig({ keyspaces: KSS, cfg: { maxSubscribeCursors: 2 } });
+    await tick(r, 5_000);
+    expect(subscribes(r)[0]?.keyspaces.map((k) => k.keyspaceId)).toEqual(["ks1", "ks2"]);
+    expect([...adds(r)].sort()).toEqual(["ks3", "ks4", "ks5"]);
+    for (const c of r.server.calls.filter((x) => x.method === "updateSubscription")) expect((c.request as { add: unknown[] }).add.length).toBeLessThanOrEqual(1);
+    // every keyspace is followed on the live session
+    for (const k of KSS) r.server.write(k, [kc("settings/after", "set", 1)]);
+    await r.engine.settle();
+    for (const k of KSS) expect(r.engine.confirmed(k).has("settings/after"), k).toBe(true);
+  });
+
+  it("the default is the protocol maximum of 10,000 cursors, so one Subscribe names every keyspace of a few", async () => {
+    const r = await rig({ keyspaces: KSS });
+    expect(subscribes(r)[0]?.keyspaces).toHaveLength(KSS.length);
+  });
+
   it("with the default limit (16 MiB) one Subscribe names every keyspace and nothing is added", async () => {
     const r = await rig({ keyspaces: KSS });
     expect(subscribes(r)[0]?.keyspaces).toHaveLength(KSS.length);

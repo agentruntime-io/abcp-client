@@ -42,6 +42,7 @@ import {
 import { CloseReason, DropReason } from "../gen/abpc/v2/sync_pb.js";
 import { CLIENT_BACKOFF, fullJitter, HOLD_BACKOFF, RECONNECT_BACKOFF, clampAfter, resendDelay } from "./backoff.js";
 import { codeName } from "./codes.js";
+import { MAX_KEYSPACES_PER_SESSION } from "./counts.js";
 import { makeReject } from "./endings.js";
 import { ProtocolViolation, RpcError } from "./errors.js";
 import { Follow } from "./follow.js";
@@ -78,6 +79,11 @@ function varintLength(n: number): number {
 export abstract class SessionLayer extends SenderLayer {
   /** The most octets of a `SubscribeRequest` that this engine builds (02 [ARC-59], 09 [READ-57]); a test lowers it. */
   protected maxSubscribeBytes = MAX_SUBSCRIBE_BYTES;
+  /**
+   * The most cursors of a `SubscribeRequest` that this engine builds: the protocol maximum of `max_keyspaces_per_session`, 10,000, above which a server may refuse
+   * the whole request before it decodes it, with `QUOTA_EXCEEDED` (02 [ARC-63]); a test lowers it.
+   */
+  protected maxSubscribeCursors = MAX_KEYSPACES_PER_SESSION;
   private running = false;
   /** `start()` was called: a flusher runs its session; a follower that is promoted does too. */
   protected startRequested = false;
@@ -362,9 +368,10 @@ export abstract class SessionLayer extends SenderLayer {
 
   /**
    * The cursors that the `Subscribe` names (09 [READ-57]): as many of the followed keyspaces, in order, as keep the request within `maxSubscribeBytes` in
-   * the binary encoding (02 [ARC-59]; the engine calls in no other codec). The rest are named in `UpdateSubscription` adds on the new session, which
-   * `Subscribed` starts for each followed keyspace that is not on it yet, each request within that size (one cursor of at most 1,000 prefixes is far
-   * under it). The `Subscribe` names one keyspace at least, whatever its size.
+   * the binary encoding (02 [ARC-59]; the engine calls in no other codec) and within `maxSubscribeCursors`, the protocol maximum of `max_keyspaces_per_session`
+   * (02 [ARC-63]: a server may refuse a `Subscribe` of more keyspaces whole, before it decodes it). The rest are named in `UpdateSubscription` adds on the new
+   * session, which `Subscribed` starts for each followed keyspace that is not on it yet, each request within that size (one cursor of at most 1,000 prefixes is
+   * far under it, and one entry each, far under the 10,000 that [ARC-63] allows). The `Subscribe` names one keyspace at least, whatever its size.
    */
   private fitSubscribe(all: Follow[]): { follows: Follow[]; cursors: KeyspaceCursor[] } {
     let size = toBinary(SubscribeRequestSchema, create(SubscribeRequestSchema, { supportedFeatures: [...this.features], clientId: this.clientId })).byteLength;
@@ -374,7 +381,7 @@ export abstract class SessionLayer extends SenderLayer {
       const c = this.cursorOf(f);
       const n = toBinary(KeyspaceCursorSchema, c).byteLength;
       size += 1 + varintLength(n) + n; // the tag of `keyspaces` (field 1), the length and the cursor
-      if (follows.length > 0 && size > this.maxSubscribeBytes) break;
+      if (follows.length > 0 && (size > this.maxSubscribeBytes || follows.length >= this.maxSubscribeCursors)) break;
       follows.push(f);
       cursors.push(c);
     }

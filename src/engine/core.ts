@@ -103,6 +103,11 @@ export interface EngineConfig {
    * The cursors that do not fit are named in `UpdateSubscription` adds on the new session (09 [READ-57]). A test lowers it.
    */
   maxSubscribeBytes?: number;
+  /**
+   * The most cursors of a `SubscribeRequest` that the engine builds; default 10,000, the protocol maximum of `max_keyspaces_per_session`, above which a server
+   * may refuse the whole request (02 [ARC-63]). The cursors that do not fit are named in `UpdateSubscription` adds on the new session (09 [READ-57]). A test lowers it.
+   */
+  maxSubscribeCursors?: number;
   /** Blobs (09 §9.9): the HTTP of the blob store, where the bytes that actions name are kept, and the size of the cache of downloads. */
   blobs?: {
     /** Moves bytes to and from signed URLs; default the platform's `fetch` (`fetchBlobHttp`). */
