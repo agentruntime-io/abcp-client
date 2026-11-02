@@ -3,6 +3,12 @@
 // The binary is deleted by the global teardown (`../global-setup.ts`).
 //
 // Without a Go toolchain the integration tests are skipped with a message (`goAvailable`, `SKIP_REASON`).
+//
+// On PostgreSQL (M7b): with ABPC_INTEGRATION_PG=1 and ABPC_PG_DSN (the DSN that scripts/pgtest.sh prints: the throwaway cluster, on its own port)
+// each server that a test starts gets two databases of its own, made for it and dropped when it is killed: the commit database and ABPC's own
+// store (`--commit-dsn` and `--own-dsn`, given through the environment). A restart of the server is then a server on two new, empty databases, as
+// it is on the in-memory store: `restart.test.ts` asserts that a client survives the loss of a store, which a restart on the same databases would
+// not make. The harness refuses a DSN that names no host or no port and the owner's port 5432: it talks to the throwaway cluster only.
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
@@ -39,6 +45,87 @@ export function ensureTmp(): void {
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+// ---- the PostgreSQL store ---------------------------------------------------------------------------------------
+
+/** Whether the servers of this run use the PostgreSQL store (ABPC_INTEGRATION_PG=1). */
+export const usesPostgres = process.env["ABPC_INTEGRATION_PG"] === "1";
+
+interface PgTarget {
+  host: string;
+  port: string;
+  user: string;
+  password: string;
+}
+
+/** The throwaway cluster of ABPC_PG_DSN: an explicit host and port, and never the owner's port 5432. */
+function pgTarget(): PgTarget {
+  const raw = process.env["ABPC_PG_DSN"];
+  if (raw === undefined || raw.trim() === "") throw new Error("ABPC_INTEGRATION_PG=1 needs ABPC_PG_DSN: run scripts/pgtest.sh start and export the DSN it prints");
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new Error("ABPC_PG_DSN is not a postgres:// URL");
+  }
+  if (u.protocol !== "postgres:" && u.protocol !== "postgresql:") throw new Error("ABPC_PG_DSN is not a postgres:// URL");
+  if (u.hostname === "" || u.port === "") throw new Error("ABPC_PG_DSN names no host or no port: refusing to let the environment pick the server");
+  if (Number(u.port) === 5432) throw new Error("ABPC_PG_DSN names port 5432, the owner's server: refusing");
+  for (const k of ["host", "port", "hostaddr", "service"]) {
+    if (u.searchParams.has(k)) throw new Error(`ABPC_PG_DSN has a "${k}" parameter: refusing`);
+  }
+  return { host: u.hostname, port: u.port, user: decodeURIComponent(u.username) || "postgres", password: decodeURIComponent(u.password) };
+}
+
+function psqlBinary(): string {
+  const dir = process.env["ABPC_PGTEST_BIN"] ?? (os.platform() === "win32" ? "C:\\Program Files\\PostgreSQL\\18\\bin" : "/usr/lib/postgresql/18/bin");
+  return path.join(dir, os.platform() === "win32" ? "psql.exe" : "psql");
+}
+
+/** Runs one statement on the maintenance database of the throwaway cluster, with an environment that points psql nowhere else. */
+function pgExec(sql: string): void {
+  const t = pgTarget();
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const k of Object.keys(env)) if (k.toUpperCase().startsWith("PG")) delete env[k];
+  if (t.password !== "") env["PGPASSWORD"] = t.password;
+  const r = spawnSync(psqlBinary(), ["-h", t.host, "-p", t.port, "-U", t.user, "-d", "postgres", "-X", "-q", "-v", "ON_ERROR_STOP=1", "-c", sql], {
+    encoding: "utf8",
+    env,
+    timeout: 60_000,
+  });
+  if (r.status !== 0) throw new Error(`psql failed (${String(r.status)}): ${r.stderr}${r.error !== undefined ? String(r.error) : ""}`);
+}
+
+let dbCounter = 0;
+
+interface PgDatabases {
+  /** The environment that gives the server its two DSNs. */
+  env: Record<string, string>;
+  /** Drops the two databases (the server has exited). */
+  drop(): void;
+}
+
+/** Makes the commit database and ABPC's own store of one server, empty. */
+function makeDatabases(): PgDatabases {
+  const t = pgTarget();
+  const id = `abpc_it_${process.pid}_${++dbCounter}_${Math.random().toString(36).slice(2, 8)}`;
+  const names = [`${id}_c`, `${id}_o`] as const;
+  for (const n of names) pgExec(`CREATE DATABASE ${n}`);
+  const auth = encodeURIComponent(t.user) + (t.password !== "" ? `:${encodeURIComponent(t.password)}` : "");
+  const dsn = (db: string): string => `postgres://${auth}@${t.host}:${t.port}/${db}?sslmode=disable`;
+  return {
+    env: { ABPC_COMMIT_DSN: dsn(names[0]), ABPC_OWN_DSN: dsn(names[1]) },
+    drop: () => {
+      for (const n of names) {
+        try {
+          pgExec(`DROP DATABASE IF EXISTS ${n} WITH (FORCE)`);
+        } catch (e) {
+          console.warn(`[integration] the database ${n} was not dropped: ${String(e)}`);
+        }
+      }
+    },
+  };
+}
 
 /** Which source the binary of this run was built from (`worktree` or `head`), for the report of a run. */
 export let builtFrom: "worktree" | "head" | undefined;
@@ -235,7 +322,14 @@ export async function startServer(o: ServerOptions): Promise<ServerProcess> {
       ...(o.config ?? {}),
     }),
   );
-  const child = spawn(bin, ["-config", path.join(dir, "server.json")], { cwd: dir, stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
+  const pg = usesPostgres ? makeDatabases() : undefined;
+  const child = spawn(bin, ["-config", path.join(dir, "server.json")], {
+    cwd: dir,
+    stdio: ["ignore", "ignore", "pipe"],
+    windowsHide: true,
+    // the DSNs go in the environment, not on the command line, which another process can read
+    env: pg !== undefined ? { ...process.env, ...pg.env } : process.env,
+  });
   running.add(child);
   let log = "";
   let exited: number | null | undefined;
@@ -250,10 +344,15 @@ export async function startServer(o: ServerOptions): Promise<ServerProcess> {
   // ready when the server says it listens, or the port accepts a connection
   const deadline = Date.now() + 20_000;
   for (;;) {
-    if (exited !== undefined) throw new Error(`the server exited (${exited}) before it listened:\n${log}`);
+    if (exited !== undefined) {
+      pg?.drop();
+      throw new Error(`the server exited (${exited}) before it listened:\n${log}`);
+    }
     if (log.includes("abpc-server listening")) break;
     if (Date.now() > deadline) {
       child.kill();
+      await Promise.race([new Promise<void>((r) => child.once("exit", () => r())), sleep(5000)]);
+      pg?.drop();
       throw new Error(`the server did not start in time:\n${log}`);
     }
     await sleep(25);
@@ -264,6 +363,7 @@ export async function startServer(o: ServerOptions): Promise<ServerProcess> {
       child.kill();
       await Promise.race([done, sleep(5000)]);
     }
+    pg?.drop();
     fs.rmSync(dir, { recursive: true, force: true });
   };
   return { port, url: `http://127.0.0.1:${port}`, log: () => log, kill };
