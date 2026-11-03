@@ -224,7 +224,8 @@ export function blobUrlAllowed(url: string, allowInsecure: boolean): boolean {
   if (u.protocol !== "http:") return false;
   if (allowInsecure) return true;
   const h = u.hostname.toLowerCase();
-  return h === "localhost" || h.endsWith(".localhost") || h === "127.0.0.1" || h === "[::1]" || /^127.d+.d+.d+$/.test(h);
+  // V23 SHOULD-2: every address of 127.0.0.0/8 is a loopback address (the URL parser has made an IPv4 host of four decimal numbers, each at most 255); a name that only looks like one is not
+  return h === "localhost" || h.endsWith(".localhost") || h === "[::1]" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
 }
 
 /** Whether the text is a blob id (03 Table 3.1, 09 [READ-84]). */
@@ -399,6 +400,13 @@ export class BlobCache {
 
   has(ks: string, id: string): boolean {
     return this.rows.has(this.key(ks, id));
+  }
+
+  /** The ids of the blobs of the keyspace that the cache holds. */
+  ids(ks: string): string[] {
+    const out: string[] = [];
+    for (const v of this.rows.values()) if (v.keyspaceId === ks) out.push(v.blobId);
+    return out;
   }
 }
 

@@ -130,6 +130,8 @@ export interface DeadLetterEntry {
    * build wrote: it is listed before the ones that have one, in the order that the storage gave.
    */
   ordinal?: number;
+  /** A redaction removed the values of erased keys from the entry's content, which keeps its place (14 [CLI-76]); `erase.ts` says what is left of a change. */
+  redacted?: boolean;
 }
 
 /** An entry of the journal of 14 [CLI-53]: the content of an action that retired with a successful outcome. */
@@ -155,6 +157,8 @@ export interface JournalEntry {
   ordinal: number;
   /** The epoch in which `GetMutationResult` last confirmed the outcome (14 [CLI-53]); the outcome's own epoch until then. */
   verifiedEpoch: number;
+  /** A redaction removed the values of erased keys from the entry's content (14 [CLI-76]): the action is no longer whole, and a lost spend action of it is not resent. */
+  redacted?: boolean;
 }
 
 /** An entry that the app's export hook was handed and has not acknowledged (14 [CLI-83]). */
@@ -171,6 +175,8 @@ export interface ExportEntry {
   atMs: number;
   /** The authoring order of the action (see `DeadLetterEntry.ordinal`). */
   ordinal?: number;
+  /** A redaction removed the values of erased keys from the entry's content, which keeps its place (14 [CLI-76]). */
+  redacted?: boolean;
 }
 
 /** A rejection that the app has not acknowledged (14 [CLI-41]). */
@@ -184,6 +190,8 @@ export interface RejectionRecord {
   atMs: number;
   /** The author of the action (14 [CLI-59]): on a shared device another principal never sees it. */
   author?: Author;
+  /** A redaction removed the values of erased keys from the content (14 [CLI-76]). */
+  redacted?: boolean;
 }
 
 /** The text of a CRDT key's pending and unsent edits that a redaction reset took out of the view (14 [CLI-13], [CLI-49]). */
@@ -267,7 +275,12 @@ export type StorageOp =
   /** Purges the replica of the keyspace (14 [CLI-66], [CLI-77]). */
   | { op: "deleteReplica"; keyspaceId: string }
   /** Removes everything of the partition (14 [CLI-65]: a sign-out in personal mode, a discard of a locked partition). */
-  | { op: "purgeAll" };
+  | { op: "purgeAll" }
+  /**
+   * Marks the commit as an erasure (14 [CLI-76]); it changes no row. A storage that keeps a history of its commits (the file journal) rewrites it as a snapshot, so that nothing
+   * that the commit replaced is left in it; the others have no history to rewrite.
+   */
+  | { op: "erase"; keyspaceId: string };
 
 /** What a replica image is, without its pages and its tail: its head and the sizes of the rest (see `OutboxStorage.loadLight`). */
 export interface ReplicaSummary {

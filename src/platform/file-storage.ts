@@ -12,8 +12,8 @@
 // `MemoryStorage` that the tests use, so the bounds of 14 [CLI-84] and the all-or-none apply behave the same.
 //
 // The journal is rewritten as one line, the snapshot of the state, when the partition is opened, when it has grown to many times what the state needs, and
-// in the commit of every purge (V19 MUST-3): what 14 [CLI-66] and [CLI-76] say a client purges is not on disk after the commit that purges it, not in a line
-// of the journal that the purge came after. The snapshot is written to a file of its own, flushed, then renamed over the journal; a snapshot that cannot be
+// in the commit of every purge (V19 MUST-3) and of every erasure (an `erase` operation, 14 [CLI-76]): what 14 [CLI-66] and [CLI-76] say a client purges or
+// replaces is not on disk after the commit that does it, not in a line of the journal that the commit came after. The snapshot is written to a file of its own, flushed, then renamed over the journal; a snapshot that cannot be
 // written leaves the journal as it was, and the storage working.
 //
 // One process at a time: `LOCK` names its holder, and a second process that opens the partition is refused (the lock of a process that is gone is
@@ -30,6 +30,7 @@ import { MemoryStorage, type MemoryStorageOptions } from "../engine/memory-stora
 import { partitionId, sameKey, type PartitionKey, type StorageProvider } from "../engine/tabs.js";
 import type { OutboxStorage, ReplicaImage, StorageMode, StorageOp, StoredLight, StoredState, StoreName } from "../engine/storage.js";
 import { FileBlobStash } from "./file-blob-stash.js";
+import { syncDirectory } from "./fsync.js";
 import { parse, stringify } from "./serialize.js";
 
 const JOURNAL = "journal.jsonl";
@@ -71,7 +72,7 @@ export class FileStorage implements OutboxStorage {
     private readonly dir: string,
     private readonly bounds: MemoryStorageOptions,
   ) {
-    this.inner = new MemoryStorage({});
+    this.inner = new MemoryStorage({ keepLog: false });
   }
 
   /** Opens the partition directory (made when it does not exist) and reads its journal. */
@@ -94,7 +95,7 @@ export class FileStorage implements OutboxStorage {
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw new StorageError(`cannot read the journal: ${(e as Error).message}`);
     }
-    const inner = new MemoryStorage({}); // no bounds while replaying: a bound that was lowered since must not lose what is stored
+    const inner = new MemoryStorage({ keepLog: false }); // no bounds while replaying: a bound that was lowered since must not lose what is stored
     let at = 0;
     let lineNo = 0;
     while (at < text.length) {
@@ -197,7 +198,8 @@ export class FileStorage implements OutboxStorage {
   /** Whether the commit purges: what it removes is not to stay in a line of the journal (14 [CLI-66], [CLI-76]). */
   private purges(ops: readonly StorageOp[]): boolean {
     const held = this.inner.replicaKeyspaces();
-    return ops.some((o) => o.op === "purgeAll" || o.op === "deleteReplica" || (o.op === "replicaBegin" && held.includes(o.keyspaceId)));
+    // 14 [CLI-76]: an `erase` commit replaces rows (the entries of the journal and of the dead-letter store, the pages and the records of an image) that the lines before it hold too
+    return ops.some((o) => o.op === "purgeAll" || o.op === "deleteReplica" || o.op === "erase" || (o.op === "replicaBegin" && held.includes(o.keyspaceId)));
   }
 
   private async commitNow(ops: readonly StorageOp[]): Promise<void> {
@@ -244,20 +246,6 @@ export class FileStorage implements OutboxStorage {
     await this.chain;
     await this.fh?.close().catch(() => undefined);
     this.fh = undefined;
-  }
-}
-
-/** Makes the rename durable where the platform can (a directory is not opened for reading on Windows). */
-async function syncDirectory(dir: string): Promise<void> {
-  try {
-    const h = await fsp.open(dir, "r");
-    try {
-      await h.sync();
-    } finally {
-      await h.close();
-    }
-  } catch {
-    // not possible here: the file itself is on disk
   }
 }
 

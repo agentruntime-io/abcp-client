@@ -14,9 +14,8 @@
 // A rebuild makes a fresh view document, with a fresh Yjs client id, from the confirmed document and the remaining pending
 // updates, and re-applies once, as a diff, the user's edits that are in no action yet (02 [ARC-52] item 3).
 //
-// TODO(R2, 14 [CLI-13], [CLI-49], [CLI-76]): the redaction reset (a `REDACTED` record, a load entry with the redaction mark, a
-// listed redaction): the rebuild that re-applies nothing, and the key's local draft. A DOC_RESET reject keeps the text of the
-// rejected action as a draft in the dead-letter flow of the engine, but no reset is detected from the log yet.
+// The redaction reset (a `REDACTED` record, a load entry with the redaction mark, a listed redaction, 14 [CLI-13], [CLI-49], [CLI-76]) is a rebuild that
+// re-applies nothing (`rebuild` with `reapplyEdits` false); what leaves the view goes to the key's local draft, which `erasure.ts` writes.
 // TODO(later): a diff of Y.XmlFragment roots, and of text formatting attributes; the diff here is of plain text, of map members
 // and of array items.
 
@@ -507,9 +506,11 @@ export class CrdtKey {
    * Rebuilds the view document (14 [CLI-13]): a fresh document with a fresh Yjs client id, from the confirmed document and the
    * pending updates that remain, with the user's edits that were in no action re-applied once, as a diff. `pendingBefore` are the
    * pending updates as they were, `pendingAfter` those that remain; `confirmed`, when given, replaces the confirmed document
-   * (a load with `resumed = false`, 09 [READ-18]). Returns false when the key has no view document, which has nothing to rebuild.
+   * (a load with `resumed = false`, 09 [READ-18]). With `reapplyEdits` false, which is the rebuild of a redaction reset (14 [CLI-13]: "A rebuild caused by a redaction reset
+   * MUST NOT re-apply any edit"), the user's edits that were in no action are not applied to the new view; the caller has put them in the key's draft. Returns false when the key
+   * has no view document, which has nothing to rebuild.
    */
-  rebuild(pendingBefore: readonly Uint8Array[], pendingAfter: readonly Uint8Array[], confirmed?: Y.Doc): boolean {
+  rebuild(pendingBefore: readonly Uint8Array[], pendingAfter: readonly Uint8Array[], confirmed?: Y.Doc, reapplyEdits = true): boolean {
     const old = this.view_;
     if (old === null) {
       if (confirmed !== undefined) {
@@ -521,13 +522,17 @@ export class CrdtKey {
     const kinds = this.kinds(old);
     // what the user had made of the document, and the document without those edits: the old confirmed document with every
     // pending update that the view held
-    const base = new Y.Doc();
-    Y.applyUpdate(base, Y.encodeStateAsUpdate(this.confirmed));
-    for (const u of pendingBefore) safeApply(base, u);
-    ensureRoots(base, kinds);
-    const before = snapshot(base, kinds);
-    const edited = snapshot(old, kinds);
-    base.destroy();
+    let before: Map<string, Snap> | undefined;
+    let edited: Map<string, Snap> | undefined;
+    if (reapplyEdits) {
+      const base = new Y.Doc();
+      Y.applyUpdate(base, Y.encodeStateAsUpdate(this.confirmed));
+      for (const u of pendingBefore) safeApply(base, u);
+      ensureRoots(base, kinds);
+      before = snapshot(base, kinds);
+      edited = snapshot(old, kinds);
+      base.destroy();
+    }
 
     if (confirmed !== undefined) {
       this.confirmed.destroy();
@@ -536,7 +541,7 @@ export class CrdtKey {
     this.unsent = [];
     old.destroy();
     this.view_ = this.makeView(this.confirmed, pendingAfter);
-    reapply(this.view_, kinds, before, edited);
+    if (before !== undefined && edited !== undefined) reapply(this.view_, kinds, before, edited);
     return true;
   }
 
@@ -653,12 +658,20 @@ export class CrdtStore {
     k.confirmed = doc;
   }
 
-  /** Drops the documents of every key that the state no longer holds as a CRDT key that has a value (a delete, a subtree deletion, the redacted state). */
-  reconcile(st: ReplicaState): string[] {
+  /**
+   * Drops the documents of every key that the state no longer holds as a CRDT key that has a value (a delete, a subtree deletion, the redacted state). A key of `keep` that holds a view
+   * document stays, with an empty confirmed document: a redaction reset rebuilds its view (14 [CLI-13], [CLI-76]) and keeps the handle that the app holds.
+   */
+  reconcile(st: ReplicaState, keep?: ReadonlySet<string>): string[] {
     const dropped: string[] = [];
     for (const [key, k] of [...this.keys_]) {
       const row = st.key(key);
       if (row === undefined || row.rule !== "crdt" || row.state !== StateValue) {
+        if (keep?.has(key) === true && k.view !== null) {
+          k.confirmed.destroy();
+          k.confirmed = new Y.Doc();
+          continue;
+        }
         // a view document that the user still holds stays readable; the key has no confirmed document any more
         if (k.view === null) k.destroy();
         this.keys_.delete(key);

@@ -6,6 +6,7 @@ import { ReplicaState } from "../rules/fold/index.js";
 import type { Random } from "./clock.js";
 import { CrdtStore } from "./crdt-view.js";
 import type { LaneName } from "./manifests.js";
+import type { PendingErasure } from "./erasure.js";
 import type { KeyspaceView } from "./overlay.js";
 import type { ExportEntry } from "./storage.js";
 import type { KeyTouch, Shown, ViewFeed } from "./view-feed.js";
@@ -191,6 +192,8 @@ export class Follow {
   exportedPending: ExportEntry[] = [];
   /** The changes that records carried and that their kind does not define, counted (02 [ARC-46]). */
   anomalies = 0;
+  /** What redactions of the keyspace have erased since the last transaction that made it durable (14 [CLI-76], `erasure.ts`): committed with the records or the load that carried them. */
+  erasure: PendingErasure | undefined;
   /** Keys outside the interest that the app loaded to author a change (14 [CLI-73]): the version that the load showed, or 0 for a key that was absent. */
   readonly outside = new Map<string, bigint>();
 

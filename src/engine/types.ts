@@ -140,6 +140,11 @@ export interface DeadLetteredEvent extends Base {
   mutationId: string;
   keyspaceId: string;
   reason: string;
+  /**
+   * `REDACTED`: the entry (a dead-letter entry or an export-hook entry) was not moved to the store: a redaction removed the values of erased keys from its content, and it keeps its place with the
+   * mark `redacted` (14 [CLI-76], §14.5). Absent for an action that moved to the store, and for an unacknowledged entry about to be purged with its deleted keyspace ([CLI-77]).
+   */
+  cause?: "REDACTED";
 }
 
 export interface OutcomeUnknownEvent extends Base {

@@ -17,6 +17,7 @@ import { UpdateSubscriptionRequestSchema, UpdateSubscriptionRequest_InterestSche
 import { FoldError } from "../rules/fold/index.js";
 import { LocalRefusal, ProtocolViolation } from "./errors.js";
 import type { KeyEntry } from "../gen/abpc/v2/types_pb.js";
+import { loadRedaction } from "./erasure.js";
 import type { Follow } from "./follow.js";
 import { HorizonLayer } from "./horizon.js";
 import { resendDelay } from "./backoff.js";
@@ -40,7 +41,7 @@ export abstract class InterestLayer extends HorizonLayer {
    * the name is plain; on a shared device it carries the principal, so that one principal's revocation record is never read as the next one's, and the
    * next one follows what its own app asks for and not what the last one's did.
    */
-  protected metaKey(name: "followed" | "revoked" | "sagas"): string {
+  protected metaKey(name: "followed" | "revoked" | "sagas" | "crdtResets"): string {
     return this.sharedDevice ? `${name}:${this.author.issuer}|${this.author.sub}` : name;
   }
 
@@ -208,8 +209,11 @@ export abstract class InterestLayer extends HorizonLayer {
         }
         const loaded = pages.flatMap((p) => p.entries);
         let entries: KeyEntry[];
+        // 14 [CLI-76]: an entry with the redaction mark that the widening installs counts as a redaction of its key ("from any load (a widening load included)")
+        const marked = new Set(loaded.filter((e) => e.redacted).map((e) => e.key));
+        const erasedBefore = this.valuesOfKeys(f, marked);
         try {
-          entries = this.installWidening(f, loaded, first.manifestVersion);
+          entries = this.installWidening(f, loaded, first.manifestVersion, new Set([...marked].filter((k) => (f.crdt.get(k)?.view ?? null) !== null)));
         } catch (e) {
           if (e instanceof FoldError) {
             this.onProtocolViolation(new ProtocolViolation("LoadStateResponse", e.message, [f.id]), [f.id]);
@@ -226,6 +230,11 @@ export abstract class InterestLayer extends HorizonLayer {
         // 09 [READ-28]: the cursor of the keyspace is unchanged; the delivery restarts below it, from min(H, cursor)
         if (h < f.watermark) f.watermark = h;
         f.invalidate();
+        const red = loadRedaction(f.id, entries.filter((e) => e.redacted).map((e) => e.key), []);
+        if (red !== undefined) {
+          this.noteRedaction(f, red, erasedBefore);
+          this.resetCrdtKeys(f, red.keys);
+        }
         await this.persistExtend(f, entries);
         await this.persistFollowed();
         this.emit({ type: "interest-changed", keyspaceId: f.id, interest: [...f.interest], cause: "WIDENED" });

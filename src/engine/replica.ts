@@ -18,6 +18,8 @@ import { BoundedSet } from "./bounded.js";
 import { ProtocolViolation } from "./errors.js";
 import { ReplicaStoreLayer } from "./replica-store.js";
 import { appliedIndexes, type CrdtPlanItem } from "./crdt-view.js";
+import { readRedaction } from "./erase.js";
+import { loadRedaction } from "./erasure.js";
 import type { Follow } from "./follow.js";
 import { canDecode } from "./overlay.js";
 import type { OutboxEntry, StoredOutcome, Verdict } from "./storage.js";
@@ -125,12 +127,20 @@ export abstract class ReplicaLayer extends ReplicaStoreLayer {
       throw e;
     }
     st.setCursor(first.checkpointSeq, first.logEpoch, first.manifestVersion);
+    // 14 [CLI-76]: an entry with the redaction mark, and a key that `redactions` lists (09 [READ-100]), count as a redaction of the key, "from any load": the earlier values of the key that the
+    // client holds are purged, from the same places as for a `REDACTED` record, and a CRDT key is reset. The values that the replica held are read before the load replaces them.
+    const red = loadRedaction(
+      f.id,
+      entries.filter((e) => e.redacted).map((e) => e.key),
+      pages.flatMap((p) => p.redactions),
+    );
+    const erasedBefore = red === undefined ? [] : this.valuesOfKeys(f, red.keys);
 
     // the CRDT documents of the load: a key that holds a view document keeps it and is rebuilt (14 [CLI-13])
     const manifest = this.manifests.get(first.manifestVersion);
     const isCrdt = (e: KeyEntry): boolean => this.manifests.template(first.manifestVersion, e.key)?.rule === "crdt" || e.encoding === "yjs/v1";
     const docs = f.crdt.install(entries, isCrdt);
-    const rebuildKeys = f.crdt.replaceConfirmed(docs);
+    const rebuildKeys = f.crdt.replaceConfirmed(docs).filter((key) => red?.keys.has(key) !== true); // a redaction reset rebuilds its keys without the user's edits (`resetCrdtKeys`)
     const rebuilds = rebuildKeys.map((key) => {
       const roots = manifest?.crdtRoots(key);
       const ck = f.crdt.get(key);
@@ -159,6 +169,10 @@ export abstract class ReplicaLayer extends ReplicaStoreLayer {
     this.blobCacheLoadReplaced(f);
     this.sagaScan(f); // the moved keys and run keys of the new state (14 [CLI-14])
     this.emit({ type: "reloaded", keyspaceId: f.id, cause, logEpoch: first.logEpoch, checkpointSeq: first.checkpointSeq });
+    if (red !== undefined) {
+      this.noteRedaction(f, red, erasedBefore);
+      this.resetCrdtKeys(f, red.keys, docs);
+    }
     for (const r of rebuilds) {
       const ck = f.crdt.get(r.key);
       if (ck === undefined) continue;
@@ -281,8 +295,13 @@ export abstract class ReplicaLayer extends ReplicaStoreLayer {
     const st = f.state;
     let plan: CrdtPlanItem[];
     let anomalies: Anomaly[];
+    // 14 [CLI-76]: a `REDACTED` record names the keys that it erases; the values that the replica holds of them are read before the fold takes them out, and a CRDT key that holds a view
+    // document keeps it through the fold, to be reset
+    const red = readRedaction(f.id, rec);
+    const erasedBefore = red === undefined ? [] : this.valuesOfKeys(f, red.keys);
+    const keepCrdt = red === undefined ? undefined : new Set([...red.keys].filter((k) => (f.crdt.get(k)?.view ?? null) !== null));
     try {
-      ({ plan, anomalies } = this.foldRecord(f, rec));
+      ({ plan, anomalies } = this.foldRecord(f, rec, keepCrdt));
     } catch (e) {
       if (e instanceof FoldError) {
         if (e.stop) {
@@ -300,6 +319,7 @@ export abstract class ReplicaLayer extends ReplicaStoreLayer {
       throw e;
     }
     applied.push(rec);
+    if (red !== undefined) this.redactionApplied(f, red, erasedBefore);
     if (anomalies.length > 0) this.noteAnomalies(f, rec.seq, anomalies);
     if (rec.recordHash.length > 0) {
       f.lastRecordHash = rec.recordHash;

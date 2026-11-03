@@ -99,13 +99,66 @@ const MAX_CLIENT_ID_LENGTH = 128;
 const EXPIRY_SLACK_MS = 5_000;
 const keyOf = (ks: string, topic: string): string => `${ks}${sep}${topic}`;
 
-/** What an entry costs the view: its state, its client id and what the entry itself weighs. */
-const entrySize = (e: PresenceEntryRaw): number => e.state.length + e.clientId.length + 64;
+/**
+ * The sizes of a principal that the text gives (V23 MUST-2, 16 [SEC-1]): a `sub` is at most 255 bytes (10 [AUTH-8]), an actor chain has at most 16 entries, each at most 255 octets
+ * (10 [AUTH-13]), and a `device_id` is at most 128 bytes, or, for a DEVICE principal that takes it from its `sub`, as long as the `sub` is (10 [AUTH-26]): the one limit that holds for
+ * both is 255. A token that breaks them is invalid, so a server that sends a principal over them sends what it never held.
+ */
+const MAX_SUB_OCTETS = 255;
+const MAX_ACTOR_CHAIN_ENTRIES = 16;
+const MAX_ACTOR_OCTETS = 255;
+const MAX_DEVICE_ID_OCTETS = 255;
+
+/** The octets of the text in UTF-8, without making the bytes. */
+function octets(s: string): number {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) n += 1;
+    else if (c < 0x800) n += 2;
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length && s.charCodeAt(i + 1) >= 0xdc00 && s.charCodeAt(i + 1) <= 0xdfff) {
+      n += 4;
+      i++;
+    } else n += 3;
+  }
+  return n;
+}
+
+/** Whether the text is longer than `max` octets in UTF-8: a code unit is at most three of them, so a short text is not counted. */
+const over = (s: string, max: number): boolean => s.length * 3 > max && octets(s) > max;
+
+/** What a principal weighs in the view: every string that it carries (the issuer and the app id too, which the text gives no size, so the byte bound is what holds them). */
+function principalSize(p: Principal | undefined): number {
+  if (p === undefined) return 0;
+  let n = octets(p.sub) + octets(p.issuer) + octets(p.appId) + octets(p.deviceId);
+  for (const a of p.actorChain) n += octets(a);
+  return n;
+}
+
+/** Why a principal is no one that a server could have verified (V23 MUST-2), or undefined. */
+function principalProblem(p: Principal | undefined): string | undefined {
+  if (p === undefined) return undefined;
+  if (over(p.sub, MAX_SUB_OCTETS)) return `a sub of ${octets(p.sub)} octets, over the 255 of 10 [AUTH-8]`;
+  if (p.actorChain.length > MAX_ACTOR_CHAIN_ENTRIES) return `an actor chain of ${p.actorChain.length} entries, over the 16 of 10 [AUTH-13]`;
+  for (const a of p.actorChain) if (over(a, MAX_ACTOR_OCTETS)) return `an actor chain entry of ${octets(a)} octets, over the 255 of 10 [AUTH-13]`;
+  if (over(p.deviceId, MAX_DEVICE_ID_OCTETS)) return `a device id of ${octets(p.deviceId)} octets, over the limit of 10 [AUTH-26]`;
+  return undefined;
+}
+
+/** What an entry costs the view: its state, its client id, its principal and what the entry itself weighs. */
+const entrySize = (e: PresenceEntryRaw): number => e.state.length + e.clientId.length + principalSize(e.principal) + 64;
 
 /** The view of a topic: a map of the entries by client instance that knows the octets that it holds. */
 class View {
   private readonly m = new Map<string, PresenceEntryRaw>();
+  /** What each entry cost when it was put (`entrySize`), so that the bytes that the view holds are taken out as they were put in. */
+  private readonly sizes = new Map<string, number>();
   bytes = 0;
+
+  /** The octets that the entry of the client instance weighs in the view; 0 for none. */
+  sizeOf(id: string): number {
+    return this.sizes.get(id) ?? 0;
+  }
 
   get size(): number {
     return this.m.size;
@@ -117,16 +170,16 @@ class View {
     return this.m.has(id);
   }
   set(id: string, e: PresenceEntryRaw): void {
-    const old = this.m.get(id);
-    if (old !== undefined) this.bytes -= entrySize(old);
+    this.bytes -= this.sizeOf(id);
+    const size = entrySize(e);
     this.m.set(id, e);
-    this.bytes += entrySize(e);
+    this.sizes.set(id, size);
+    this.bytes += size;
   }
   delete(id: string): boolean {
-    const old = this.m.get(id);
-    if (old === undefined) return false;
-    this.m.delete(id);
-    this.bytes -= entrySize(old);
+    if (!this.m.delete(id)) return false;
+    this.bytes -= this.sizeOf(id);
+    this.sizes.delete(id);
     return true;
   }
   values(): IterableIterator<PresenceEntryRaw> {
@@ -481,7 +534,10 @@ export abstract class PresenceLayer extends SessionLayer {
         await this.run(() => {
           if (t.op === "join") t.op = undefined;
           if (t.closed) {
-            if (t.leaveWhenJoined && this.sessionId() === sid) this.sendLeave(t, sid); // N4: the last tab left while the join was under way
+            // N4: the last tab left while the join was under way, and the answer finds the topic left. V23 MUST-3, 09 [READ-74]: unless a tab joined it again meanwhile (the topic that the engine keeps now is
+            // another one, and "The engine MUST NOT leave a topic while any of its tabs is still in it"): the membership that this join made is the session's, and the live topic uses it
+            const live = this.topics.get(keyOf(t.keyspaceId, t.topic));
+            if (t.leaveWhenJoined && this.sessionId() === sid && (live === undefined || live.closed)) this.sendLeave(t, sid);
             return;
           }
           t.failures = 0;
@@ -703,7 +759,7 @@ export abstract class PresenceLayer extends SessionLayer {
   private admits(view: View, raw: PresenceEntryRaw): boolean {
     const have = view.get(raw.clientId);
     if (have === undefined && view.size >= this.viewCap()) return false;
-    return view.bytes - (have === undefined ? 0 : entrySize(have)) + entrySize(raw) <= MAX_VIEW_BYTES;
+    return view.bytes - view.sizeOf(raw.clientId) + entrySize(raw) <= MAX_VIEW_BYTES;
   }
 
   private entryOf(e: PresenceEntry, t: Topic, now: number): PresenceEntryRaw | undefined {
@@ -719,6 +775,15 @@ export abstract class PresenceLayer extends SessionLayer {
           detail: e.state.length > this.limits.maxPresenceStateBytes ? `an entry of ${e.state.length} octets, over max_presence_state_bytes (${this.limits.maxPresenceStateBytes}, 09 [READ-74]); it is not kept` : `a client id of ${e.clientId.length} characters (03 [ID-35]); the entry is not kept`,
           keyspaces: [t.keyspaceId],
         });
+      }
+      return undefined;
+    }
+    // V23 MUST-2, 16 [SEC-1]: nor is a principal that no token could carry: a `sub` of at most 255 bytes (10 [AUTH-8]), an actor chain of at most 16 entries of at most 255 octets ([AUTH-13]), a device id of at most 255 ([AUTH-26])
+    const bad = principalProblem(e.principal);
+    if (bad !== undefined) {
+      if (!t.droppedReported) {
+        t.droppedReported = true;
+        this.emit({ type: "protocol-error", what: "PresenceFrame", detail: `an entry with ${bad}; it is not kept`, keyspaces: [t.keyspaceId] });
       }
       return undefined;
     }

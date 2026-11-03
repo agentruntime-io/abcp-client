@@ -40,6 +40,11 @@ export interface MemoryStorageOptions {
   mode?: StorageMode;
   /** Whether `requestPersistence` is granted; default false. */
   grantPersistence?: boolean;
+  /**
+   * Whether `log` keeps every commit; default true. A storage that wraps this one for a durable store (the file storage) keeps none: the log would hold, in memory and for the life of the
+   * process, the values that an erasure replaced (14 [CLI-76]).
+   */
+  keepLog?: boolean;
 }
 
 export class MemoryStorage implements OutboxStorage {
@@ -227,7 +232,7 @@ export class MemoryStorage implements OutboxStorage {
     this.drafts = drafts;
     this.replicas = replicas;
     this.meta = meta;
-    this.log.push(ops.map((x) => structuredClone(x)));
+    if (this.options.keepLog !== false) this.log.push(ops.map((x) => structuredClone(x)));
     return Promise.resolve();
   }
 

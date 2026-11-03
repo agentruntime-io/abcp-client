@@ -128,6 +128,7 @@ import {
   ErrorClass,
   KeyChangeSchema,
   KeyEntrySchema,
+  KeyRedactionSchema,
   KeyspaceCursorSchema,
   KeyspaceLifecycle,
   Lane,
@@ -155,7 +156,7 @@ import {
   type SuccessorRule,
 } from "../gen/abpc/v2/types_pb.js";
 import { checkWellFormed } from "../rules/crdt/index.js";
-import { applyRecord, installEntry, ReplicaState, StateNull, StateValue, VersionTopology, isReservedKey, type Rule } from "../rules/fold/index.js";
+import { applyRecord, installEntry, ReplicaState, StateNull, StateRedacted, StateValue, VersionTopology, isReservedKey, type Rule } from "../rules/fold/index.js";
 import { compareUtf8, toHex } from "../rules/bytes.js";
 import { sha256 } from "../rules/crypto.js";
 import { setHashProvider } from "../rules/crypto.js";
@@ -166,6 +167,7 @@ import { FakePresence, type FakePresenceOptions } from "./presence.js";
 import { appliedIndexes, planCrdt } from "../engine/crdt-view.js";
 import { matchSuccessor } from "../engine/successors.js";
 import { encodeContent } from "../engine/entry.js";
+import { jsonBytes } from "../engine/changes.js";
 import { RpcError, type RpcStatus } from "../engine/errors.js";
 import type { Clock } from "../engine/clock.js";
 import type { StaticManifests } from "../engine/manifests.js";
@@ -348,6 +350,8 @@ class FakeKeyspace {
   lastWriter = new Map<string, string>();
   /** Intents that are registered and not decided. */
   pending = new Map<string, PendingIntent>();
+  /** The erasure ledger's redactions of the keyspace (12 §12.7.5), listed in a load that answers a resume check (09 [READ-100]). */
+  redactions: { epoch: number; seq: bigint; keys: string[] }[] = [];
 
   constructor(
     readonly id: string,
@@ -459,6 +463,41 @@ function resultOf(id: string, o: MutationResult["outcome"], extra: { duplicate?:
 const rejectedResult = (id: string, r: Reject, duplicate = false): MutationResult => resultOf(id, { case: "rejected", value: r }, { duplicate });
 const retryResult = (id: string, reason: RetryReason, afterMs = 1000, intentSeq = 0n): MutationResult =>
   resultOf(id, { case: "retry", value: create(RetrySchema, { reason, afterMs }) }, { intentSeq });
+
+/**
+ * 12 [ADM-65]: a run key's value with the changes of erased keys in its start document blanked (`steps[].changes` and `steps[].compensate`, proto3 JSON `KeyChange`s): a change that holds a
+ * member other than `key`, `kind` and `seenVersion` becomes `{key, kind, seenVersion, redacted: true}`. Undefined when nothing is blanked.
+ */
+function blankStartDocument(value: Uint8Array, erased: ReadonlySet<string>): Uint8Array | undefined {
+  let doc: unknown;
+  try {
+    doc = JSON.parse(new TextDecoder().decode(value));
+  } catch {
+    return undefined;
+  }
+  if (typeof doc !== "object" || doc === null || Array.isArray(doc)) return undefined;
+  const steps = (doc as { steps?: unknown }).steps;
+  if (!Array.isArray(steps)) return undefined;
+  let changed = false;
+  const dflt = (v: unknown): boolean => v === "" || v === 0 || v === "0" || v === false || v === null;
+  for (const step of steps) {
+    if (typeof step !== "object" || step === null) continue;
+    const s = step as Record<string, unknown>;
+    for (const field of ["changes", "compensate"]) {
+      const list = s[field];
+      if (!Array.isArray(list)) continue;
+      s[field] = list.map((c: unknown) => {
+        if (typeof c !== "object" || c === null) return c;
+        const ch = c as Record<string, unknown>;
+        if (typeof ch["key"] !== "string" || !erased.has(ch["key"]) || ch["redacted"] === true) return c;
+        if (!Object.entries(ch).some(([m, v]) => m !== "key" && m !== "kind" && m !== "seenVersion" && !dflt(v))) return c;
+        changed = true;
+        return { key: ch["key"], ...(ch["kind"] !== undefined ? { kind: ch["kind"] } : {}), ...(ch["seenVersion"] !== undefined ? { seenVersion: ch["seenVersion"] } : {}), redacted: true };
+      });
+    }
+  }
+  return changed ? jsonBytes(doc) : undefined;
+}
 
 /** 07 [MUT-7]: the order of `LaneWatermark`s, by `keyspace_id` compared in bytes and then by `lane` (SEQUENCED, then GATED). */
 function compareWatermarks(a: { keyspaceId: string; lane: number }, b: { keyspaceId: string; lane: number }): number {
@@ -716,9 +755,11 @@ export class FakeServer {
   }
 
   /** A write by another principal, committed at once as an OP record (a remote edit that the client under test sees on its stream). */
-  write(id: string, changes: KeyChange[], opts: { sub?: string; opType?: string; mutationId?: string; overwroteNewer?: number[] } = {}): bigint {
+  write(id: string, changes: KeyChange[], opts: { sub?: string; opType?: string; mutationId?: string; overwroteNewer?: number[]; previous?: KeyEntry[]; blobRefs?: string[] } = {}): bigint {
     const k = this.ks(id);
     const rec = this.record(k, RecordKind.OP, { principal: this.principal(opts.sub ?? "other"), mutationId: opts.mutationId ?? `other-${++this.principalCounter}`, opType: opts.opType ?? "op", changes, overwroteNewer: opts.overwroteNewer ?? [] });
+    if (opts.previous !== undefined) rec.previous = opts.previous; // an override-only action's `previous` entries (06 [LOG-21])
+    if (opts.blobRefs !== undefined) rec.blobRefs = opts.blobRefs; // 06 [LOG-90]
     this.commit(k, rec);
     return rec.seq;
   }
@@ -864,6 +905,91 @@ export class FakeServer {
     // 07 [MUT-84], [MUT-87]: a record at or below the prune floor is older than the horizon, so an action whose base is below it gets OFFLINE_TOO_LONG;
     // a test that prunes young records for the sake of RESUME_TOO_OLD says so with `judgeHorizon: false`
     k.pruned = opts.judgeHorizon !== false;
+  }
+
+  /**
+   * A redaction of keys of this keyspace (12 [ADM-62] to [ADM-66], 06 [LOG-44], [LOG-76]), as a client sees it. The named keys that are not `refused` (a legal floor, 12 [ADM-63]) are the erased keys:
+   *
+   *  - every earlier change of an erased key, in every record that the keyspace keeps, is blanked (06 [LOG-76]): its value fields cleared and the encoding `redacted/v1` (a `DELETE` stays), and
+   *    so is each `previous` entry of it; and the earlier changes that set a run key whose start document the redaction blanks (12 [ADM-65]);
+   *  - one `REDACTED` record is appended (06 [LOG-44]): its `keys` are the erased keys that held a value in the timeline (present, tombstoned, or changed with a value in a record), its
+   *    `erased_keys` the others, its `min_seq` the first record that held a value of one, its `refused_keys` the refused ones; its changes are the `DELETE`s of the keys that were present and the
+   *    server-written `SET` of each run key (`abpc.saga.v1/run/{id}`) whose start document holds a change of an erased key, with that change blanked (`{"key", "kind", "seenVersion", "redacted": true}`);
+   *  - the ledger lists each erased key with the record's seq, for the load that answers a resume check (09 [READ-100]); a CRDT key's document is discarded (05 [STATE-78]).
+   *
+   * Not modelled: the closing of pending intents that request an erased key (12 [ADM-64]), the blobs (12 [ADM-103]; `blobs.deleteBlob` and `BLOB_DELETED` records are a test's own), the reach through
+   * former paths, moves and splits, the checkpoints, and the grants. Returns the seq of the `REDACTED` record, or the head when nothing in the keyspace needed a record.
+   */
+  redact(id: string, named: readonly string[], opts: { refused?: readonly string[] } = {}): bigint {
+    const k = this.ks(id);
+    const refused = [...new Set(opts.refused ?? [])].sort(compareUtf8);
+    const erased = [...new Set(named)].filter((x) => !refused.includes(x)).sort(compareUtf8);
+    const erasedSet = new Set(erased);
+    const blankedAlready = (c: KeyChange): boolean => c.encoding === "redacted/v1" && c.value.length === 0 && !c.isNull && c.delta === 0n && c.update.length === 0;
+    const holdsValue = (c: KeyChange): boolean => c.kind !== ChangeKind.DELETE && !blankedAlready(c);
+    const held = (key: string): boolean => k.state.key(key) !== undefined || k.state.tombstone(key) !== undefined || k.log.some((r) => r.changes.some((c) => c.key === key && holdsValue(c)));
+    const redacted = erased.filter(held);
+    const others = erased.filter((x) => !redacted.includes(x));
+    let minSeq = 0n;
+    for (const r of k.log) {
+      if (r.changes.some((c) => erasedSet.has(c.key) && holdsValue(c))) {
+        minSeq = r.seq;
+        break;
+      }
+    }
+    // 12 [ADM-65]: the run keys whose start document holds a change of an erased key get a server-written SET with the change blanked
+    const runSets: KeyChange[] = [];
+    for (const key of k.state.keyNames()) {
+      const row = k.state.key(key);
+      if (row === undefined || row.state !== StateValue || !/^abpc\.saga\.v1\/run\/[^/]+$/.test(key)) continue;
+      const next = blankStartDocument(row.value, erasedSet);
+      if (next !== undefined) runSets.push(create(KeyChangeSchema, { key, kind: ChangeKind.SET, value: next, encoding: "json/v1", seenVersion: row.version }));
+    }
+    const runKeys = new Set(runSets.map((c) => c.key));
+    const deletes = redacted.flatMap((key) => {
+      const row = k.state.key(key);
+      return row === undefined ? [] : [create(KeyChangeSchema, { key, kind: ChangeKind.DELETE, seenVersion: row.version })];
+    });
+    // 06 [LOG-76]: the earlier records, replaced by their blanked copies (what a session has been sent is not changed)
+    const blank = (c: KeyChange): KeyChange => create(KeyChangeSchema, { key: c.key, kind: c.kind, seenVersion: c.seenVersion, encoding: c.kind === ChangeKind.DELETE ? "" : "redacted/v1" });
+    k.log = k.log.map((r) => {
+      const changed = r.changes.some((c) => (erasedSet.has(c.key) || (runKeys.has(c.key) && c.kind === ChangeKind.SET)) && (c.kind === ChangeKind.DELETE ? false : !blankedAlready(c)));
+      const prevChanged = r.previous.some((p) => erasedSet.has(p.key));
+      if (!changed && !prevChanged) return r;
+      return create(RecordSchema, {
+        ...r,
+        changes: r.changes.map((c) => ((erasedSet.has(c.key) || (runKeys.has(c.key) && c.kind === ChangeKind.SET)) && c.kind !== ChangeKind.DELETE && !blankedAlready(c) ? blank(c) : c)),
+        previous: r.previous.map((p) => (erasedSet.has(p.key) ? create(KeyEntrySchema, { key: p.key, version: p.version, ...(p.changedAt !== undefined ? { changedAt: p.changedAt } : {}), encoding: "redacted/v1" }) : p)),
+      });
+    });
+    if (redacted.length === 0 && others.length === 0 && runSets.length === 0) {
+      k.redactions.push({ epoch: k.epoch, seq: k.head, keys: erased });
+      return k.head;
+    }
+    const body: Record<string, unknown> = { redaction_id: `redaction-${++this.principalCounter}`, keys: redacted, min_seq: Number(minSeq) };
+    if (others.length > 0) body["erased_keys"] = others;
+    if (refused.length > 0) body["refused_keys"] = refused;
+    const rec = this.record(k, RecordKind.SYSTEM, {
+      principal: this.principal("system"),
+      system: create(SystemEventSchema, { kind: SystemKind.REDACTED, mustUnderstand: true, body: jsonBytes(body), encoding: "json/v1" }),
+      changes: [...deletes, ...runSets],
+    });
+    this.commit(k, rec);
+    for (const key of erased) k.ydocs.delete(key);
+    k.redactions.push({ epoch: k.epoch, seq: rec.seq, keys: erased });
+    return rec.seq;
+  }
+
+  /** The redactions of the erasure ledger that a load answering a resume check lists (09 [READ-100]): the ones newer than the cursor, in increasing (epoch, seq) and then key order. */
+  private redactionsSince(k: FakeKeyspace, cur: KeyspaceCursor | undefined): ReturnType<typeof create<typeof KeyRedactionSchema>>[] {
+    const after = cur?.afterSeq ?? 0n;
+    const epoch = cur?.logEpoch ?? 0;
+    const out: ReturnType<typeof create<typeof KeyRedactionSchema>>[] = [];
+    for (const r of [...k.redactions].sort((a, b) => a.epoch - b.epoch || (a.seq < b.seq ? -1 : a.seq > b.seq ? 1 : 0))) {
+      if (!((r.epoch === epoch && r.seq > after) || r.epoch > epoch)) continue;
+      for (const key of [...r.keys].sort(compareUtf8)) out.push(create(KeyRedactionSchema, { key, redactionSeq: r.seq, logEpoch: r.epoch }));
+    }
+    return out;
   }
 
   /** Removes the keyspace from every session's follows without a frame: a following keyspace that heartbeats no longer list (09 [READ-54]). */
@@ -1297,7 +1423,8 @@ export class FakeServer {
           version: row.version,
           changedAt: timestampFromMs(Number(row.changedAt.seconds) * 1000 + Math.floor(row.changedAt.nanos / 1e6)),
           changedBy: row.changedBy,
-          crdtCoveredSeq: crdt ? row.version : 0n,
+          crdtCoveredSeq: crdt || (row.state === StateRedacted && row.rule === "crdt") ? row.version : 0n,
+          redacted: row.state === StateRedacted, // 05 [STATE-82]: a key in the redacted state, in a load below the `REDACTED` record (09 [READ-13])
         }),
       );
     }
@@ -1381,7 +1508,9 @@ export class FakeServer {
       token = `page-${this.nextToken++}`;
       this.loads.set(token, { entries: all, offset: size, checkpoint: k.head, epoch: k.epoch, manifestVersion: k.manifestVersion });
     }
-    return create(LoadStateResponse_, { ...base, checkpointSeq: k.head, entries: first, nextPageToken: token, resumed: false, laneWatermarks: wms, skippedUnsupported: this.skippedUnsupported });
+    // 09 [READ-100]: the cold load that answers a resume check (`after_seq > 0`) carries the redactions newer than the cursor, once, on its first page
+    const redactions = afterSeq > 0n ? this.redactionsSince(k, cur) : [];
+    return create(LoadStateResponse_, { ...base, checkpointSeq: k.head, entries: first, nextPageToken: token, resumed: false, laneWatermarks: wms, skippedUnsupported: this.skippedUnsupported, redactions });
   }
 
   // -- Subscribe (09 §9.4 to §9.7) --

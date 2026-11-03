@@ -15,12 +15,14 @@
 
 import { ChangeKind, KeyspaceLifecycle, type KeyEntry, type Record as RecordMessage } from "../gen/abpc/v2/types_pb.js";
 import type { LoadStateResponse } from "../gen/abpc/v2/sync_pb.js";
-import { applyRecord, FoldError, installEntry, isReservedKey, ReplicaState, VersionTopology, type Anomaly } from "../rules/fold/index.js";
+import { applyRecord, FoldError, installEntry, isReservedKey, ReplicaState, StateValue, VersionTopology, type Anomaly } from "../rules/fold/index.js";
 import { isSegment } from "../rules/fold/template.js";
-import { EndingLayer } from "./endings.js";
+import { ErasureLayer } from "./erasure.js";
 import { planCrdt, appliedIndexes, type CrdtPlanItem } from "./crdt-view.js";
 import { Follow } from "./follow.js";
-import type { ReplicaHead, ReplicaImage } from "./storage.js";
+import { erasePage, eraseRecord, type ImageErasure, type Use } from "./erase.js";
+import type { PendingErasure } from "./erasure.js";
+import type { ReplicaHead, ReplicaImage, StorageOp } from "./storage.js";
 
 /** Whether the key is under one of the interest prefixes (09 [READ-22]): equal to it, or below it. An empty interest is the whole keyspace. */
 export function inInterest(interest: readonly string[], key: string): boolean {
@@ -58,7 +60,7 @@ function appliedKeys(rec: RecordMessage): string[] {
   return out;
 }
 
-export abstract class ReplicaStoreLayer extends EndingLayer {
+export abstract class ReplicaStoreLayer extends ErasureLayer {
   /** Whether the engine keeps the persisted replica (§14.10). */
   protected persistReplica = true;
   /** The most records that a persisted tail may hold at a restart: a longer one is dropped and the keyspace is loaded again. */
@@ -94,9 +96,9 @@ export abstract class ReplicaStoreLayer extends EndingLayer {
   /**
    * Applies a record to the keyspace's confirmed state and its CRDT documents: the delivery watermark's jump over records that the
    * client does not hold (09 [READ-42]), the fold (14 [CLI-4]), the interest filter (14 [CLI-71]) and the confirmed documents (14 [CLI-13]).
-   * Live delivery and the replay of a persisted tail both do exactly this. Throws the fold's `FoldError`; the state is then as it was.
+   * Live delivery and the replay of a persisted tail both do exactly this. Throws the fold's `FoldError`; the state is then as it was. `keepCrdt`: see `CrdtStore.reconcile`.
    */
-  protected foldRecord(f: Follow, rec: RecordMessage): { plan: CrdtPlanItem[]; anomalies: Anomaly[] } {
+  protected foldRecord(f: Follow, rec: RecordMessage, keepCrdt?: ReadonlySet<string>): { plan: CrdtPlanItem[]; anomalies: Anomaly[] } {
     const st = f.state;
     // 09 [READ-42]: every record touches the interest; a watermark that passes seqs the client does not hold says they do not
     if (rec.seq > st.seq + 1n) st.setCursor(rec.seq - 1n, f.logEpoch, st.manifestVersion);
@@ -114,7 +116,7 @@ export abstract class ReplicaStoreLayer extends EndingLayer {
     }
     // the confirmed documents of the CRDT keys that the record changed (14 [CLI-13])
     f.crdt.apply(plan);
-    f.crdt.reconcile(st);
+    f.crdt.reconcile(st, keepCrdt); // the CRDT keys that a `REDACTED` record erases and that hold a view document keep it, for the reset (14 [CLI-13], [CLI-76])
     for (const c of rec.changes) if (c.key.startsWith("abpc.saga.v1/")) this.sagaKeyChanged(f, c.key); // the sagas that the client follows (14 [CLI-14], `sagas.ts`)
     this.blobDeletedRecord(f, rec); // 14 [CLI-76]: a `BLOB_DELETED` record drops the cached bytes of its blob
     return { plan, anomalies };
@@ -161,23 +163,102 @@ export abstract class ReplicaStoreLayer extends EndingLayer {
     };
   }
 
-  /** A load installed confirmed state: the image of the keyspace is now the pages of the load (14 [CLI-2]). */
+  /**
+   * A load installed confirmed state: the image of the keyspace is now the pages of the load (14 [CLI-2]). What the load erased (14 [CLI-76]: a mark, a listed redaction) is made
+   * durable in the same transaction, which is the one that moves the persisted cursor to the load's `checkpoint_seq`.
+   */
   protected async persistBegin(f: Follow, pages: readonly LoadStateResponse[]): Promise<void> {
-    if (!this.persistReplica || this.role !== "flusher") return;
+    const er = f.erasure;
+    f.erasure = undefined;
+    if (!this.persistReplica || this.role !== "flusher") {
+      if (er !== undefined) await this.erasureOnly(f, er);
+      return;
+    }
     const first = pages[0] as LoadStateResponse;
     const entries: KeyEntry[] = [];
     for (const p of pages) for (const e of p.entries) entries.push(e);
+    const begin: StorageOp = { op: "replicaBegin", keyspaceId: f.id, head: this.headOf(f), base: { manifestVersion: first.manifestVersion, logEpoch: first.logEpoch, checkpointSeq: first.checkpointSeq, entries } };
     try {
-      await this.tx([{ op: "replicaBegin", keyspaceId: f.id, head: this.headOf(f), base: { manifestVersion: first.manifestVersion, logEpoch: first.logEpoch, checkpointSeq: first.checkpointSeq, entries } }]);
+      if (er !== undefined) await this.erasureTx(f, er, [begin]);
+      else await this.tx([begin]);
       f.image = { ok: true, seqs: new Set(), headMs: this.serverNow() };
       this.touchPersisted();
     } catch (e) {
       this.imageFailed(f, e);
+      if (er !== undefined) this.retryErasure(f, er);
     }
+    if (er !== undefined) await this.judgeBlobs(f, er);
   }
 
-  /** Records were applied: they join the image's tail with the new head, in one local transaction ([CLI-2]). */
+  /** The erasure of a keyspace whose image is not kept: the entries and drafts that it replaced (14 [CLI-76]). */
+  private async erasureOnly(f: Follow, er: PendingErasure): Promise<void> {
+    if (this.role === "flusher") {
+      try {
+        await this.erasureTx(f, er, []);
+      } catch (e) {
+        this.noteInternalError(e);
+        this.retryErasure(f, er);
+      }
+    }
+    await this.judgeBlobs(f, er);
+  }
+
+  /** The redactions as the rewrite of an image reads them: each erases the changes below its record, but the value that a key still holds (a former path that is present again, 06 [LOG-44]). */
+  private imageSpecs(f: Follow, er: PendingErasure): ImageErasure[] {
+    const keeps = (k: string, seq: bigint): boolean => {
+      const row = f.state.key(k);
+      return row !== undefined && row.state === StateValue && row.version === seq;
+    };
+    return er.redactions.map((r) => ({ keys: r.keys, runKeys: r.runKeys, blankedIntents: r.blankedIntents, ...(r.seq !== undefined ? { below: r.seq } : {}), keeps }));
+  }
+
+  /** The image of a keyspace as the storage holds it, or undefined. */
+  protected async readImage(keyspaceId: string): Promise<ReplicaImage | undefined> {
+    if (this.storage.loadImage !== undefined) return this.storage.loadImage(keyspaceId);
+    return (await this.storage.load()).replicas.find((r) => r.keyspaceId === keyspaceId);
+  }
+
+  /**
+   * The persisted image of a keyspace with the values of the erased keys taken out (14 [CLI-76], [CLI-2]): the pages that hold them are entries in the redacted state, the records that
+   * changed them hold blanked changes and `previous` entries (06 [LOG-76]); a restart folds them to the state that the unblanked ones gave. Returns the operations that replace the image,
+   * with the records of `fresh` that are not in it yet; what the images held of values and of blobs is told to `er`.
+   */
+  private erasedImageOps(f: Follow, img: ReplicaImage, fresh: readonly RecordMessage[], er: PendingErasure): StorageOp[] {
+    const specs = this.imageSpecs(f, er);
+    const note = (u: Use): void => {
+      if (u.erasedAny) {
+        for (const id of u.blobRefs) er.refsErased.add(id);
+        for (const b of u.erased) er.erased.push(b);
+      }
+      if (u.otherAny) {
+        for (const id of u.blobRefs) er.refsOther.add(id);
+        for (const b of u.other) er.other.push(b);
+      }
+    };
+    for (const e of img.base.entries) {
+      if (e.value.length > 0 && erasePage(e, specs) !== undefined) er.erased.push(e.value);
+    }
+    const entries = img.base.entries.map((e) => erasePage(e, specs) ?? e);
+    const records = [...img.tail, ...fresh].map((r) => eraseRecord(r, specs, note) ?? r);
+    const head = this.headOf(f);
+    return [
+      { op: "replicaBegin", keyspaceId: f.id, head, base: { ...img.base, entries } },
+      { op: "replicaAppend", keyspaceId: f.id, head, records },
+    ];
+  }
+
+  /**
+   * Records were applied: they join the image's tail with the new head, in one local transaction ([CLI-2]). When they carried a redaction (14 [CLI-76]), the same transaction
+   * replaces the image with one that holds no value of the erased keys and the other copies that the redaction reached: the persisted cursor never passes a `REDACTED` record whose
+   * purge is not done.
+   */
   protected async persistRecords(f: Follow, recs: readonly RecordMessage[]): Promise<void> {
+    const er = f.erasure;
+    if (er !== undefined) {
+      f.erasure = undefined;
+      await this.persistRecordsErasing(f, recs, er);
+      return;
+    }
     if (!this.persistReplica || this.role !== "flusher" || !f.image.ok) return;
     const fresh = recs.filter((r) => !f.image.seqs.has(r.seq));
     const head = this.headOf(f);
@@ -197,6 +278,38 @@ export abstract class ReplicaStoreLayer extends EndingLayer {
     }
   }
 
+  private async persistRecordsErasing(f: Follow, recs: readonly RecordMessage[], er: PendingErasure): Promise<void> {
+    if (!this.persistReplica || this.role !== "flusher") {
+      await this.erasureOnly(f, er);
+      return;
+    }
+    const fresh = recs.filter((r) => !f.image.seqs.has(r.seq));
+    const extra: StorageOp[] = [];
+    let following = f.image.ok;
+    try {
+      const img = await this.readImage(f.id);
+      if (img === undefined) following = false; // none is stored: nothing of the replica to erase there, and the image that was followed is none
+      else if (following) extra.push(...this.erasedImageOps(f, img, fresh, er));
+      else extra.push({ op: "deleteReplica", keyspaceId: f.id }); // an image that does not follow the state is of no use, and what it holds of erased values goes
+    } catch (e) {
+      this.noteInternalError(e);
+      following = false;
+      extra.push({ op: "deleteReplica", keyspaceId: f.id });
+    }
+    try {
+      await this.erasureTx(f, er, extra);
+      if (following) {
+        for (const r of fresh) f.image.seqs.add(r.seq);
+        f.image.headMs = this.serverNow();
+      } else f.image = { ok: false, seqs: new Set(), headMs: 0 };
+      this.touchPersisted();
+    } catch (e) {
+      this.imageFailed(f, e);
+      this.retryErasure(f, er);
+    }
+    await this.judgeBlobs(f, er);
+  }
+
   /** The head moved with no record (a delivery watermark, the time of a sync): written at most once in `everyMs`, unless `force`. */
   protected async persistHead(f: Follow, everyMs = 30_000, force = false): Promise<void> {
     if (!this.persistReplica || this.role !== "flusher" || !f.image.ok) return;
@@ -210,16 +323,30 @@ export abstract class ReplicaStoreLayer extends EndingLayer {
     }
   }
 
-  /** The entries of a widening load join the pages of the image (14 [CLI-72]). */
+  /** The entries of a widening load join the pages of the image (14 [CLI-72]); what the load erased (14 [CLI-76]) is made durable with them. */
   protected async persistExtend(f: Follow, entries: readonly KeyEntry[]): Promise<void> {
-    if (!this.persistReplica || this.role !== "flusher" || !f.image.ok) return;
+    const er = f.erasure;
+    f.erasure = undefined;
+    if (!this.persistReplica || this.role !== "flusher" || !f.image.ok) {
+      if (er !== undefined) await this.erasureOnly(f, er);
+      return;
+    }
     try {
-      await this.tx([{ op: "replicaExtend", keyspaceId: f.id, head: this.headOf(f), entries: [...entries] }]);
+      const extra: StorageOp[] = [];
+      if (er !== undefined) {
+        const img = await this.readImage(f.id);
+        if (img !== undefined) extra.push(...this.erasedImageOps(f, img, [], er));
+      }
+      extra.push({ op: "replicaExtend", keyspaceId: f.id, head: this.headOf(f), entries: [...entries] });
+      if (er !== undefined) await this.erasureTx(f, er, extra);
+      else await this.tx(extra);
       f.image.headMs = this.serverNow();
       this.touchPersisted();
     } catch (e) {
       this.imageFailed(f, e);
+      if (er !== undefined) this.retryErasure(f, er);
     }
+    if (er !== undefined) await this.judgeBlobs(f, er);
   }
 
   /** The image no longer follows the state: it is dropped, so that a restart loads the keyspace instead of restoring a state that is behind. */
@@ -297,7 +424,7 @@ export abstract class ReplicaStoreLayer extends EndingLayer {
    * `checkpoint_seq`: the stream has kept those since, so they are not installed ("and nothing else", 09 [READ-28]), and no entry is installed
    * over a row, or a tombstone, that the state holds at a higher version (05 [STATE-38]'s guard): a widening never takes the state of a key back.
    */
-  protected installWidening(f: Follow, loaded: readonly KeyEntry[], manifestVersion: number): KeyEntry[] {
+  protected installWidening(f: Follow, loaded: readonly KeyEntry[], manifestVersion: number, keepCrdt?: ReadonlySet<string>): KeyEntry[] {
     const st = f.state;
     const entries = loaded.filter((e) => {
       if (inInterest(f.interest, e.key)) return false; // the old interest: the stream's, and newer than the load's checkpoint
@@ -325,7 +452,7 @@ export abstract class ReplicaStoreLayer extends EndingLayer {
       }
       f.crdt.setConfirmed(key, doc);
     }
-    f.crdt.reconcile(st);
+    f.crdt.reconcile(st, keepCrdt);
     return entries;
   }
 }

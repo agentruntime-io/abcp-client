@@ -6,6 +6,7 @@
 
 import { create } from "@bufbuild/protobuf";
 import { MutationSchema, type Mutation } from "../gen/abpc/v2/sync_pb.js";
+import { ChangeKind } from "../gen/abpc/v2/types_pb.js";
 import { CanonError, encode, unmarshal } from "../rules/canon/index.js";
 import type { OutboxEntry } from "./storage.js";
 
@@ -41,6 +42,8 @@ export interface DepView {
   opType: string;
   keys: readonly string[];
   mutation: Mutation;
+  /** The authoring order of the action in its outbox (`OutboxEntry.ordinal`): what a redaction reset of a CRDT key is judged by. */
+  ordinal?: number;
 }
 
 export interface DepContext {
@@ -48,6 +51,24 @@ export interface DepContext {
   barrier(opType: string): boolean;
   /** The owning key of a fenced key (11 §11.2.4), or undefined. */
   fencedBy(key: string): string | undefined;
+  /** The first ordinal authored after the redaction reset of a CRDT key (14 [CLI-13], [CLI-76]); 0 or absent for a key that no redaction reset. */
+  resetOrdinal?(key: string): number;
+}
+
+/** Whether the action updates the CRDT key (`CRDT_UPDATE`, or an `OVERRIDE` that carries an update). */
+function updatesCrdt(m: Mutation, key: string): boolean {
+  return m.changes.some((c) => c.key === key && (c.kind === ChangeKind.CRDT_UPDATE || (c.kind === ChangeKind.OVERRIDE && c.update.length > 0)));
+}
+
+/**
+ * The exception of item 1 for a CRDT key that a redaction reset (14 [CLI-13], [CLI-76]): "no later action depends on [the pending updates authored before the reset] through that key".
+ * An update of the key that the later action B authored after the reset, and an update of it that the earlier action A authored before, are not dependent on each other through the key: B
+ * typed on the reset document, and A, which the server ends with `STALE{DOC_RESET}` (05 [STATE-85]), must not fail B with it.
+ */
+function afterReset(key: string, a: DepView, b: DepView, ctx: DepContext): boolean {
+  const r = ctx.resetOrdinal?.(key) ?? 0;
+  if (r <= 0 || a.ordinal === undefined || b.ordinal === undefined) return false;
+  return a.ordinal < r && b.ordinal >= r && updatesCrdt(a.mutation, key) && updatesCrdt(b.mutation, key);
 }
 
 function related(a: string, b: string): boolean {
@@ -58,14 +79,16 @@ function related(a: string, b: string): boolean {
  * Whether the later action B depends on the earlier action A of the same keyspace and outbox (14 [CLI-30]). `explicit` is the set
  * of mutation ids that B was submitted with a link to (item 4, client-only).
  *
- * TODO(14 [CLI-13], [CLI-76]): the exception of item 1 for a CRDT key whose redaction reset the client applied after it authored
- * A (B's update of that key does not depend on A's update of it) comes with the redaction reset, a later milestone (R2).
+ * The exception of item 1 for a CRDT key whose redaction reset the client applied after it authored A (B's update of that key does not depend on A's update of it,
+ * 14 [CLI-13], [CLI-76]) is `afterReset`.
  */
 export function dependsOn(b: DepView, a: DepView, explicit: ReadonlySet<string>, ctx: DepContext): boolean {
   // 1. the same key, or a key below a key that the other writes (parents and entity markers)
   for (const kb of b.keys) {
     for (const ka of a.keys) {
-      if (related(kb, ka)) return true;
+      if (!related(kb, ka)) continue;
+      if (kb === ka && afterReset(kb, a, b, ctx)) continue;
+      return true;
     }
   }
   // 2. a precondition on a key A writes, on a prefix of a key A writes, or after A's mutation id; 3. on A's intent row

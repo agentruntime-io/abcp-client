@@ -107,6 +107,17 @@ export interface HeldContent {
   authoredIn?: string;
 }
 
+/**
+ * The stash lists the blob and cannot give its bytes (a damaged file or row, `BlobStash.get` answers nothing): the engine holds none of it (09 [READ-94], V23 SHOULD-3). It is `BLOB_MISSING` to
+ * the call that asked for the upload, and the repair of an action counts the blob as lacking, so that the hold for lost bytes starts (14 [CLI-44], [CLI-45]) instead of the action being sent
+ * again for ever.
+ */
+class NoStagedBytes extends BlobError {
+  constructor(blobId: string) {
+    super("BLOB_MISSING", `the engine holds no bytes of the blob ${blobId} to upload (09 [READ-94])`);
+  }
+}
+
 /** A transfer that took longer than the engine allows it (`EngineConfig.blobs.transferTimeoutMs`): counted as a failed attempt. */
 class TransferTimeout extends Error {
   constructor(readonly ms: number) {
@@ -490,7 +501,7 @@ export abstract class BlobLayer extends PresenceLayer {
   /** The rounds of the upload of one staged blob (see the SPEC-QUESTION in the header). */
   private async uploadStaged(keyspaceId: string, blobId: string, o: CallOptions | undefined): Promise<void> {
     const staged = await this.blobStash.get(keyspaceId, blobId);
-    if (staged === undefined) throw new BlobError("BLOB_MISSING", `the engine holds no bytes of the blob ${blobId} to upload (09 [READ-94])`);
+    if (staged === undefined) throw new NoStagedBytes(blobId);
     let last = "";
     for (let round = 0; round < MAX_UPLOAD_ROUNDS; round++) {
       this.check(o);
@@ -582,14 +593,19 @@ export abstract class BlobLayer extends PresenceLayer {
       let held = false;
       for (const ks of this.stashKeyspaces(e)) {
         if (!(await this.blobStash.has(ks, id))) continue;
-        held = true;
-        if (skipCommitted && this.committed.has(this.blobKey(ks, id))) break;
-        uploaded++;
+        if (skipCommitted && this.committed.has(this.blobKey(ks, id))) {
+          held = true;
+          break;
+        }
         try {
           await this.shareUpload(ks, id, true);
-        } catch {
+        } catch (err) {
+          // V23 SHOULD-3: a listed entry that gives no bytes is bytes that the engine does not hold; the next keyspace of the action may have them
+          if (err instanceof NoStagedBytes) continue;
           // the send meets BLOB_MISSING or BLOB_PENDING again; its backoff applies
         }
+        held = true;
+        uploaded++;
         break;
       }
       if (!held) lacking.push(id);
@@ -811,6 +827,39 @@ export abstract class BlobLayer extends PresenceLayer {
       this.cache.delete(f.id, id);
       this.committed.delete(this.blobKey(f.id, id));
     } else this.cache.dropKeyspace(f.id); // a body that names no blob: what the client cannot judge it drops (a download that is needed again is one call)
+  }
+
+  /** The blobs of the keyspace that the engine holds bytes of: the cache of downloads, the staged bytes, and the blobs that this run knows to be committed (14 [CLI-76], `erasure.ts`). */
+  protected async blobIdsHeld(keyspaceId: string): Promise<Set<string>> {
+    const out = new Set(this.cache.ids(keyspaceId));
+    for (const s of await this.blobStash.list()) if (s.keyspaceId === keyspaceId) out.add(s.blobId);
+    return out;
+  }
+
+  /**
+   * A redaction erased the only values that named these blobs (14 [CLI-76], `erasure.ts`): their cached bytes go, and so do the bytes that the engine staged for them, but those that a pending action
+   * names (the outbox, the locked entries of other principals): the user's new writes stay, with what they carry (09 [READ-94]). A dead-letter entry or an export-hook entry that names one
+   * keeps its place with its values erased, and no longer keeps the bytes. A stash that fails leaves its bytes, and the failure is recorded.
+   */
+  protected blobsErased(keyspaceId: string, ids: ReadonlySet<string>): void {
+    for (const id of ids) {
+      this.cache.delete(keyspaceId, id);
+      this.committed.delete(this.blobKey(keyspaceId, id));
+    }
+    this.detach(
+      (async () => {
+        const pending = new Set<string>();
+        for (const e of [...this.entries.values(), ...this.lockedEntries]) {
+          if (!this.stashKeyspaces(e).has(keyspaceId)) continue;
+          try {
+            for (const id of decodeContent(e.content).blobRefs) pending.add(id);
+          } catch (err) {
+            if (!(err instanceof CanonError)) throw err;
+          }
+        }
+        for (const id of ids) if (!pending.has(id)) await this.stashDelete(keyspaceId, id);
+      })().catch((e: unknown) => this.noteInternalError(e)),
+    );
   }
 
   /** A load with `resumed = false` installed confirmed state: it passed over the `BLOB_DELETED` records below its checkpoint, so the cache of the keyspace goes (14 [CLI-76]). */

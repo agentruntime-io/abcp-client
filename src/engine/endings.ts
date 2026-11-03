@@ -269,11 +269,20 @@ export abstract class EndingLayer extends EngineCore {
   // ---------------------------------------------------------------------------------------------------------------------
   // CRDT views of ended actions (14 [CLI-13])
 
-  /** The pending Yjs updates of a CRDT key, in outbox order, leaving out the given actions. */
+  /**
+   * The ordinal from which the pending updates of a CRDT key shape its view: a redaction reset (14 [CLI-13], [CLI-76]) takes the updates authored before it out of the view for good.
+   * Zero: every pending update is in it (`erasure.ts` overrides it).
+   */
+  protected crdtResetOrdinal(_keyspaceId: string, _key: string): number {
+    return 0;
+  }
+
+  /** The pending Yjs updates of a CRDT key, in outbox order, leaving out the given actions and those that a redaction reset took out of the view. */
   protected pendingUpdates(keyspaceId: string, key: string, exclude: ReadonlySet<string>): Uint8Array[] {
     const out: Uint8Array[] = [];
+    const from = this.crdtResetOrdinal(keyspaceId, key);
     for (const e of this.entriesOf(keyspaceId)) {
-      if (exclude.has(e.mutationId)) continue;
+      if (exclude.has(e.mutationId) || e.ordinal < from) continue;
       const m = this.content(e);
       if (m === undefined) continue;
       for (const c of m.changes) {

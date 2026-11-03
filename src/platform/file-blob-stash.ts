@@ -11,12 +11,14 @@
 // actions name), and which `destroy` removes with the partition; an app's own (`EngineConfig.blobs.stash`) goes before it, and is one partition's: two principals never share a stash.
 //
 // A file is written to its end and flushed to the disk before it is renamed into place, so that a power loss never leaves a name over bytes that were not written (the check of `get` would catch
-// them, but an upload of the bytes would then be lost for good).
+// them, but an upload of the bytes would then be lost for good); and the directory is flushed after the rename and after a removal, so that the name that the outbox relies on is on the disk too
+// (V23 SHOULD-4, 09 [READ-94]).
 
 import { createHash } from "node:crypto";
 import { access, mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
 import * as path from "node:path";
 import type { BlobStash, StagedBlob } from "../engine/blob-store.js";
+import { syncDirectory } from "./fsync.js";
 
 interface Facts {
   keyspaceId: string;
@@ -57,6 +59,7 @@ export class FileBlobStash implements BlobStash {
       await h.close();
     }
     await rename(tmp, file);
+    await syncDirectory(this.dir); // the name is on the disk too, not only the file (V23 SHOULD-4; `file-storage.ts` does the same for its snapshot)
   }
 
   async put(blob: StagedBlob): Promise<void> {
@@ -99,6 +102,7 @@ export class FileBlobStash implements BlobStash {
     const base = path.join(this.dir, this.name(keyspaceId, blobId));
     await rm(`${base}.json`, { force: true });
     await rm(`${base}.bin`, { force: true });
+    await syncDirectory(this.dir); // an erased blob does not come back with the name after a power loss
   }
 
   /**
@@ -108,6 +112,7 @@ export class FileBlobStash implements BlobStash {
   async clear(): Promise<void> {
     await this.init();
     for (const f of await readdir(this.dir)) if (OWN_FILE.test(f)) await rm(path.join(this.dir, f), { force: true });
+    await syncDirectory(this.dir);
   }
 
   async list(): Promise<{ keyspaceId: string; blobId: string; size: number; stagedAtMs: number }[]> {

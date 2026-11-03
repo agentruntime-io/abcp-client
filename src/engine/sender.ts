@@ -101,8 +101,12 @@ export abstract class SenderLayer extends ReactionLayer {
       // dependencies (14 [CLI-30]): on the earlier actions of the keyspace that are still in the outbox and not ended
       const explicit = new Set(options?.after ?? []);
       for (const x of explicit) if (!this.entries.has(x)) throw new LocalRefusal("REFUSED", `unknown action ${x} in the explicit links`);
-      const bView: DepView = { mutationId: id, opType: input.opType, keys: keysWritten(m), mutation: m };
-      const ctx = { barrier: (opType: string) => manifest.opType(opType)?.barrier ?? false, fencedBy: (key: string) => manifest.fencedBy(key) };
+      const bView: DepView = { mutationId: id, opType: input.opType, keys: keysWritten(m), mutation: m, ordinal: this.nextOrdinal };
+      const ctx = {
+        barrier: (opType: string) => manifest.opType(opType)?.barrier ?? false,
+        fencedBy: (key: string) => manifest.fencedBy(key),
+        resetOrdinal: (key: string) => this.crdtResetOrdinal(f.id, key), // 14 [CLI-13], [CLI-76]
+      };
       const deps: string[] = [];
       // a replacement takes the place of the action it replaces: the actions that depend on that one move to it ([CLI-34], [CLI-47])
       const moving = new Set<string>();
@@ -114,7 +118,7 @@ export abstract class SenderLayer extends ReactionLayer {
         if (this.ending.has(a.mutationId) || a.stuck !== undefined || moving.has(a.mutationId)) continue;
         const am = this.content(a);
         if (am === undefined) continue;
-        if (dependsOn(bView, { mutationId: a.mutationId, opType: a.opType, keys: keysWritten(am), mutation: am }, explicit, ctx)) deps.push(a.mutationId);
+        if (dependsOn(bView, { mutationId: a.mutationId, opType: a.opType, keys: keysWritten(am), mutation: am, ordinal: a.ordinal }, explicit, ctx)) deps.push(a.mutationId);
       }
 
       const now = this.serverNow();

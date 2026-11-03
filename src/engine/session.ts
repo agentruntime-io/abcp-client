@@ -1206,7 +1206,8 @@ export abstract class SessionLayer extends SenderLayer {
   }
 
   private async answerJournal(f: Follow, j: JournalEntry, ans: GetMutationResultResponse): Promise<void> {
-    const spend = j.spend && !j.spendResent;
+    // 14 [CLI-76]: a journal entry whose content a redaction erased is no longer the whole action, and a lost spend action is not resent from it: it ends as one of unknown outcome
+    const spend = j.spend && !j.spendResent && j.redacted !== true;
     const stub = this.stubOf(j);
     const reverted = (): void => {
       this.emit({ type: "reverted", mutationId: j.mutationId, keyspaceId: j.keyspaceId, seq: this.seqOf(j.outcome), logEpoch: j.outcome.logEpoch });

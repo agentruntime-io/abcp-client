@@ -4,8 +4,8 @@
 // behaviour is in the layers it extends (core, endings, replica-store, replica, reactions, sender, session, presence, blobs, horizon, interest,
 // revocation, tab-layer).
 //
-// Out of scope here, each a TODO that names its rule: the local query layer (C4), the real network (C5), a redaction's purge of the
-// journal and the dead-letter store (14 [CLI-76], R2).
+// A redaction's purge of every local copy (14 [CLI-76]) is `erasure.ts` (the copies of the stores, the CRDT reset, the blobs) with `erase.ts` (what a copy is after it) and
+// `replica-store.ts` (the persisted pages and records). Out of scope here: the local query layer (C4, `query/`) and the real network (C5, `net/`).
 
 import { create } from "@bufbuild/protobuf";
 import type * as Y from "yjs";
@@ -162,6 +162,7 @@ export class Engine extends TabLayer {
     // revocation left (the quarantine, the actions that are asked about) is finished
     const revoked = this.revokedFromMeta(s.meta[this.metaKey("revoked")]);
     this.restoreSagas(s.meta[this.metaKey("sagas")]); // 14 [CLI-14]: the sagas that were followed, with what was said of them
+    this.restoreCrdtResets(s.meta[this.metaKey("crdtResets")]); // 14 [CLI-13], [CLI-76]: the CRDT keys that a redaction reset, and the actions authored before it
     for (const img of s.replicas) {
       // 14 [CLI-59]: the cache of another principal of a shared device is not this one's: it goes
       if (!this.isMyImage(img)) {
