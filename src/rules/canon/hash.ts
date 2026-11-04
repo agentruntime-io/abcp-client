@@ -25,6 +25,9 @@ const KEY_CHANGE = "abpc.v2.KeyChange";
 const RECORD = "abpc.v2.Record";
 const OWNER_CONTACT = "abpc.v2.OwnerContact";
 const REDACT_REQUEST = "abpc.v2.RedactRequest";
+/** A rule of a `SplitKeyspaceRequest` and a successor of an `ArchiveKeyspaceRequest` (the one request that holds a SuccessorRule): 12 [ADM-94] clears their `prefix`. */
+const SPLIT_RULE = "abpc.v2.SplitRule";
+const SUCCESSOR_RULE = "abpc.v2.SuccessorRule";
 /** ChangeKind `OVERRIDE` (types.proto), compared by number so that a dynamic type works too. */
 const OVERRIDE_KIND = ChangeKind.OVERRIDE;
 
@@ -207,10 +210,11 @@ export function hashRecordFromDigests(r: RecordMessage, digests: readonly Uint8A
 
 /**
  * The view of the request digest (12 [ADM-94]): every value field cleared first, which is the value fields of every
- * KeyChange (06 [LOG-71]), unknown fields included, the `address` of every owner contact and, since round 18,
- * `RedactRequest.keys`, so that the digest of a `Redact` is a function of the keyspace, the reason and `shared_blobs` and
- * holds no key path of a `personal` template. Unknown fields of every other message stay as received. With `personal`, the
- * `key` of every `OVERRIDE` change for which it holds is cleared too.
+ * KeyChange (06 [LOG-71]), unknown fields included, the `address` of every owner contact, `RedactRequest.keys` (round 18)
+ * and, since round 19 (J7), the `prefix` of every rule of a `SplitKeyspaceRequest` and of every successor of an
+ * `ArchiveKeyspaceRequest`, whatever it is, so that the digest of a `Redact`, a split or an archive holds no key path of a
+ * `personal` template. Unknown fields of every other message stay as received. With `personal`, the `key` of each
+ * `OVERRIDE` change for which it holds is cleared too (change by change: the key of another change is kept).
  */
 function requestViewFor(personal?: (key: string) => boolean): EncodeView {
   const view: EncodeView = {
@@ -222,6 +226,9 @@ function requestViewFor(personal?: (key: string) => boolean): EncodeView {
           return fd.name === "address";
         case REDACT_REQUEST:
           return fd.name === "keys"; // no key path of a personal template, so no key path of a Redact
+        case SPLIT_RULE:
+        case SUCCESSOR_RULE:
+          return fd.name === "prefix"; // J7: no prefix of a split or an archive, whatever it is
         default:
           return false;
       }
@@ -243,15 +250,16 @@ const requestView = requestViewFor();
 
 /**
  * Returns the canonical encoding that 12 [ADM-94] digests, and the digest: SHA-256 over the canonical encoding of the
- * request with every value field cleared (and `RedactRequest.keys`), so that no digest of a value remains after a `Redact`,
+ * request with every value field cleared (and `RedactRequest.keys` and every split and archive `prefix`, J7), so that no digest of a value remains after a `Redact`,
  * none of a contact ever, and none of a key path of a `personal` template. The request keeps its unknown fields as received
  * (07 [MUT-45]). An entry that has no request, and one of a request that was refused before it could be decoded (02
  * [ARC-61]), carries an empty digest, which this function is not for.
  *
  * For the audit entry of a `Mutate/abpc.Override`, m is the override's Mutation and `personal` says whether a key matches a
  * template that is `personal` in the manifest version in force for the keyspace at the commit, the version under which 07
- * Table 7-2 item 3 judges the override and that the override's record carries as `manifest_version` (06 [LOG-8]); the key of
- * every `OVERRIDE` change for which it holds is cleared with the value fields, so that such a change keeps its kind and
+ * Table 7-2 item 3 judges the override and that the override's record carries as `manifest_version` (06 [LOG-8]; the
+ * keyspace's effective version); the key of each `OVERRIDE` change for which it holds is cleared with the value fields,
+ * and the key of another change of the same override is kept, so that such a change keeps its kind and
  * `seen_version`. A later change of `personal` in a newer version does not change the digest (A.7: a client that recomputes it
  * clears the same fields under the same version). Without `personal` every key stays.
  */
