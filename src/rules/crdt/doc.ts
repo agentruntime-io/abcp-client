@@ -748,11 +748,10 @@ export class Analysis {
         // same, holding such an id as a ContentDeleted or a GC ([STATE-74]). An id that is not hidden has all its ancestors live, now and when it was
         // defined, so the depth stored with its definition is the number of ContentType items on the whole chain.
         //
-        // 05 [STATE-71] (D-AT (b), audit 17: the text stands, with a note that the bound counts within one chain of visible types): "An item whose parent is such an id ... counts if it is a `ContentType`
-        // item, and it has no parent to go on to." Reading (1), the text and crdt-type-depth-022 as they stand, which the code follows: the levels
-        // under a hidden type are not bounded by 32, since each update that nests 32 types under the last of the one before is at depth 32, and a key
-        // can hold any number of hidden levels one inside the other, up to its storage limit. Reading (2), the owner's recommendation (a): the bound
-        // of 32 counts the levels under a hidden type as well. Round 19 leaves the text as it is.
+        // 05 [STATE-71] (D-AT: the owner ruled (b) in audit 17, a note only: the text stands, and crdt-type-depth-022 decides it; the rc's note says that the bound counts within one chain of
+        // visible types): "An item whose parent is such an id ... counts if it is a `ContentType` item, and it has no parent to go on to." The code follows the text: the levels under a hidden
+        // type are not bounded by 32, since each update that nests 32 types under the last of the one before is at depth 32, and a key can hold any number of hidden levels one inside the
+        // other, bounded only by the key's size limit ([STATE-72]), as the note says.
         const df = this.doc.defAt(cur);
         base = df !== undefined && !this.hidden(cur) ? df.depth : 0; // the first definition of the id wins ("a struct of this update that [STATE-76] ignores has no depth")
         break;
