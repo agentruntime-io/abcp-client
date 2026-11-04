@@ -47,15 +47,9 @@ const KNOWN_LIBRARY_DIFFERENCES: Record<string, { library: "yjs" | "yrs"; shows?
 /**
  * The vectors of the pinned spec (draft 17, omniview 86ba7e7) that the client's rules do not pass yet, with the work that will
  * make them pass (the twin of the server's `vectors.SkipPending`). Remove an id when its work lands. Empty: the nesting vectors of round 18
- * (`crdt-type-depth-002`, `-003`, `-004`, `-006`, `-009`, R18-B1) pass.
+ * (`crdt-type-depth-002`, `-003`, `-004`, `-006`, `-009`, R18-B1) and of round 19 (`-010` to `-022`, R19-B1) pass.
  */
-const PENDING = new Map<string, string>([
-  ["crdt-type-depth-014", "R19-B1: 05 [STATE-71], the depth goes on through a deleted or hidden item"],
-  ["crdt-type-depth-015", "R19-B1: 05 [STATE-71], the depth goes on through a deleted or hidden item"],
-  ["crdt-type-depth-016", "R19-B1: 05 [STATE-71], the depth goes on through a deleted or hidden item"],
-  ["crdt-type-depth-018", "R19-B1: 05 [STATE-71], the depth goes on through a deleted or hidden item"],
-  ["crdt-type-depth-022", "R19-B1: 05 [STATE-71], the depth goes on through a deleted or hidden item"],
-]);
+const PENDING = new Map<string, string>([]);
 const vit = (id: string) => (PENDING.has(id) ? it.skip : it);
 
 /** Stable JSON for a comparison of documents: object keys sorted. */

@@ -78,9 +78,11 @@ export interface Def {
   root: string | null;
   /**
    * The nesting depth of 05 [STATE-71]: the number of ContentType items on the chain of the struct's parents, itself included, saturating at 255; 0 for a
-   * GC. It is a function of the key's integrated updates, which a def never leaves (an id keeps its first definition), so structs that agree on the rest
+   * GC. The chain ends at a hidden id, which counts as no type (round 19, m1), so the depth is the one that the struct has while no id on its chain is
+   * hidden, which is the whole time for an id that is not hidden: a hidden id has all its ancestors live or hidden, and `nestOf` never reads its depth.
+   * It is a function of the key's integrated updates, which a def never leaves (an id keeps its first definition), so structs that agree on the rest
    * agree on it and it is no part of `sameRun`. Storing it makes "an item's depth is its parent's plus one" cost one lookup, whatever the length of the
-   * chain of hidden items above the parent (02 [ARC-46]).
+   * chain of live items above the parent (02 [ARC-46]).
    */
   depth: number;
 }
@@ -390,12 +392,19 @@ export class Doc {
    * origin, or else that of its right origin), each id with its first definition in seq order ([STATE-76]), over the key's integrated updates
    * ([STATE-41]) and this update; a struct of this update that [STATE-76] ignores has no depth, and the chain ends at a root, at an id that is not
    * present, and after an item that takes its parent from a `GC` (that item counts if it is a `ContentType` item, and it has no parent to go on to).
-   * An update that [STATE-76] folds to a no-op for good (a gap, a `Skip`, a missing dependency) is judged like any other [...]. An item whose depth
-   * is above 32 fails the check: depth 32 is accepted and depth 33 is refused." Throws a CrdtError with the reason "nesting", to be rejected with
+   * An id that the key's canonical delete set holds before this update ([STATE-41]), or that is an id of the key's integrated updates that is hidden
+   * ([STATE-76]) by that delete set and those updates, both as they stand before this update, counts as no `ContentType` item. An item whose parent
+   * is such an id, or that takes its parent from a `GC` ([STATE-76]), counts if it is a `ContentType` item, and it has no parent to go on to. An item
+   * that takes its parent from an origin or a right origin that the delete set holds, and not from a `GC`, goes on to that neighbour's parent as
+   * [STATE-76] gives it, which every valid base holds, since a base keeps such an id as a `ContentDeleted` with its origins ([STATE-74]). So the
+   * depth needs only what every valid base holds ([STATE-74]), whatever base the key holds, as the document length of [STATE-72] does. An update that
+   * [STATE-76] folds to a no-op for good (a gap, a `Skip`, a missing dependency) is judged like any other [...]. An item whose depth is above 32
+   * fails the check: depth 32 is accepted and depth 33 is refused." Throws a CrdtError with the reason "nesting", to be rejected with
    * SCHEMA_INVALID. It changes nothing of the Doc.
    *
    * 02 [ARC-46]: the chain is walked by a loop, never by recursion (Yjs JS overflows its stack on a deep nest), each item of the update once, and the
-   * chain above an id of the Doc not at all: the Doc stores the depth of each first definition.
+   * chain above an id of the Doc not at all: a live id of the Doc has the depth that the Doc stores with its definition, and a hidden one counts as
+   * nothing.
    */
   checkNesting(u: Update): void {
     const a = new Analysis(this, u);
@@ -721,7 +730,8 @@ export class Analysis {
 
   /**
    * The nesting depth of the struct that first defines id (05 [STATE-71]): the number of ContentType items on the chain that starts at id, id
-   * included; 0 for an id that no struct defines (the chain ends there) and for a GC. An id below its client's next clock has the depth that the Doc
+   * included; 0 for an id that no struct defines (the chain ends there) and for a GC. An id below its client's next clock is 0 when the key's delete
+   * set and integrated updates hide it ("counts as no `ContentType` item", and the chain ends below it), and otherwise has the depth that the Doc
    * stores with its definition; an id of the update is walked up through the update's items to the first one whose depth is known, or to a root, an
    * item that takes its parent from a GC, an id of the Doc, or an id that is not present, and the depths of the items on the way are filled in from
    * the top down. Each item of the update is walked once, with no recursion.
@@ -732,7 +742,19 @@ export class Analysis {
     let cur: Id = id;
     for (;;) {
       if (cur.clock < this.doc.next(cur.client)) {
-        base = this.doc.defAt(cur)?.depth ?? 0; // the first definition of the id wins ("a struct of this update that [STATE-76] ignores has no depth")
+        // 05 [STATE-71] (Nesting), round 19 (m1): "An id that the key's canonical delete set holds before this update, or that is an id of the key's
+        // integrated updates that is hidden ([STATE-76]) by that delete set and those updates, both as they stand before this update, counts as no
+        // `ContentType` item" and has no parent to go on to: the chain ends below it, and the item that names it counts itself. A base gives the
+        // same, holding such an id as a ContentDeleted or a GC ([STATE-74]). An id that is not hidden has all its ancestors live, now and when it was
+        // defined, so the depth stored with its definition is the number of ContentType items on the whole chain.
+        //
+        // SPEC-QUESTION: 05 [STATE-71] (D-AT, R19-4, open with the owner): "An item whose parent is such an id ... counts if it is a `ContentType`
+        // item, and it has no parent to go on to." Reading (1), the text and crdt-type-depth-022 as they stand, which the code follows: the levels
+        // under a hidden type are not bounded by 32, since each update that nests 32 types under the last of the one before is at depth 32, and a key
+        // can hold any number of hidden levels one inside the other, up to its storage limit. Reading (2), the owner's recommendation (a): the bound
+        // of 32 counts the levels under a hidden type as well. Round 19 leaves the text as it is.
+        const df = this.doc.defAt(cur);
+        base = df !== undefined && !this.hidden(cur) ? df.depth : 0; // the first definition of the id wins ("a struct of this update that [STATE-76] ignores has no depth")
         break;
       }
       if (this.u === null) break;
