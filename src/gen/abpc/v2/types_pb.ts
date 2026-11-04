@@ -1700,7 +1700,7 @@ export enum RetryReason {
 
   /**
    * reached its limit (spec/13 [PLC-10]), a stale config_version, a wait for the
-   * app's config lock past its lease, or a create that finds it held alone or awaited by an UpdateAppConfig or a reset run (spec/12 [ADM-111]), a B or D commit call
+   * app's config lock past its lease, or a create that finds it held alone or awaited by an UpdateAppConfig or a reset run, or, in every placement, a create whose T is after that lock's deadline or that starts no statement because its lease has ended, or an UpdateAppConfig that starts no DDL statement because its lease has ended (spec/12 [ADM-111]), a B or D commit call
    * refused by the version row (spec/13 [PLC-87]): the row's pending mark above the call's T, or the version below the row (A.5), an
    * UpdateAppConfig whose write of the row waits past its lease (A.5), or a GATED intent's decision commit
    * conflicted fewer than N consecutive times; at N it ends CONTENDED (spec/08 §8.4).

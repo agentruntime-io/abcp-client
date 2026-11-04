@@ -630,7 +630,8 @@ export type AppConfig = Message<"abpc.v2.AppConfig"> & {
 
   /**
    * The C modules the app's admins enable, with their principals (spec/04 [MAN-89]). Removing a module stops it within
-   * one heartbeat interval.
+   * one heartbeat interval. While the app is suspended, the escrow module's change of mode is served only as spec/12
+   * [ADM-17] limits it.
    *
    * @generated from field: repeated abpc.v2.ModuleConfig modules = 18;
    */
@@ -816,7 +817,7 @@ export const GetAppConfigResponseSchema: GenMessage<GetAppConfigResponse> = /*@_
  * expected_config_version, so a retry after an unknown outcome succeeds; one whose mask names owner_contacts still
  * adopts the provisional contacts and sends new challenges (spec/12 [ADM-13], spec/04 [MAN-69]).
  * While the app is suspended, an update may change only user issuers (admin: false), except the adoption of spec/12
- * [ADM-17] and except in recovery mode after a break-glass change, when any field but the admin-issuer entry may
+ * [ADM-17], the escrow module's change of mode as that item limits it, and except in recovery mode after a break-glass change, when any field but the admin-issuer entry may
  * change (spec/12 §12.2.3, spec/16 [SEC-44]).
  *
  * @generated from message abpc.v2.UpdateAppConfigRequest
