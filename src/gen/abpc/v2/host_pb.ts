@@ -376,7 +376,8 @@ export const DecisionFinalizedResponseSchema: GenMessage<DecisionFinalizedRespon
 
 /**
  * Sent at every epoch advance of a keyspace (spec/06 §6.9, spec/08 [GATE-100]), with the values of its EPOCH_ADVANCED
- * record (spec/06 [LOG-48]). A host processes the notices of a keyspace in increasing new_epoch and idempotently by
+ * record (spec/06 [LOG-48]); a catch-up notice of the latest advance, for a module declared while none declared it, or moved out of
+ * process, carries the same values (spec/08 [GATE-100]). A host processes the notices of a keyspace in increasing new_epoch and idempotently by
  * (app_id, keyspace_id, new_epoch) (spec/08 [GATE-101]). A record (log_epoch, seq) of the keyspace lies in the kept
  * prefix when seq <= base_seq and log_epoch <= base_epoch; a profile R host checks only the reservations whose
  * DECISION lies outside it, and those made by a Try of an earlier epoch with no DECISION received (spec/08 [GATE-104]).

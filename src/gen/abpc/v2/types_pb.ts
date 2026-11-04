@@ -530,7 +530,8 @@ export type Decision = Message<"abpc.v2.Decision"> & {
    * change_index unset (spec/08 [GATE-16], [GATE-24] step 4); or a final failure at the decision commit (spec/08 §8.4):
    * of the requested changes' own checks (STALE, STALE{REDACTED} included, and STALE{LEASE} of an owner-keeping or
    * owner-setting change that fails its re-check against a revocation, spec/08 [GATE-24] step 6; TOMBSTONED,
-   * RANGE_EXCEEDED, QUOTA_EXCEEDED, and PAYLOAD_TOO_LARGE of a CRDT update that would take its key's stored size
+   * RANGE_EXCEEDED, QUOTA_EXCEEDED, SCHEMA_INVALID of a requested CRDT update whose nesting passes 32 (spec/05 [STATE-71]),
+   * and PAYLOAD_TOO_LARGE of a CRDT update that would take its key's stored size
    * or document length over the limit in force, spec/05 [STATE-72]), or, for a gate effect, one of the checks that are final for an effect, with the
    * codes that spec/08 [GATE-24] step 8 and [GATE-28] give them (STALE, STALE{MOVING}, POLICY_CHANGED, RANGE_EXCEEDED);
    * for a possible owner-authorized write, such a failure that reads the keyspace is PERMISSION_DENIED instead,
@@ -1699,8 +1700,8 @@ export enum RetryReason {
 
   /**
    * reached its limit (spec/13 [PLC-10]), a stale config_version, a wait for the
-   * app's config lock past its lease, or a create that finds it held alone or awaited by an UpdateAppConfig or a reset run (spec/12 [ADM-10]), a B or D commit call
-   * refused by the version row (spec/13 [PLC-79]): the row's pending mark above the call's T, or the version below the row (A.5), an
+   * app's config lock past its lease, or a create that finds it held alone or awaited by an UpdateAppConfig or a reset run (spec/12 [ADM-111]), a B or D commit call
+   * refused by the version row (spec/13 [PLC-87]): the row's pending mark above the call's T, or the version below the row (A.5), an
    * UpdateAppConfig whose write of the row waits past its lease (A.5), or a GATED intent's decision commit
    * conflicted fewer than N consecutive times; at N it ends CONTENDED (spec/08 §8.4).
    * A lock timeout at the decision commit is not a conflict: the intent stays

@@ -671,10 +671,11 @@ export type GetAppConfigResponse = Message<"abpc.v2.GetAppConfigResponse"> & {
   config?: AppConfig;
 
   /**
-   * 1 after RegisterApp. Adds 1 on every change of the stored config: an accepted UpdateAppConfig that changes it,
-   * a break-glass change (spec/16 [SEC-44]), a server's addition of features to enabled_features (one change for the
-   * features that one activation or pin adds), and a pending admin_recovery or owner_contacts change taking effect
-   * (spec/04 [MAN-69]).
+   * 1 after RegisterApp. The number that spec/04 [MAN-69] gives the next change (in B and D it can pass the stored
+   * value by more than 1); it changes with each change that [MAN-69] lists, the reset's renumbering included: an
+   * accepted UpdateAppConfig that changes it, a break-glass change (spec/16 [SEC-44]), a server's addition of
+   * features to enabled_features (one change for the features that one activation or pin adds), and a pending
+   * admin_recovery or owner_contacts change taking effect.
    *
    * @generated from field: uint64 config_version = 2;
    */
@@ -2239,15 +2240,16 @@ export type AuditEntry = Message<"abpc.v2.AuditEntry"> & {
   reason: string;
 
   /**
-   * SHA-256 of the canonical request with every value field and every owner
+   * SHA-256 of the canonical request with every value field, every owner
    *
    * @generated from field: bytes request_digest = 9;
    */
   requestDigest: Uint8Array;
 
   /**
-   * contact's address, RedactRequest.keys and the key of every change of an
-   * override of a personal template cleared (spec/12 [ADM-94]); of the Mutation, for an override;
+   * contact's address, RedactRequest.keys, split and archive prefixes and the
+   * key of each OVERRIDE change whose key matches a personal template cleared
+   * (spec/12 [ADM-94]); of the Mutation, for an override;
    * empty for an event with no request and for a request refused before it can be
    * encoded; break-glass: of the canonical change (spec/16 [SEC-44])
    *

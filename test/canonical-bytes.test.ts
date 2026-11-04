@@ -112,7 +112,11 @@ describe("06 [LOG-71] value digests, E, C, W and record_hash (record-hash vector
 
 // Round 18 (spec draft 16, omniview 6e5fe6f): the vectors the code does not pass yet, with the batch that will (the server's list is
 // server/internal/vectors/pending.go). Remove an entry when its work lands.
-const PENDING = new Map<string, string>([]);
+const PENDING = new Map<string, string>([
+  ["request-digest-009", "R19-B2: 12 [ADM-94] (J7), every split and archive prefix is cleared"],
+  ["request-digest-010", "R19-B2: 12 [ADM-94] (J7), every split and archive prefix is cleared"],
+  ["request-digest-011", "R19-B2: 12 [ADM-94] (J7), every split and archive prefix is cleared"],
+]);
 
 // Since round 18 (12 [ADM-94], m9) the digest also clears `RedactRequest.keys` and the `key` of every OVERRIDE change whose key
 // matches a template that is `personal` in the manifest version in force; a vector lists those keys in `personal_keys` (the
