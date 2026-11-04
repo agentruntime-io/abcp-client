@@ -748,7 +748,7 @@ export class Analysis {
         // same, holding such an id as a ContentDeleted or a GC ([STATE-74]). An id that is not hidden has all its ancestors live, now and when it was
         // defined, so the depth stored with its definition is the number of ContentType items on the whole chain.
         //
-        // SPEC-QUESTION: 05 [STATE-71] (D-AT, R19-4, open with the owner): "An item whose parent is such an id ... counts if it is a `ContentType`
+        // 05 [STATE-71] (D-AT (b), audit 17: the text stands, with a note that the bound counts within one chain of visible types): "An item whose parent is such an id ... counts if it is a `ContentType`
         // item, and it has no parent to go on to." Reading (1), the text and crdt-type-depth-022 as they stand, which the code follows: the levels
         // under a hidden type are not bounded by 32, since each update that nests 32 types under the last of the one before is at depth 32, and a key
         // can hold any number of hidden levels one inside the other, up to its storage limit. Reading (2), the owner's recommendation (a): the bound
