@@ -91,6 +91,17 @@ const cases: Case[] = [
   { name: "05 [STATE-7]: an object of 1,025 members", bad: ops(sets("settings/a", members(1025))), good: ops(sets("settings/a", members(1024))) },
   { name: "05 [STATE-7]: U+0000 in a string", bad: ops(sets("settings/a", '"\\u0000"')), good: ops(sets("settings/a", '"a"')) },
   { name: "05 [STATE-7]: U+0000 in a member name", bad: ops(sets("settings/a", '{"\\u0000":1}')) },
+  // R19 review S5: a value that breaks a limit is structurally invalid whatever other defect of its text the reader reports first
+  { name: "05 [STATE-7]: U+0000 in a string, and a duplicate member before it", bad: ops(sets("settings/a", '{"a":"\\u0000","a":1}')) },
+  { name: "05 [STATE-7]: U+0000 in a string, and a number that is no binary64 value", bad: ops(sets("settings/a", '["\\u0000",1e400]')) },
+  {
+    name: "05 [STATE-7]: U+0000 in a string, and an octet that is not UTF-8",
+    bad: ops(raw({ key: "settings/a", kind: ChangeKind.SET, value: new Uint8Array([...J('["\\u0000","'), 0xff, ...J('"]')]), encoding: "json/v1" })),
+  },
+  { name: "05 [STATE-7]: nesting of 33 after a duplicate member", bad: ops(sets("settings/a", `{"a":1,"a":${nest(33)}}`)) },
+  { name: "05 [STATE-7]: nesting of 33 after a bad number and an unpaired surrogate", bad: ops(sets("settings/a", `[1e400,"\\ud800",${nest(33)}]`)) },
+  { name: "05 [STATE-7]: an object of 1,025 members, the first of them twice", bad: ops(sets("settings/a", `{"m":0,"m":0,${members(1024).slice(1, -1)}}`)) },
+  { name: "05 [STATE-7]: an object of 1,025 members, with the name of one of them spelled by an escape", bad: ops(sets("settings/a", `{"\\u006d0000":0,${members(1025).slice(1, -1)}}`)) },
   { name: "05 [STATE-15]: the literal null as a value", bad: ops(sets("settings/a", "null")) },
   { name: "05 [STATE-15]: is_null with a value", bad: ops(raw({ key: "settings/a", kind: ChangeKind.SET, value: J("1"), encoding: "json/v1", isNull: true })), good: ops(raw({ key: "settings/a", kind: ChangeKind.SET, encoding: "json/v1", isNull: true })) },
   // -- the template and the value schema of the manifest version of the record (05 [STATE-6], [STATE-8], [STATE-10], [STATE-14], [STATE-19], [STATE-27]) --
@@ -179,13 +190,44 @@ describe("16 [SEC-3]: what the check leaves to 14 [CLI-5], and to the app's limi
     expect(r.engine.status().holds).toEqual([]);
   });
 
-  it("an INTENT's requested changes are not applied, and so not judged; its intent row is", async () => {
+  it("an INTENT's requested changes are not applied, and their template and value are not judged: a requested change that breaks its template's schema leaves the keyspace going", async () => {
     const r = await rig({ manifests: new StaticManifests(SPEC) });
-    r.server.appendRaw(KS, { kind: RecordKind.INTENT, changes: [sets("settings/..", "1"), sets("abpc.intent/other-1", '{"status":"PENDING"}')] });
+    r.server.appendRaw(KS, { kind: RecordKind.INTENT, changes: [sets("limits/a", "11"), sets("abpc.intent/other-1", '{"status":"PENDING"}')] });
     await r.engine.settle();
     expect(ofType(r, "protocol-error")).toEqual([]);
     expect(r.engine.status().holds).toEqual([]);
     expect(r.engine.cursor(KS)?.seq).toBe(1n); // applied: the cursor moved, and the requested change is in no state
-    expect(r.engine.confirmed(KS).has("settings/..")).toBe(false);
+    expect(r.engine.confirmed(KS).has("limits/a")).toBe(false);
+  });
+});
+
+// R19 review, note 4. 16 [SEC-3]: "A client engine MUST check every record it applies against the same structural rules ... the envelope rules, the segment syntax, the reserved namespace and the `json/v1`
+// limits ... always". An INTENT record is applied (its intent row is), and its requested changes are carried in it: a key that breaks the segment syntax, and a change that breaks the envelope of its kind,
+// are rules of SEC-2 that the record breaks, whatever the engine does with the change. Reading taken (the text says nothing that exempts them): the key and the envelope of a requested change are judged;
+// its template and its value are not (nothing of it is applied or read).
+describe.each(["live", "resume"] as const)("16 [SEC-3]: the requested changes of an INTENT are judged by their key and their envelope, delivered %s", (mode) => {
+  const intent = (...changes: KeyChange[]): Init => ({ kind: RecordKind.INTENT, changes });
+  const bad: [string, Init][] = [
+    ["a segment `..`", intent(sets("settings/..", "1"), sets("abpc.intent/other-1", '{"status":"PENDING"}'))],
+
+    ["a DELETE that sets a value", intent(raw({ key: "settings/a", kind: ChangeKind.DELETE, value: J("1") }))],
+    ["a SET that sets no encoding", intent(raw({ key: "settings/a", kind: ChangeKind.SET, value: J("1") }))],
+    ["a CAS with no expected", intent(raw({ key: "notes/n1", kind: ChangeKind.CAS, value: J("1"), encoding: "json/v1" }))],
+  ];
+  for (const [name, init] of bad) {
+    it(`${name}: protocol-error, the PROTOCOL_ERROR hold, and nothing of the record applied`, async () => {
+      const r = await deliver(mode, init);
+      expect(ofType(r, "protocol-error").map((e) => [e.what, e.keyspaces])).toEqual([["RecordsFrame", [KS]]]);
+      expect(r.engine.status().holds.map((h) => [h.keyspaceId, h.code])).toEqual([[KS, "PROTOCOL_ERROR"]]);
+      expect(r.engine.cursor(KS)?.seq).toBe(1n);
+    });
+  }
+  // SPEC-QUESTION (16 [SEC-3] with 03 [ID-47]): the reserved namespace of a requested change is not judged, as the vector fold-moved-002 has it (an INTENT whose requested change names `abpc.saga.v1/saga/s1`)
+  it("requested changes that are well formed, one with a reserved key that 03 §3.8 does not define and one with a value that breaks its template's schema: the record is applied, with no hold", async () => {
+    const r = await deliver(mode, intent(sets("settings/a", "1"), sets("limits/a", "11"), sets("abpc.saga.v1/saga/s1", "{}"), casAbsent("notes/n1", "1"), del("settings/b")));
+    expect(r.engine.cursor(KS)?.seq).toBe(2n);
+    expect(ofType(r, "protocol-error")).toEqual([]);
+    expect(r.engine.status().holds).toEqual([]);
+    expect(r.engine.confirmed(KS).has("settings/a")).toBe(false); // requested, never applied
   });
 });

@@ -256,6 +256,23 @@ describe("14 [CLI-3], [CLI-4], 06 [LOG-11] gaps and stops", () => {
     applyRecord(st, rules, committed);
     expect(text(st.key("k/a")?.value)).toBe("1");
   });
+
+  it("judges the key and the envelope of the requested changes that an INTENT and a REJECTED DECISION do not apply, and nothing else of them (16 [SEC-3], R19 review note 4)", () => {
+    const row = "abpc.intent/i-1";
+    const intentOf = (...changes: KeyChange[]): RecordMessage => create(RecordSchema, { ...op(1, ...changes), kind: RecordKind.INTENT, mutationId: "i-1" });
+    const rejectedOf = (...changes: KeyChange[]): RecordMessage =>
+      create(RecordSchema, { ...op(1, ...changes), kind: RecordKind.DECISION, mutationId: "i-1", decision: create(DecisionSchema, { intentId: "i-1", status: DecisionStatus.REJECTED }) });
+    for (const make of [intentOf, rejectedOf]) {
+      // a key that breaks the segment syntax, and a change that breaks the envelope of its kind, in a requested change
+      expect(() => applyRecord(new ReplicaState(), rules, make(set("k/..", "1"), set(row, "{}")))).toThrow(FoldError);
+
+      expect(() => applyRecord(new ReplicaState(), rules, make(create(KeyChangeSchema, { key: "k/a", kind: ChangeKind.DELETE, value: utf8Encode("1") }), set(row, "{}")))).toThrow(FoldError);
+      // a requested change with a key that matches no template, and a value that no schema would take, is not judged: it is not applied
+      const st = new ReplicaState();
+      applyRecord(st, rules, make(set("zzz/q", "2"), set("k/a", "not json"), set("abpc.saga.v1/saga/s1", "{}"), set(row, "{}"))); // nor its reserved namespace: vector fold-moved-002
+      expect(st.key("zzz/q")).toBeUndefined();
+    }
+  });
 });
 
 describe("09 [READ-9], [READ-13] the entries of a load", () => {

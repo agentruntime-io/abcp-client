@@ -97,10 +97,22 @@ export function codePointLength(s: string): number {
   return n;
 }
 
+/** The enum values of a schema as a set, built once for each list (R19 review, note 5): a value is judged against up to 1,024 of them, and a list is scanned once for each string of a value of up to 4 MiB otherwise. */
+const enumSets = new WeakMap<readonly (string | number)[], ReadonlySet<string | number>>();
+
+function inEnum<T extends string | number>(list: readonly T[], v: T): boolean {
+  let set = enumSets.get(list);
+  if (set === undefined) {
+    set = new Set<string | number>(list);
+    enumSets.set(list, set);
+  }
+  return set.has(v);
+}
+
 /** @internal Returns "" when a string value fits the schema, and else why it does not. Length counts code points. */
 export function fitString(s: Schema, str: string): string {
   if (s.type !== "string") return `expected ${s.type}, got string`;
-  if (s.enum !== undefined && s.enum.length > 0 && !s.enum.includes(str)) {
+  if (s.enum !== undefined && s.enum.length > 0 && !inEnum(s.enum, str)) {
     return "the string is not one of the enum values";
   }
   if ((s.minLen !== undefined || s.maxLen !== undefined) && !lengthWithin(s, codePointLength(str))) {
@@ -114,7 +126,7 @@ export function fitNumber(s: Schema, f: number): string {
   switch (s.type) {
     case "int":
       if (!isInteger(f)) return "the number is not an integer within ±(2^53−1)";
-      if (s.enumInt !== undefined && s.enumInt.length > 0 && !s.enumInt.includes(f === 0 ? 0 : f)) {
+      if (s.enumInt !== undefined && s.enumInt.length > 0 && !inEnum(s.enumInt, f === 0 ? 0 : f)) {
         return "the integer is not one of the enum values";
       }
       break;

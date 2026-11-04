@@ -21,7 +21,7 @@ import { CrdtError, Doc, parseUpdate, type Update } from "../crdt/index.js";
 import { applyIncr, counterText, JsonV1Error, parseCounter } from "../jsonv1/index.js";
 import { compareUtf8 } from "../bytes.js";
 import { type Anomaly, refuse } from "./errors.js";
-import { judgeChange, judgeChangeKey, judgeRecord } from "./judge.js";
+import { judgeChange, judgeChangeKey, judgeRecord, judgeRequestedChange } from "./judge.js";
 import { type Rules, type Template, VersionTopology } from "./rules.js";
 import { selectSystem, type Selection } from "./system.js";
 import {
@@ -304,6 +304,14 @@ function plan(st: ReplicaState, rules: Rules, rec: RecordMessage, sel: Selection
       deleted.add(key);
       deletedList.push(key);
     }
+  }
+  // R19 review, note 4 (16 [SEC-3]): the requested changes of an INTENT, and of a REJECTED decision, are not applied (06 [LOG-23], [LOG-32]); their keys and their envelopes are judged all the same
+  if (rec.kind === RecordKind.INTENT || rec.kind === RecordKind.DECISION) {
+    const applied = new Set(sel.applied);
+    rec.changes.forEach((c, i) => {
+      if (applied.has(i)) return;
+      judgeRequestedChange(rec, i, c, (k) => top.template(k)); // the template is looked up after the key is judged: a key that breaks the syntax has none
+    });
   }
   // A key is in the subtree of a marker key when that marker is among its ancestor markers (05 [STATE-42]), so the questions about
   // the record's own deletions are answered by the key's ancestors, a handful, and not by the record's changes: a record of 2,000

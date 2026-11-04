@@ -18,6 +18,7 @@ export {
 } from "./value.js";
 export { denote, numberText } from "./number.js";
 export { checkJsonText, parse, parseDocument, validate } from "./parse.js";
+export { checkLimits } from "./limits.js";
 export { canonical } from "./canonical.js";
 export {
   DEFAULT_RANGE,

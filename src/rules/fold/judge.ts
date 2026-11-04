@@ -5,7 +5,8 @@
 //   the reserved namespace and the `json/v1` limits of 05 [STATE-7] always, against the templates and value schemas of the manifest version that the record carries, and never against the app's limits
 //   in force (07 §7.9): a record that the server appended is not structurally invalid for a limit that was lowered later (04 [MAN-75])."
 //
-// What is judged here, for each change that the record applies (`INTENT` and a `REJECTED` decision apply only the intent row; their requested changes are audit):
+// What is judged here, for each change that the record applies (`INTENT` and a `REJECTED` decision apply only the intent row; their requested changes are audit, and only the segment syntax of their key
+// and their envelope are judged: `judgeRequestedChange`, R19 review note 4):
 //   - the record's own envelope: an OP record holds a change (07 Table 7-2 item 1); `causation_id` and `correlation_id`, when set, and each `blob_refs` entry have their syntax (03 [ID-23], Table 3.1);
 //   - the key: 1 to 16 segments of 1 to 64 octets of `seg-char`, none of them `.`, `..` or `__proto__`, at most 512 octets (03 [ID-1], [ID-2], [ID-13]); a key of the reserved namespace is one that 03 §3.8
 //     defines (03 [ID-47]);
@@ -27,12 +28,13 @@
 // SPEC-QUESTION (16 [SEC-3] with 14 [CLI-5], 16 [SEC-4]): CLI-5 has a change "whose value a client cannot decode locally" enter the confirmed state and be shown as undecodable, "MUST NOT stop the engine
 // for such a change", while SEC-3 judges a record against "the `json/v1` limits of 05 [STATE-7]" and stops the keyspace for a record that breaks them. Taken: the limits of STATE-7 are what its text calls
 // "these limits" (nesting over 32, over 1,024 members in an object, U+0000 in a string or a member name), and a value that breaks them, or the literal null of [STATE-15], is structurally invalid; any other
-// defect of a `json/v1` text (not JSON, a duplicate member, a number that is no binary64 value, not in canonical form) is a value that the client cannot decode, which CLI-5 keeps. Reading B: every
+// defect of a `json/v1` text (not JSON, a duplicate member, a number that is no binary64 value, not in canonical form) is a value that the client cannot decode, which CLI-5 keeps, except that a value
+// that breaks a limit is structurally invalid whatever other defect the reader reports first (checkLimits; R19 review S5). Reading B: every
 // condition of STATE-7 is a rule that SEC-3 judges, and CLI-5 covers only a value that passed the server's checks and that the client cannot display.
 
 import { ChangeKind, RecordKind, type KeyChange, type Record as RecordMessage } from "../../gen/abpc/v2/types_pb.js";
 import { REDACTED_ENCODING } from "../hashes/index.js";
-import { allowsNull, validate, validateBytes, MAX_SAFE_INTEGER } from "../jsonv1/index.js";
+import { allowsNull, checkLimits, validate, validateBytes, MAX_SAFE_INTEGER } from "../jsonv1/index.js";
 import { refuse, type FoldCode } from "./errors.js";
 import { isReservedKey, type Template } from "./rules.js";
 import { isSegment } from "./template.js";
@@ -105,7 +107,7 @@ export function isDefinedReservedKey(key: string): boolean {
 }
 
 /** The key of a change: 03 [ID-1], [ID-2], [ID-13] and, in the reserved namespace, [ID-47]. */
-function judgeKey(rec: RecordMessage, i: number, key: string): void {
+function judgeKey(rec: RecordMessage, i: number, key: string, reserved = true): void {
   const where = `change ${i} names the key "${key.length > 80 ? `${key.slice(0, 80)}...` : key}"`;
   if (key === "") bad("invalid-key", rec, "ID-13", `change ${i} has no key`);
   // an octet count: every octet of a key that passes the segment syntax is one character, and one that does not is refused at its first
@@ -115,7 +117,7 @@ function judgeKey(rec: RecordMessage, i: number, key: string): void {
   for (const s of segments) {
     if (!isSegment(s)) bad("invalid-key", rec, "ID-1", `${where}, which has a segment that breaks 03 [ID-1] or [ID-2]`);
   }
-  if (isReservedKey(key) && !isDefinedReservedKey(key)) bad("invalid-key", rec, "ID-47", `${where}, a reserved key that 03 §3.8 does not define`);
+  if (reserved && isReservedKey(key) && !isDefinedReservedKey(key)) bad("invalid-key", rec, "ID-47", `${where}, a reserved key that 03 §3.8 does not define`);
 }
 
 /** 05 [STATE-20]: the fields that a change of the kind requires and forbids; 05 [STATE-24]: a `CAS`'s `expected`. */
@@ -198,6 +200,13 @@ function judgeValue(rec: RecordMessage, i: number, c: KeyChange, tpl: Template):
     // a value that cannot be read at all (not JSON, a duplicate member, a number that is no binary64 value, not canonical) is one that the client cannot decode: 14 [CLI-5] keeps it, as the SPEC-QUESTION
     // above says; the limits of [STATE-7], the literal null of [STATE-15] and the value schema are the structural rules of SEC-3
     if (err !== null && (err.reason === "json-limits" || err.reason === "literal-null" || err.reason === "schema")) bad("schema-invalid", rec, "STATE-7", `${name}: ${err.message}`);
+    // R19 review S5: the limits are judged whatever other defect the reader reports first. `validate` stops at the first syntax, duplicate-member, surrogate, noncharacter, number or UTF-8 defect, so a
+    // limit that the text breaks after it (or U+0000 anywhere in it) was left unjudged and the value was applied as an undecodable one; `checkLimits` reads the text for the limits alone. A text that
+    // `validate` read to its end (not canonical, or valid) has none of them.
+    if (err !== null && err.reason !== "not-canonical") {
+      const lim = checkLimits(c.value);
+      if (lim !== null) bad("schema-invalid", rec, "STATE-7", `${name}: ${lim.message}`);
+    }
   } else if (c.encoding === "bytes/v1") {
     const err = validateBytes(c.value, tpl.schema !== undefined && tpl.schema.type === "bytes" ? tpl.schema : undefined);
     if (err !== null) bad("schema-invalid", rec, "STATE-8", `${name}: ${err.message}`);
@@ -239,4 +248,23 @@ export function judgeChange(rec: RecordMessage, i: number, c: KeyChange, tpl: Te
 /** The key of a change, before its template is looked up. */
 export function judgeChangeKey(rec: RecordMessage, i: number, key: string): void {
   judgeKey(rec, i, key);
+}
+
+/**
+ * Judges a change that the record carries and the fold does not apply: the requested change of an `INTENT`, or of a `REJECTED` decision, which is audit (R19 review, note 4). 16 [SEC-3] has a client
+ * engine check "every record it applies" against "the envelope rules, the segment syntax, the reserved namespace and the `json/v1` limits", and the record is applied, its intent row; a key that
+ * breaks the segment syntax in a requested change is a rule of SEC-2 that the record breaks, whatever the engine does with the change. So the segment syntax of the key and the envelope of the change are
+ * judged, and the rest is not: the reserved namespace (the vector fold-moved-002 has a requested change that names a key that 03 §3.8 does not define, and the record is accepted), the template and the
+ * value schema (the manifest's judgement of a change that the server's registration made, of which a client that applies none reads none of the values).
+ * `templateOf` gives the template that a key matches under the record's manifest version, when it matches one (it tells a CRDT key's envelope from a plain one).
+ */
+export function judgeRequestedChange(rec: RecordMessage, i: number, c: KeyChange, templateOf: (key: string) => Template | undefined): void {
+  // SPEC-QUESTION (16 [SEC-3] with 03 [ID-47], R19 review note 4): the segment syntax of the key (03 [ID-1], [ID-2], [ID-13]) and the envelope are judged; the reserved namespace is not. The vector
+  // fold-moved-002 (17 [CONF-9]) carries an INTENT whose requested change names `abpc.saga.v1/saga/s1`, a key that 03 §3.8 does not define, and its expected result is that the record is accepted, so a
+  // client that judged the reserved namespace of a requested change would refuse a record that the vectors accept. Reading B: every key of the record is judged by the same rules as an applied one.
+  judgeKey(rec, i, c.key, false);
+  if (c.encoding === REDACTED_ENCODING && c.kind !== ChangeKind.DELETE) return; // blanked by a redaction: nothing left to judge
+  const tpl = templateOf(c.key);
+  if (c.kind === ChangeKind.OVERRIDE && tpl === undefined) return; // an override's envelope depends on the template's rule, which this key does not have
+  judgeEnvelope(rec, i, c, tpl?.rule === "crdt");
 }
