@@ -88,7 +88,7 @@ describe("14 [CLI-2], [CLI-8]: a restart resumes from the persisted replica", ()
     d.on("update", (u: Uint8Array) => ups.push(u));
     d.getText("text").insert(0, "hello");
     d.getText("text").insert(5, " world");
-    for (const update of ups) r.server.write(KS, [create(KeyChangeSchema, { key: "docs/d1", kind: ChangeKind.CRDT_UPDATE, update })]);
+    for (const update of ups) r.server.write(KS, [create(KeyChangeSchema, { key: "docs/d1", kind: ChangeKind.CRDT_UPDATE, update, encoding: "yjs/v1" })]);
     await r.engine.settle();
     const live = toHex(stateOf(r).keyspaceStateHash());
     expect(live).toBe(toHex(r.server.stateOf(KS).keyspaceStateHash()));

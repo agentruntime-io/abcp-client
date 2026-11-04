@@ -54,7 +54,7 @@ describe.skipIf(!goAvailable)("the engine against the Go server", () => {
     expect(a.manifests.parsed(1)?.app).toBe("tracker");
     expect(a.manifests.get(1)?.opType("Approve")).toMatchObject({ lane: "GATED", optimistic: true });
     expect(a.manifests.get(1)?.opType("Set")).toMatchObject({ lane: "SEQUENCED", writes: ["note/{id}"] });
-    expect(a.manifests.get(1)?.template(1, "count/x")).toEqual({ rule: "counter", entity: false, parent: "" });
+    expect(a.manifests.get(1)?.template(1, "count/x")).toMatchObject({ rule: "counter", entity: false, parent: "" });
     expect(a.ofType("protocol-error")).toEqual([]);
   });
 

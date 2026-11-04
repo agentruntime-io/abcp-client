@@ -58,7 +58,7 @@ describe("V23 SHOULD-3, 09 [READ-94], 14 [CLI-44], [CLI-45]: a staged entry whos
     }
   }
 
-  it("the probe P4: the action meets BLOB_MISSING, the repair finds no bytes to upload, and the action is held (BLOB_BYTES_LOST) instead of being sent again for ever", async () => {
+  it("the probe P4: the action meets BLOB_MISSING, the repair finds no bytes to upload, and the action is held (14 Table 14.1, the row for BLOB_MISSING) and resent with the hold backoff instead of the client backoff", async () => {
     const r = await brig({ cfg: { blobs: { stash: new Damaged() } } });
     r.random.fixed = 0.5;
     await goOffline(r);
@@ -73,11 +73,11 @@ describe("V23 SHOULD-3, 09 [READ-94], 14 [CLI-44], [CLI-45]: a staged entry whos
     const mutates = r.server.calls.filter((c) => c.method === "mutate").length;
     const holds = r.engine.status().holds;
     expect(holds).toMatchObject([{ scope: "action", code: "BLOB_MISSING", mutationId: a.mutationId, blobIds: [ref.blobId] }]);
-    expect(mutates).toBeLessThan(10); // the silent loop of V21 MUST-1 sent it 56 times in 2 h
-    expect(r.engine.outbox().some((e) => e.mutationId === a.mutationId)).toBe(true); // the action stays, never sent while the hold lasts
+    expect(mutates).toBe(9); // the first send, and the eight resends of the hold backoff in 2 h (30 s, 1, 2, 4, 8, 16, 30, 30 min); the silent loop of V21 MUST-1 sent it 56 times
+    expect(r.engine.outbox().some((e) => e.mutationId === a.mutationId)).toBe(true); // the action stays
   });
 
-  it("the app stages the bytes again under the same id and the hold clears (a stash that reads them)", async () => {
+  it("the app stages the bytes again under the same id: the client uploads them, the resend gets another result, and the hold clears (a stash that reads them)", async () => {
     let damaged = true;
     class Healing extends MemoryBlobStash {
       override get(ks: string, id: string): Promise<StagedBlob | undefined> {

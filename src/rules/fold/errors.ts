@@ -19,6 +19,15 @@ export type FoldCode =
   /** A change names a key that no template of the record's manifest version matches (03 [ID-19]). */
   | "no-template"
   /**
+   * A record is structurally invalid by 16 [SEC-3], which judges it against the rules of 16 [SEC-2] and never against the app's limits in force: a key that breaks the segment syntax
+   * (03 §3.1, §3.3) or names a reserved key that nothing defines (03 [ID-47]); an envelope that breaks 07 §7.3 as a record shows it (05 [STATE-20], [STATE-24], 03 [ID-23]); a value that
+   * breaks the template's encoding or `value_schema`, or the `json/v1` limits of 05 [STATE-7] (05 [STATE-6], [STATE-10], [STATE-14], [STATE-15], [STATE-19], [STATE-27]). Not a stop of
+   * 15 [COMPAT-35]; each is handled as a `malformed` record is.
+   */
+  | "invalid-key"
+  | "invalid-envelope"
+  | "schema-invalid"
+  /**
    * The record is not one that a server writes: a SYSTEM body that does not read, a CRDT update that does not parse, a counter that
    * leaves its range, two applied changes to one key. Not a stop (15 [COMPAT-35]).
    */

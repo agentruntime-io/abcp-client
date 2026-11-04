@@ -22,7 +22,7 @@ function remoteEdit(r: Rig, fn: (t: Y.Text) => void): Uint8Array {
 }
 
 function writeRemote(r: Rig, update: Uint8Array, kind: ChangeKind = ChangeKind.CRDT_UPDATE): bigint {
-  return r.server.write(KS, [create(KeyChangeSchema, { key: KEY, kind, update })], { sub: "bob" });
+  return r.server.write(KS, [create(KeyChangeSchema, { key: KEY, kind, update, encoding: "yjs/v1" })], { sub: "bob" });
 }
 
 const textOf = (d: Y.Doc): string => d.getText("text").toString();

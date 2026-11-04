@@ -31,13 +31,11 @@
 // that closes without a completed `stop()` is a tab that left. The engine learns it from the tab's `gone` message, from a `pagehide` hint, and, for a crash or a close that sent nothing, from the lock that
 // each tab holds and the flusher asks for (`tab-layer.ts`, `presenceTabGone`).
 //
-// Q75.1 (decided, V21 SHOULD-1): "When several of its tabs are in one topic, the entry's state is the latest state that one of them set": "them" are the tabs in the topic, so when a tab leaves, the entry
-// takes the latest state that one of the tabs that remain set (`presenceLeave`); "its entry stays" is about the entry, not its state. When no tab that remains set a state there is nothing to take, and the
-// entry stays as it is, marked as the state of a tab that left (`orphaned`): the one gap of the text.
-//
-// SPEC-QUESTION (09 [READ-74], residual of Q75.1): the text does not say what the entry holds when the only tab that set a state leaves and the tabs that remain set none. Taken: the entry keeps that
-// state (a reading of the last state, marked `orphaned` in `presenceTopics`) and is kept alive with it, until a remaining tab sets one or the last tab leaves. Reading B: the entry is left to expire.
-// For Yjs awareness the state is the map of the tabs that remain, and the engine publishes it ([READ-83]).
+// Q75.1 (decided, V21 SHOULD-1; settled by the text of draft 17): "When several of its tabs are in one topic, the entry's state is the latest state that one of them set": "them" are the tabs in the topic,
+// so when a tab leaves, the entry takes the latest state that one of the tabs that remain set (`presenceLeave`); "its entry stays" is about the entry, not its state. "When the tab that set the entry's
+// state leaves and no remaining tab has set one, the entry keeps the last state that was published, is kept alive while any tab of the engine is in the topic, and is replaced by the next publish of a
+// remaining tab" (09 [READ-74], cited by 14 [CLI-61]): the engine keeps `Topic.latest`, the last state that a tab published through the engine (`publishPresence`), and goes on publishing it at the keepalive
+// (`orphaned` in `presenceTopics` says that the state is one that no tab in the topic set). For Yjs awareness the state is the map of the tabs that remain, and the engine publishes it ([READ-83]).
 
 import { create } from "@bufbuild/protobuf";
 import { timestampMs } from "@bufbuild/protobuf/wkt";
@@ -202,11 +200,11 @@ type Op = "join" | "publish";
 /** What the engine keeps of one topic. */
 class Topic {
   readonly tabs = new Map<string, TabState>();
-  /** Plain topics: the latest state that a tab set (09 [READ-74]), among the tabs that are in the topic; when the tab that set it left and no remaining tab set one, the state of that tab (see `orphaned`). */
+  /** Plain topics: the latest state that a tab published (09 [READ-74]), among the tabs that are in the topic; when the tab that set it left and no remaining tab set one, the last state that was published (see `orphaned`). */
   latest: Uint8Array | undefined;
   /** The sets of the topic so far: `TabState.setSeq` is drawn from it. */
   setCounter = 0;
-  /** `latest` is the state of a tab that left, and no tab that remains set one: the one gap of 09 [READ-74] (Q75.1). */
+  /** `latest` is the last state that was published by a tab that left, and no tab that remains set one: the entry keeps it (09 [READ-74]), until the next publish of a remaining tab. */
   orphaned = false;
   /** An entry of a frame was dropped as no entry of the server can be, and the engine said so (once for a session, not for every frame that a server floods). */
   droppedReported = false;
@@ -407,7 +405,7 @@ export abstract class PresenceLayer extends SessionLayer {
         this.pumpTopic(t);
       }
     } else if (t.latest !== undefined) {
-      t.orphaned = true; // no tab that remains set a state: the entry stays as the tab that left made it (the one gap)
+      t.orphaned = true; // 09 [READ-74]: no tab that remains set a state: the entry keeps the last state that was published, and is kept alive
     }
   }
 

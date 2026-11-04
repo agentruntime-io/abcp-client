@@ -268,7 +268,10 @@ describe("V21 SHOULD-1 (Q75.1), 09 [READ-74]: the entry's state is the latest st
     expect(entryState(r, ROOM)).toEqual({ v: 2 });
   });
 
-  it("when no tab that remains set a state the entry stays as it is (the one gap), marked as that of a tab that left; the first state of a remaining tab replaces it", async () => {
+  // Round 19 (draft 17), 09 [READ-74], cited by 14 [CLI-61]: "When the tab that set the entry's state leaves and no remaining tab has set one, the entry keeps the last state that was published, is kept
+  // alive while any tab of the engine is in the topic, and is replaced by the next publish of a remaining tab. When the last of its tabs in the topic leaves, the engine MUST leave the topic with
+  // `LeavePresence`." The text settles what Q75.1 left as a gap (marked SPEC-QUESTION before).
+  it("when no tab that remains set a state the entry keeps the last state that was published (09 [READ-74]), is kept alive while a tab is in the topic, and is replaced by the next publish of a remaining tab", async () => {
     const { r, t1, t2 } = await setup();
     await t1.engine.joinPresence(KS, ROOM); // in the topic, sets nothing
     await t2.engine.joinPresence(KS, ROOM);
@@ -276,12 +279,40 @@ describe("V21 SHOULD-1 (Q75.1), 09 [READ-74]: the entry's state is the latest st
     await settleAll(t1.engine, t2.engine);
     await t2.engine.leavePresence(KS, ROOM);
     await tick(r, [t1.engine, t2.engine], 3000);
-    expect(entryState(r, ROOM)).toEqual({ typing: true });
+    expect(entryState(r, ROOM)).toEqual({ typing: true }); // the last state that was published
     expect(t1.engine.presenceTopics()[0]).toMatchObject({ orphaned: true });
+    expect(leaves(r.server)).toBe(0); // t1 is in the topic: the engine does not leave it, and the other members get no `left_client_ids`
+    // kept alive: the entry would expire after the TTL (30 s here) if the engine did not publish it again, and it does, with the same state, for as long as a tab is in the topic
+    const before = publishedStates(r.server).length;
+    await tick(r, [t1.engine, t2.engine], 120_000, 5000);
+    const kept = publishedStates(r.server).slice(before);
+    expect(kept.length).toBeGreaterThanOrEqual(4); // about every half TTL
+    for (const s of kept) expect(s).toEqual({ typing: true });
+    expect(r.server.presence.entries(KS, ROOM)).toHaveLength(1); // the entry never expired
+    expect(leaves(r.server)).toBe(0);
+    // replaced by the next publish of a remaining tab
     await t1.engine.publishPresence(KS, ROOM, { typing: false });
     await tick(r, [t1.engine, t2.engine], 3000);
     expect(entryState(r, ROOM)).toEqual({ typing: false });
     expect(t1.engine.presenceTopics()[0]).toMatchObject({ orphaned: false });
+    // and when the last tab in the topic leaves, the engine leaves it
+    await t1.engine.leavePresence(KS, ROOM);
+    await tick(r, [t1.engine, t2.engine], 3000);
+    expect(leaves(r.server)).toBe(1);
+    expect(r.server.presence.entries(KS, ROOM)).toEqual([]);
+  });
+
+  it("a state that a tab published and the engine has not sent yet (coalesced within the publish interval) is the last state that was published when that tab leaves: it is sent, and the entry keeps it", async () => {
+    const { r, t1, t2 } = await setup();
+    await t1.engine.joinPresence(KS, ROOM);
+    await t2.engine.joinPresence(KS, ROOM);
+    await t2.engine.publishPresence(KS, ROOM, { n: 1 });
+    await settleAll(t1.engine, t2.engine);
+    await t2.engine.publishPresence(KS, ROOM, { n: 2 }); // within the interval of the first: it waits for the next slot
+    await t2.engine.leavePresence(KS, ROOM);
+    await tick(r, [t1.engine, t2.engine], 3000);
+    expect(entryState(r, ROOM)).toEqual({ n: 2 });
+    expect(leaves(r.server)).toBe(0);
   });
 });
 

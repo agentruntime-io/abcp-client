@@ -26,10 +26,10 @@ export type HoldKind =
   | "UNKNOWN_DROP_REASON"
   | "CONFLICT_WAIT"
   /**
-   * A client condition, not a row of the table (SPEC-QUESTION in `blobs.ts`): the server answered `BLOB_MISSING` to an action, and no stash of the engine holds the bytes of a blob that it names, so
-   * no upload can mend it. The action alone is held until the app stages the bytes again under the same blob id, or the action reaches its bound (14 [CLI-45]).
+   * The row of Table 14.1 for `BLOB_MISSING` for a name in an action's `blob_refs`, when the client holds the blob's bytes in no stash (09 [READ-94], 14 [CLI-44]): the action alone is held, its
+   * resends are made with the hold backoff, and the app is told that the bytes are missing, so that it can stage them again (`blobs.ts`).
    */
-  | "BLOB_BYTES_LOST"
+  | "BLOB_MISSING"
   | "EPOCH_RESOLUTION"
   | "NO_TOKEN"
   | "SUBJECT_REVOKED";
@@ -51,13 +51,13 @@ export interface Hold {
   boundMs?: number;
   /** The number of probes made, the exponent of the hold backoff. */
   attempts: number;
-  /** The lane's head action that a probe resends. */
+  /** The action that a probe resends: the lane's head, or the held action itself (`BLOB_MISSING`). */
   probeId?: string;
   /** The reject that started the hold, when one did: an action that the hold ends before it was ever sent is dead-lettered with it (14 [CLI-45]). */
   reject?: Reject;
   /** The time of the next probe has come: the head action may be resent, the keyspace re-added, the call repeated. */
   probeDue?: boolean;
-  /** `BLOB_BYTES_LOST`: the blobs of the action whose bytes the engine does not hold. */
+  /** `BLOB_MISSING`: the blobs of the action whose bytes the engine holds in no stash. */
   blobIds?: string[];
 }
 

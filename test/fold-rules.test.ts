@@ -259,7 +259,7 @@ describe("05 [STATE-43], [STATE-45] (Q12, V6 MUST-B): a change covered by a subt
   const records: Record<string, KeyChange[]> = {
     // a nested marker that was present, changed by a CAS and by a SET
     "nested marker CAS and title SET": [del("issue/x"), casAbsent("issue/x/comment/c1", "{}"), set("issue/x/title", '"U"')],
-    "nested marker SET, body SET": [del("issue/x"), set("issue/x/comment/c1", "{}"), set("issue/x/comment/c1/body", '"V"'), del("issue/x/title")],
+    "nested marker SET, body SET": [del("issue/x"), casAbsent("issue/x/comment/c1", "{}"), set("issue/x/comment/c1/body", '"V"'), del("issue/x/title")],
     // a nested marker that the record deletes too, and changes
     "nested marker DELETE and body SET": [del("issue/x"), del("issue/x/comment/c1"), set("issue/x/comment/c1/body", '"V"'), set("issue/x/title", '"U"')],
     // a nested marker that holds a tombstone, and one that was never there
@@ -304,7 +304,7 @@ describe("05 [STATE-43], [STATE-45] (Q12, V6 MUST-B): a change covered by a subt
   it("a nested marker that was present before the record keeps its entity tombstone when the record changes it after the DELETE", () => {
     for (const c of [
       [del("issue/x"), casAbsent("issue/x/comment/c1", "{}")],
-      [del("issue/x"), set("issue/x/comment/c1", "{}")],
+      [del("issue/x"), override("issue/x/comment/c1", "{}")],
     ]) {
       const f = setup();
       f.op(...c);
@@ -397,7 +397,7 @@ describe("15 [COMPAT-35] (V1 SHOULD-4): a reader stops at exactly an unknown cha
 
   it("stops at a change kind, an encoding and a decision status that it does not know, wherever they stand in the record", () => {
     const f = new Fixture();
-    f.op(set("v/a", "1"), set("c/n", '"not a counter"'));
+    f.op(set("v/a", "1"), override("c/n", '"not a counter"')); // a counter key that holds a value that is no counter: only an OVERRIDE can leave one (05 [STATE-26])
     const decision = (status: number, changes: KeyChange[]): RecordMessage => {
       const r = record(RecordKind.DECISION, 2, changes);
       r.mutationId = "m1";
@@ -429,16 +429,19 @@ describe("15 [COMPAT-35] (V1 SHOULD-4): a reader stops at exactly an unknown cha
       expect(err.rule).toBe("COMPAT-35");
     }
 
-    // the four encodings of Table 5.2.1 are known, and a change with no encoding names none to know
-    for (const enc of ["json/v1", "bytes/v1", "yjs/v1", "redacted/v1", ""]) {
-      f.op(withEncoding(ChangeKind.SET, "free/enc", enc));
-    }
+    // the four encodings of Table 5.2.1 are known: no stop, each on a change that is well formed for it
+    f.op(set("v/a", "2"));
+    f.op(create(KeyChangeSchema, { key: "v/bytes", kind: ChangeKind.SET, value: bytes("raw"), encoding: "bytes/v1" }));
+    f.op(crdtUpdate("d/enc", TEXT_UPDATE));
+    f.op(blank(set("v/blanked", "1")));
+    // a change with no encoding names none to know: it is no stop, and a `SET` without one is refused as an envelope that breaks 05 [STATE-20] (16 [SEC-3])
+    expect(f.refused(op(f.next(), withEncoding(ChangeKind.SET, "v/noenc", "")), "invalid-envelope").stop).toBe(false);
     f.op(del("v/a"), incr("c/k", 1n));
   });
 
   it("a change of a known kind and encoding that the fold cannot apply is no stop (02 [ARC-46])", () => {
     const f = new Fixture();
-    f.op(set("v/a", "1"), set("c/n", '"not a counter"'));
+    f.op(set("v/a", "1"), override("c/n", '"not a counter"')); // a counter key that holds a value that is no counter: only an OVERRIDE can leave one (05 [STATE-26])
     // an INCR on a value that is no counter
     expect(f.refused(op(f.next(), incr("c/n", 1n)), "malformed").stop).toBe(false);
     // a key that matches no template, two changes to one key, a CRDT update that is no Yjs update

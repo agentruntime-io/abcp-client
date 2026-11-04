@@ -4,7 +4,7 @@
 
 import { describe, expect, it } from "vitest";
 import { cas, set, type ExportRecord } from "../src/engine/index.js";
-import { kc, KS, ofType, rig, tick, types } from "./helpers/engine.js";
+import { kc, kcCas, KS, ofType, rig, tick, types } from "./helpers/engine.js";
 import { settleAll, tabsRig, typesOf } from "./helpers/tabs.js";
 import type { FakeTransport } from "../src/fake/index.js";
 
@@ -12,10 +12,10 @@ describe("scenario: a restart that resumes from storage and finds the world chan
   it("the app is closed with a note; Bob edits it while Ana is away; Ana reopens offline, edits against the persisted copy, and connects: a conflict, in which the handler sees Bob's value, and her merge is a new action", async () => {
     const seen: string[] = [];
     const r = await rig({ heartbeatMs: 0 });
-    r.server.write(KS, [kc("notes/n1", "set", "base")]);
+    r.server.write(KS, [kcCas("notes/n1", "base")]);
     await r.engine.settle();
     await r.engine.stop();
-    r.server.write(KS, [kc("notes/n1", "set", "bobs")], { sub: "bob" }); // while Ana is away
+    r.server.write(KS, [kcCas("notes/n1", "bobs")], { sub: "bob" }); // while Ana is away
     const r2 = await rig({
       storage: r.storage,
       server: r.server,

@@ -315,17 +315,20 @@ describe("09 [READ-89], 14 [CLI-44]: an action that names a blob that is not com
     expect(ofType(r, "held")).toEqual([]);
   });
 
-  // V21 MUST-1 (09 [READ-94]): the engine cannot re-upload bytes that it does not hold, and a resend would meet the same answer for ever: the action is held, loudly (the full scenarios are in
-  // test/engine-blobs-lost.test.ts), where it was resent with the backoff before
-  it("BLOB_MISSING for a blob that the engine holds no bytes of: the action is held (`held` event, scope action, the blob id in the status), not resent, nothing dead-lettered, and no server blob is deleted", async () => {
+  // 14 Table 14.1, the row for `BLOB_MISSING` when the client holds the blob's bytes in no stash (14 [CLI-44], [CLI-45], 09 [READ-94]): the engine cannot re-upload bytes that it does not hold, so
+  // the action is held (the action alone) and reported, and resent with the hold backoff, not with the client backoff (the full scenarios are in test/engine-blob-missing-hold.test.ts)
+  it("BLOB_MISSING for a blob that the engine holds no bytes of: the action is held (`held` event, scope action, the blob id in the status), resent with the hold backoff, nothing dead-lettered, and no server blob is deleted", async () => {
     const r = await brig();
     r.random.fixed = 0.5;
     const { mutationId } = await submitWith(r, ["z".repeat(22)]);
     await r.engine.settle();
     expect(calls(r.server, "mutate")).toBe(1);
-    await r.clock.advance(60_000);
+    await r.clock.advance(29_000);
     await r.engine.settle();
-    expect(calls(r.server, "mutate")).toBe(1); // no silent resend
+    expect(calls(r.server, "mutate")).toBe(1); // the first wait of the hold backoff is [0, 1 min], here 30 s: not the client backoff of 1 s
+    await r.clock.advance(2_000);
+    await r.engine.settle();
+    expect(calls(r.server, "mutate")).toBe(2); // resent, unchanged, and still held
     expect(r.engine.outbox().map((e) => e.mutationId)).toEqual([mutationId]);
     expect(r.engine.deadLetterEntries()).toEqual([]);
     expect(r.engine.status().holds).toEqual([{ scope: "action", code: "BLOB_MISSING", keyspaceId: KS, mutationId, blobIds: ["z".repeat(22)] }]);

@@ -43,16 +43,16 @@ describe("what the client reads of a manifest", () => {
   const m = readManifest(answer(DOC), 1, "tracker");
 
   it("gives the fold the merge rule, the entity marker and the parent of each template, the parent being the longest entity prefix compared as text, variable names included (04 [MAN-20], draft 15)", () => {
-    expect(m.template(1, "issue/7")).toEqual({ rule: "lww", entity: true, parent: "" });
+    expect(m.template(1, "issue/7")).toMatchObject({ rule: "lww", entity: true, parent: "" });
     // `issue/{x}/title` spells the enclosing entity's variable otherwise: its prefix `issue/{x}` is no entity template's text, so it has no parent
-    expect(m.template(1, "issue/7/title")).toEqual({ rule: "lww", entity: false, parent: "" });
-    expect(m.template(1, "issue/7/flag")).toEqual({ rule: "lww", entity: false, parent: "issue/{id}" });
+    expect(m.template(1, "issue/7/title")).toMatchObject({ rule: "lww", entity: false, parent: "" });
+    expect(m.template(1, "issue/7/flag")).toMatchObject({ rule: "lww", entity: false, parent: "issue/{id}" });
     // fold-parent-014: `crate/{y}/part/{id}` has no parent beside the entity `crate/{x}`
-    expect(m.template(1, "crate/c1/part/p1")).toEqual({ rule: "lww", entity: false, parent: "" });
-    expect(m.template(1, "issue/7/comment/c1")).toEqual({ rule: "lww", entity: true, parent: "issue/{id}" });
-    expect(m.template(1, "issue/7/comment/c1/body")).toEqual({ rule: "cas", entity: false, parent: "issue/{id}/comment/{cid}" });
-    expect(m.template(1, "count/x")).toEqual({ rule: "counter", entity: false, parent: "" });
-    expect(m.template(1, "doc/d1")).toEqual({ rule: "crdt", entity: false, parent: "" });
+    expect(m.template(1, "crate/c1/part/p1")).toMatchObject({ rule: "lww", entity: false, parent: "" });
+    expect(m.template(1, "issue/7/comment/c1")).toMatchObject({ rule: "lww", entity: true, parent: "issue/{id}" });
+    expect(m.template(1, "issue/7/comment/c1/body")).toMatchObject({ rule: "cas", entity: false, parent: "issue/{id}/comment/{cid}" });
+    expect(m.template(1, "count/x")).toMatchObject({ rule: "counter", entity: false, parent: "" });
+    expect(m.template(1, "doc/d1")).toMatchObject({ rule: "crdt", entity: false, parent: "" });
     expect(m.template(1, "seq/number")?.rule).toBe("counter");
     expect(m.template(1, "nothing/here")).toBeUndefined();
     expect(m.template(1, "issue/7/title/extra")).toBeUndefined();
@@ -106,7 +106,7 @@ describe("what the client reads of a manifest", () => {
         "doc/{id}": { rule: "crdt", roots: { t: "text" } },
       },
     });
-    for (const key of ["issue/1", "issue/1/title", "issue/1/flag", "crate/c1", "crate/c1/part/p1", "count/q", "doc/z"]) expect(m.template(1, key)).toEqual(s.template(1, key));
+    for (const key of ["issue/1", "issue/1/title", "issue/1/flag", "crate/c1", "crate/c1/part/p1", "count/q", "doc/z"]) expect(m.template(1, key)).toMatchObject({ rule: s.template(1, key)?.rule, entity: s.template(1, key)?.entity, parent: s.template(1, key)?.parent, encoding: s.template(1, key)?.encoding });
   });
 });
 

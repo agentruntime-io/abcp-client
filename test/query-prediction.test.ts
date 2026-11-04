@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 import { Code } from "../src/gen/abpc/v2/types_pb.js";
 import { reject as mk } from "../src/fake/index.js";
 import { cas, del, incr, jsonBytes, set } from "../src/engine/index.js";
-import { goOffline, goOnline, kc, ofType, rejectResult, types } from "./helpers/engine.js";
+import { goOffline, goOnline, kc, kcCas, ofType, rejectResult, types } from "./helpers/engine.js";
 import { jsonOf, keysOf, KS, put, qrig, watch } from "./helpers/query.js";
 
 describe("the predicted view and the confirmed state (14 [CLI-6])", () => {
@@ -121,7 +121,7 @@ describe("a pending change is committed, reverted or corrected, and a live query
     const w = watch(r, { keyspaceId: KS, select: { prefix: "note/" } });
     expect(w.updates[0]?.added).toEqual([]);
     // another principal makes the expectation hold before the action is sent
-    r.server.write(KS, [kc("note/n1", "set", "y")]);
+    r.server.write(KS, [kcCas("note/n1", "y")]);
     r.server.faults.paused = true;
     await goOnline(r);
     r.server.resumeDelivery();

@@ -49,7 +49,7 @@ describe.skipIf(!goAvailable)("the transport against the Go server", () => {
         const m = ms.parsed(1);
         expect(m?.app).toBe(APP);
         expect(m?.hash).toHaveLength(32);
-        expect(ms.template(1, "doc/x")).toEqual({ rule: "crdt", entity: false, parent: "" });
+        expect(ms.template(1, "doc/x")).toMatchObject({ rule: "crdt", entity: false, parent: "" });
         expect(ms.get(1)?.counterRange("count/x")).toEqual({ min: 0n, max: 1000000n });
         expect(ms.get(1)?.opType("Approve")).toMatchObject({ lane: "GATED", logIntent: true });
         // the active version (0) answers with the version's own number

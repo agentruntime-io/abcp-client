@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { cas, del, incr, jsonBytes, LocalRefusal, set, StaticManifests, type Predictor } from "../src/engine/index.js";
 import { Code, ChangeKind } from "../src/gen/abpc/v2/types_pb.js";
 import { reject as mk } from "../src/fake/index.js";
-import { goOffline, goOnline, kc, KS, ofType, rejectResult, rig, text, types } from "./helpers/engine.js";
+import { goOffline, goOnline, kc, kcCas, KS, ofType, rejectResult, rig, text, types } from "./helpers/engine.js";
 
 describe("14 [CLI-6] the view is confirmed state plus the pending actions, in outbox order", () => {
   it("shows pending changes at once, in outbox order, and recomputes when confirmed state advances", async () => {
@@ -47,8 +47,7 @@ describe("14 [CLI-10] lww", () => {
 describe("14 [CLI-11] cas", () => {
   it("is shown as pending, and its value is predicted only if its expectation holds against the view below it", async () => {
     const r = await rig();
-    r.server.write(KS, [kc("notes/n1", "set", "base")].map((c) => ({ ...c, kind: ChangeKind.SET })));
-    // notes/{id} is a cas template: a server write uses SET only through the fold, which accepts any kind for a stored row
+    r.server.write(KS, [kcCas("notes/n1", "base")]); // notes/{id} is a cas template: the record carries a CAS (05 [STATE-19])
     await goOffline(r);
     await r.clock.advance(0);
     await r.engine.settle();
@@ -71,7 +70,7 @@ describe("14 [CLI-11] cas", () => {
     const c = await r.engine.submit({ keyspaceId: KS, opType: "CasSet", changes: [cas("notes/n1", "new", { value: jsonBytes("y") })] });
     expect(r.engine.view(KS).get("notes/n1")).toBeUndefined();
     // meanwhile another principal sets the value to "y", so the expectation holds when the action is sent
-    r.server.write(KS, [kc("notes/n1", "set", "y")]);
+    r.server.write(KS, [kcCas("notes/n1", "y")]);
     r.server.faults.paused = true; // the record of the other write, and the one of this action, arrive together after the result
     await goOnline(r);
     r.server.resumeDelivery();
@@ -299,7 +298,7 @@ describe("14 [CLI-20] prediction is total", () => {
 describe("14 [CLI-11] cas: an expectation by version (the default of the `cas` builder) is read from the confirmed state, and holds against the view below it", () => {
   it("a pending CAS whose version is the confirmed one is predicted; one behind another pending action on the key is not, since that action's version does not exist yet", async () => {
     const r = await rig();
-    r.server.write(KS, [kc("notes/n1", "set", "base")]);
+    r.server.write(KS, [kcCas("notes/n1", "base")]);
     await r.engine.settle();
     await goOffline(r);
     const first = await r.engine.submit({ keyspaceId: KS, opType: "CasSet", changes: [cas("notes/n1", "first")] }); // version 1: the confirmed one

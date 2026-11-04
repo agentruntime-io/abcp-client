@@ -769,7 +769,19 @@ export class FakeServer {
    * unknown kind, a required feature it lacks, an unknown SYSTEM kind that must be understood, 06 [LOG-11]). The server's state is
    * only moved to its seq.
    */
-  appendRaw(id: string, init: { kind?: number; requiredFeatures?: readonly string[]; system?: { kind: number; mustUnderstand: boolean; body?: Uint8Array }; changes?: KeyChange[] }): bigint {
+  appendRaw(
+    id: string,
+    init: {
+      kind?: number;
+      requiredFeatures?: readonly string[];
+      system?: { kind: number; mustUnderstand: boolean; body?: Uint8Array };
+      changes?: KeyChange[];
+      /** The envelope fields of the record that a test breaks on purpose (16 [SEC-3]): the ids of 03 [ID-23]. */
+      causationId?: string;
+      correlationId?: string;
+      blobRefs?: readonly string[];
+    },
+  ): bigint {
     const k = this.ks(id);
     const rec = this.record(k, (init.kind ?? RecordKind.OP) as RecordKind, {
       principal: this.principal("other"),
@@ -779,6 +791,9 @@ export class FakeServer {
       ...(init.system !== undefined ? { system: create(SystemEventSchema, { kind: init.system.kind as SystemKind, mustUnderstand: init.system.mustUnderstand, body: init.system.body ?? new Uint8Array(), encoding: "json/v1" }) } : {}),
     });
     rec.requiredFeatures = [...(init.requiredFeatures ?? [])];
+    if (init.causationId !== undefined) rec.causationId = init.causationId;
+    if (init.correlationId !== undefined) rec.correlationId = init.correlationId;
+    if (init.blobRefs !== undefined) rec.blobRefs = [...init.blobRefs];
     k.log.push(rec);
     k.state.setCursor(rec.seq, k.epoch, k.manifestVersion);
     this.deliver(k);

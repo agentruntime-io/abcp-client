@@ -181,7 +181,7 @@ export interface HeldEvent extends Base {
   code: string;
   /** The hold's bound, in server time (ms since the epoch), when it has one (14 [CLI-45]). */
   bound?: number;
-  /** A hold for bytes that the engine lost (`BLOB_MISSING`, scope `action`): the blobs that the app stages again, under these ids, to clear it. */
+  /** The hold of 14 Table 14.1 for `BLOB_MISSING` when the client holds the blob's bytes in no stash (scope `action`): the blobs whose bytes are missing, which the app supplies with `stageBlob` under these ids. */
   blobIds?: string[];
 }
 
@@ -397,7 +397,7 @@ export interface HoldInfo {
   code: string;
   /** The hold's bound in server time, ms since the epoch. */
   bound?: number;
-  /** A hold for bytes that the engine lost (`BLOB_MISSING`, scope `action`): the blobs that the app stages again, under these ids, to clear it. */
+  /** The hold of 14 Table 14.1 for `BLOB_MISSING` when the client holds the blob's bytes in no stash (scope `action`): the blobs whose bytes are missing, which the app supplies with `stageBlob` under these ids. */
   blobIds?: string[];
 }
 

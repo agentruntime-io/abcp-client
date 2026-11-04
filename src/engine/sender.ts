@@ -195,12 +195,12 @@ export abstract class SenderLayer extends ReactionLayer {
     return out;
   }
 
-  /** Whether the hold that blocks `e` lets it through as the probe of the hold (a resend of the head, 14 [CLI-45]). */
-  private probeFor(e: OutboxEntry): Hold | undefined {
-    for (const h of this.holds.blocking(e)) {
-      if (h.probeDue === true && h.probeId === e.mutationId && (h.scope === "lane" || h.scope === "keyspace")) return h;
-    }
-    return undefined;
+  /**
+   * Whether the hold lets `e` through as its probe: a resend of the head of a lane or keyspace hold, or of the action that a `BLOB_MISSING` hold holds (14 [CLI-45], Table 14.1), at the time
+   * that the hold backoff gives.
+   */
+  private static isProbeOf(h: Hold, e: OutboxEntry): boolean {
+    return h.probeDue === true && h.probeId === e.mutationId && (h.scope === "lane" || h.scope === "keyspace" || h.kind === "BLOB_MISSING");
   }
 
   private canSendNow(e: OutboxEntry): boolean {
@@ -210,8 +210,8 @@ export abstract class SenderLayer extends ReactionLayer {
     if (rt.nextAttemptAt > this.clock.now()) return false;
     const blocking = this.holds.blocking(e);
     if (blocking.length > 0) {
-      // only the probe of a lane or keyspace hold goes through, and only when no other hold stops the action
-      const others = blocking.filter((h) => !(h.probeDue === true && h.probeId === e.mutationId && (h.scope === "lane" || h.scope === "keyspace")));
+      // only the probe of a hold goes through (a resend of the head of a lane or keyspace hold, of the action of a `BLOB_MISSING` hold), and only when no other hold stops the action
+      const others = blocking.filter((h) => !SenderLayer.isProbeOf(h, e));
       if (others.length > 0) return false;
     }
     if (this.unresolvedDeps(e).length > 0) return false;
@@ -463,9 +463,10 @@ export abstract class SenderLayer extends ReactionLayer {
     const f = this.follows.get(e.keyspaceId);
     if (e.lane === "GATED" && r.intentSeq > 0n) e.registered = true;
     const o = r.outcome;
-    // a result that is not the hold's own ends the hold of a resend (14 Table 14.1)
+    // a result that is not the hold's own ends the hold of a resend (14 Table 14.1): `Reject{BLOB_MISSING}` is the own result of the hold of an action whose blob bytes the client holds in no stash
     const rejectKind = o.case === "rejected" ? (await Promise.resolve(this.holdKindOfResult(o.value))) : undefined;
-    if (source === "mutate" || source === "poll") this.clearProbeHolds(e, rejectKind);
+    const keepKind = rejectKind ?? (o.case === "rejected" && o.value.code === Code.BLOB_MISSING ? "BLOB_MISSING" : undefined);
+    if (source === "mutate" || source === "poll") this.clearProbeHolds(e, keepKind);
     switch (o.case) {
       case "appended": {
         e.lastResult = { kind: "appended", what: `seq ${o.value.seq}`, atMs: this.serverNow() };

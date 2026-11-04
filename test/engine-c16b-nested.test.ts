@@ -132,7 +132,7 @@ describe("14 [CLI-13], Q67: the nested text that the guard covers", () => {
     const h = r.engine.crdt(KS, KEY);
     const remote = new Y.Doc();
     remote.getMap("m").set("body", new Y.Text(PAIR));
-    r.server.write(KS, [create(KeyChangeSchema, { key: KEY, kind: ChangeKind.CRDT_UPDATE, update: Y.encodeStateAsUpdate(remote) })], { sub: "bob" });
+    r.server.write(KS, [create(KeyChangeSchema, { key: KEY, kind: ChangeKind.CRDT_UPDATE, update: Y.encodeStateAsUpdate(remote), encoding: "yjs/v1" })], { sub: "bob" });
     await r.engine.settle();
     const t = h.doc.getMap("m").get("body") as Y.Text;
     expect(t.toString()).toBe(PAIR);

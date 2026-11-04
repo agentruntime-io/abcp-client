@@ -1,6 +1,8 @@
 // What the fold reads of a manifest: the template that a key matches under a manifest version (04 §4.4), and the topology of
 // markers and parents that follows from the templates (05 §5.6).
 
+import type { Schema } from "../jsonv1/index.js";
+
 /** The merge rule of a key's template (05 §5.4). The state records it with each key, so that the per-key state hash needs no manifest. */
 export type Rule = "lww" | "cas" | "counter" | "crdt";
 
@@ -16,6 +18,13 @@ export interface Template {
    * first segments (05 §5.6, "with the same id segments").
    */
   parent: string;
+  /**
+   * The template's encoding (05 [STATE-6]): `json/v1`, `bytes/v1` or `yjs/v1`. Absent where the reader of the manifest does not know it: a change's encoding is then not compared with it
+   * (16 [SEC-3] judges a record against the manifest version that it carries, as far as the reader tells).
+   */
+  encoding?: string;
+  /** The template's `value_schema` (04 §4.4.2), read for its use (04 [MAN-18]); absent when the template has none or the reader of the manifest does not read it. */
+  schema?: Schema;
 }
 
 /**

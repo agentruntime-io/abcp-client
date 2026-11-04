@@ -102,7 +102,7 @@ describe("V19 N4: what the client does with a manifest costs by the length of a 
       const got = m.template(1, key);
       if (want === undefined) expect(got, key).toBeUndefined();
       else {
-        expect(got, key).toEqual({ rule: expect.any(String), entity: want.entity, parent: naive.parent(want.text) });
+        expect(got, key).toMatchObject({ rule: expect.any(String), entity: want.entity, parent: naive.parent(want.text) });
         expect(m.templatePattern(key), key).toBe(want.text);
       }
     }

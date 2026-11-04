@@ -224,12 +224,20 @@ export abstract class ReactionLayer extends ReplicaLayer {
         }
         await this.run(() => {
           if (!this.entries.has(e.mutationId) || e.outcome !== undefined) return;
-          // 09 [READ-94], 14 [CLI-44], V21 MUST-1: the server has not the blob, and the engine holds the bytes of a blob that the action names in no stash: with nothing to upload, or after an upload that
-          // did not mend it, a resend meets the same answer for ever. The action is held, loudly, until the app stages the bytes again (see the SPEC-QUESTION in `blobs.ts`).
+          // 14 Table 14.1, the row for `BLOB_MISSING` (09 [READ-94], 14 [CLI-44]): the server has not the blob, and the client holds the bytes of a blob that the action names in no stash: with nothing
+          // to upload, or after an upload that did not mend it, a resend meets the same answer until the app supplies the bytes. The client keeps the action and holds it (the action alone), resends it
+          // with the hold backoff (the probe of the hold), and tells the app that the bytes are missing (the `held` event and the sync status name the blobs).
           if (why === "missing" && done !== undefined && done.lacking.length > 0 && (done.uploaded === 0 || rt.blobRepairs > 0)) {
-            this.startHold({ kind: "BLOB_BYTES_LOST", scope: "action", keyspaceId: e.keyspaceId, mutationId: e.mutationId, code: codeName(Code.BLOB_MISSING), blobIds: done.lacking });
-            return; // the entry is not sent while the hold lasts (`nextAttemptAt` stays out of reach; `bytesStagedAgain` frees it)
+            const h = this.startHold({ kind: "BLOB_MISSING", scope: "action", keyspaceId: e.keyspaceId, mutationId: e.mutationId, code: codeName(Code.BLOB_MISSING), blobIds: done.lacking, probeId: e.mutationId });
+            h.blobIds = [...done.lacking];
+            // a resend of the held action is the probe: the sender spends it and arms the next, so that a hold in force has its timer already
+            if (!this.probeTimers.has(h.key) && h.probeDue !== true) this.armProbe(h);
+            rt.nextAttemptAt = 0; // the probe is the only thing that gates the resend now (`canSendNow`)
+            this.schedulePump();
+            return;
           }
+          // the bytes are held again (the app staged them and the repair uploaded them): the row does not apply, and the action is repaired and resent as 14 [CLI-44] says for every other `BLOB_MISSING`
+          this.stopHold("BLOB_MISSING", e.keyspaceId, undefined, e.mutationId);
           if (done !== undefined && done.uploaded > 0) rt.blobRepairs++;
           rt.nextAttemptAt = 0;
           this.deferEntry(e, Math.max(0, delayMs - (this.clock.now() - started)));
@@ -620,6 +628,13 @@ export abstract class ReactionLayer extends ReplicaLayer {
     this.probeTimers.set(h.key, cancel);
   }
 
+  /** The probe of a hold is due now, not when its timer says: an event that the row names as a cause to try again (the app staged the bytes that `BLOB_MISSING` waits for). The next probe is armed when this one is spent. */
+  protected probeNow(h: Hold): void {
+    this.probeTimers.get(h.key)?.();
+    this.probeTimers.delete(h.key);
+    h.probeDue = true;
+  }
+
   /** A probe is due: do what the hold's row says (14 Table 14.1). */
   protected onProbeDue(h: Hold): void {
     const f = h.keyspaceId !== undefined ? this.follows.get(h.keyspaceId) : undefined;
@@ -644,6 +659,9 @@ export abstract class ReactionLayer extends ReplicaLayer {
       case "UNKNOWN_HOLD":
       case "MUTATE_FAILURE":
         this.schedulePump(); // the lane's head is resent, unchanged
+        break;
+      case "BLOB_MISSING":
+        this.schedulePump(); // the held action is resent, unchanged, unless its blobs are being repaired (`nextAttemptAt`): the pump after the repair sends it
         break;
       case "HISTORY_DIVERGED":
         if (f !== undefined) {
@@ -707,9 +725,10 @@ export abstract class ReactionLayer extends ReplicaLayer {
   /** A result that is not the hold's own ends it (14 Table 14.1, "clears when"): a resend that gets another result. */
   protected clearProbeHolds(e: OutboxEntry, keep: HoldKind | undefined): void {
     for (const h of this.holds.all()) {
-      if (h.kind !== "UNSUPPORTED_FEATURE" && h.kind !== "UNKNOWN_HOLD" && h.kind !== "MUTATE_FAILURE" && h.kind !== "KEYSPACE_NOT_FOUND" && h.kind !== "UNKNOWN_OP_TYPE") continue;
+      if (h.kind !== "UNSUPPORTED_FEATURE" && h.kind !== "UNKNOWN_HOLD" && h.kind !== "MUTATE_FAILURE" && h.kind !== "KEYSPACE_NOT_FOUND" && h.kind !== "UNKNOWN_OP_TYPE" && h.kind !== "BLOB_MISSING") continue;
       if (h.keyspaceId !== e.keyspaceId || h.kind === keep) continue;
       if (h.scope === "lane" && h.lane !== e.lane) continue;
+      if (h.scope === "action" && h.mutationId !== e.mutationId) continue; // `BLOB_MISSING` holds the action alone
       if (h.kind === "KEYSPACE_NOT_FOUND" && h.keyspaceId !== undefined) {
         // the keyspace exists (14 Table 14.1, "Clears when"): a session that dropped it with NOT_FOUND follows it again, with the load of a resume check
         const f = this.follows.get(h.keyspaceId);
@@ -949,8 +968,8 @@ export abstract class ReactionLayer extends ReplicaLayer {
         await this.endAction(e, { sink: "none", reject: makeReject(Code.CANCELLED, ErrorClass.DEAD_LETTER, "cancelled by the app"), reason: codeName(Code.CANCELLED), dependents: "fail" });
         return true;
       }
-      // held for bytes that the engine lost (`BLOB_BYTES_LOST`, see `blobs.ts`): the server answered BLOB_MISSING, which records nothing (09 [READ-89]), so the action can leave as one never sent
-      if (!e.registered && this.holds.has("BLOB_BYTES_LOST", e.keyspaceId, undefined, mutationId)) {
+      // held for bytes that the client holds in no stash (14 Table 14.1, `BLOB_MISSING`): the server answered BLOB_MISSING, which records nothing (09 [READ-89]), so the action can leave as one never sent
+      if (!e.registered && this.holds.has("BLOB_MISSING", e.keyspaceId, undefined, mutationId)) {
         await this.endAction(e, { sink: "none", reject: makeReject(Code.CANCELLED, ErrorClass.DEAD_LETTER, "cancelled by the app"), reason: codeName(Code.CANCELLED), dependents: "fail", slot: "release" });
         return true;
       }

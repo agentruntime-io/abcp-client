@@ -140,7 +140,7 @@ describe("V21 MUST-1, 09 [READ-94], 14 [CLI-21]: the bytes that a durable outbox
     expect(durable.engine.status().blobStash).toBe("durable");
   });
 
-  it("the bytes of an action are lost (a stash that was cleared): the server answers BLOB_MISSING, the action is held loudly, nothing is resent, and the lane is not wedged for good", async () => {
+  it("the bytes of an action are lost (a stash that was cleared): the server answers BLOB_MISSING, the action is held loudly and resent with the hold backoff (14 Table 14.1), and the lane is not wedged for good", async () => {
     const r = await brig();
     r.random.fixed = 0.5;
     await goOffline(r);
@@ -159,7 +159,11 @@ describe("V21 MUST-1, 09 [READ-94], 14 [CLI-21]: the bytes that a durable outbox
       await r.clock.advance(300_000); // two hours
       await r.engine.settle();
     }
-    expect(calls(r.server, "mutate")).toBe(sentWhenHeld); // 57 calls in two hours before: no silent resend
+    // 14 Table 14.1: "resends it with the hold backoff", 1 min x 2^n up to 1 h, drawn here at its middle (random.fixed = 0.5): 30 s, 1 min, 2, 4, 8, 16, 30 min, 30 min. Eight resends in two hours, a few
+    // more than none and far fewer than the 57 that the client backoff (cap 5 min) made before the V21 fix
+    expect(calls(r.server, "mutate") - sentWhenHeld).toBe(8);
+    expect(held(r)).toHaveLength(1); // the resends do not start the hold again, or end it
+    expect(ofType(r, "held").map((e) => e.state)).toEqual(["start"]);
     expect(r.engine.deadLetterEntries()).toEqual([]);
     expect(r.engine.outbox().map((e) => e.mutationId)).toContain(a.mutationId);
     // the app stages the same bytes again under the same blob id: the hold clears, the engine uploads them and sends the action, and the actions behind it follow

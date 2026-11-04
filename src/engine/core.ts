@@ -201,7 +201,7 @@ export interface Runtime {
    * its staged blobs and uploads them, `ready` when the send may go (`blobs.ts`).
    */
   blobs: "unchecked" | "checking" | "ready";
-  /** How many repairs of the action's blobs uploaded something (`BLOB_MISSING`, 09 [READ-89]): a second one that meets the same answer, with bytes lacking, holds the action. */
+  /** How many repairs of the action's blobs uploaded something (`BLOB_MISSING`, 09 [READ-89]): a second one that meets the same answer, with bytes lacking, holds the action (14 Table 14.1). */
   blobRepairs: number;
   /** How often a request that carried it got `Unauthenticated` (14 [CLI-50]). */
   authTries: number;
@@ -746,7 +746,7 @@ export abstract class EngineCore {
     this.runtimes.delete(id);
     this.decoded.delete(id);
     // the action is gone (retired, cancelled, ended): the hold that waited for the app to stage its bytes again goes with it (`blobs.ts`)
-    for (const h of this.holds.all()) if (h.kind === "BLOB_BYTES_LOST" && h.mutationId === id) this.stopHold(h.kind, h.keyspaceId, h.lane, h.mutationId);
+    for (const h of this.holds.all()) if (h.kind === "BLOB_MISSING" && h.mutationId === id) this.stopHold(h.kind, h.keyspaceId, h.lane, h.mutationId);
   }
 
   /** The outbox entries of a keyspace, in outbox order (14 [CLI-6]). */
@@ -870,7 +870,7 @@ export abstract class EngineCore {
       case "EPOCH_RESOLUTION":
         return "keyspace";
       case "CONFLICT_WAIT":
-      case "BLOB_BYTES_LOST":
+      case "BLOB_MISSING":
         return "action";
       default:
         return "app";

@@ -9,7 +9,7 @@ import { reject as mk } from "../src/fake/index.js";
 import { PublishPresenceRequestSchema, PublishPresenceResponseSchema, SubscribeRequestSchema } from "../src/gen/abpc/v2/sync_pb.js";
 import { Code, RetryReason, RetrySchema } from "../src/gen/abpc/v2/types_pb.js";
 import { FakeRaw, breakUtf8 } from "./helpers/raw.js";
-import { goOffline, goOnline, rig } from "./helpers/engine.js";
+import { goOffline, goOnline, kc, rig } from "./helpers/engine.js";
 import { DOC, frame, KS, PRESENCE_MANIFEST, plain, presenceManifests, prig, protocolErrors, publishedStates, requests, ROOM, second, stateOf } from "./helpers/presence.js";
 import { FakeServer, ManualClock } from "../src/fake/index.js";
 import { settleAll, tabsRig } from "./helpers/tabs.js";
@@ -323,7 +323,7 @@ describe("09 [READ-71], 16 [SEC-30]: presence is never stored", () => {
     expect(a.engine.presenceEntries(KS, ROOM)).toHaveLength(1);
     expect(b.engine.presenceEntries(KS, ROOM)).toHaveLength(1);
     // the same server write that a restart would have to replay: write something to the keyspace so that the storage is used
-    a.server.write(KS, []);
+    a.server.write(KS, [kc("settings/x", "set", 1)]);
     await a.engine.settle();
     for (const r of [a, b]) {
       const st = await r.storage.load();

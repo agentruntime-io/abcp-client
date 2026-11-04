@@ -6,8 +6,9 @@
 // A record is applied whole or not at all (02 [ARC-28]): the fold first reads the record and settles what every change does, and
 // only then changes the state, so a refusal leaves the state as it was.
 //
-// What the fold reads of a manifest is the small `Rules` interface. It reads no limit, no value schema and no gate: the commit
-// judged them, and a record that the server wrote is applied as it says.
+// What the fold reads of a manifest is the small `Rules` interface. It reads no limit of the app and no gate: the commit judged them,
+// and a record that the server wrote is applied as it says. It judges the record's structure as 16 [SEC-3] says (`judge.ts`): the
+// envelope, the keys, the `json/v1` limits and the value schema of the manifest version that the record carries.
 
 import {
   ChangeKind,
@@ -20,6 +21,7 @@ import { CrdtError, Doc, parseUpdate, type Update } from "../crdt/index.js";
 import { applyIncr, counterText, JsonV1Error, parseCounter } from "../jsonv1/index.js";
 import { compareUtf8 } from "../bytes.js";
 import { type Anomaly, refuse } from "./errors.js";
+import { judgeChange, judgeChangeKey, judgeRecord } from "./judge.js";
 import { type Rules, type Template, VersionTopology } from "./rules.js";
 import { selectSystem, type Selection } from "./system.js";
 import {
@@ -106,6 +108,8 @@ export function applyRecord(st: ReplicaState, rules: Rules, rec: RecordMessage, 
     if (isNew) st.applied(seq, rec.logEpoch, rec.manifestVersion);
     return { moved: isNew, skipped: 0 };
   }
+  // 16 [SEC-3]: the envelope of the record, judged before its changes (`plan` judges each change that the record applies)
+  judgeRecord(rec);
   const p = plan(st, rules, rec, sel, opts, isNew);
   commit(st, rec, p);
   if (isNew) {
@@ -279,12 +283,16 @@ function plan(st: ReplicaState, rules: Rules, rec: RecordMessage, sel: Selection
   for (const i of sel.applied) {
     const c = rec.changes[i] as KeyChange;
     const key = c.key;
-    if (key === "") throw refuse("malformed", seq, "ID-13", `change ${i} has no key`);
+    // 16 [SEC-3]: the syntax of the key (03 [ID-1], [ID-2], [ID-13]) and the reserved namespace (03 [ID-47])
+    judgeChangeKey(rec, i, key);
     // STATE-5, MUT-15: one action never changes a key twice, and the records of the server's own work do not either.
     if (seen.has(key)) throw refuse("malformed", seq, "STATE-5", `the record changes key "${key}" twice`);
     seen.add(key);
     const tpl = top.template(key);
     if (tpl === undefined) throw refuse("no-template", seq, "ID-19", `key "${key}" matches no template of manifest version ${rec.manifestVersion}`);
+    // 16 [SEC-3]: the change against the envelope rules, and its value against the encoding and the value schema of the template of the manifest version that the record carries, and the `json/v1`
+    // limits of 05 [STATE-7]; never against a limit of the app in force (07 §7.9)
+    judgeChange(rec, i, c, tpl);
     // STATE-38, READ-16: a change whose seq is not above the key's version, or above the deletion seq of a deleted ancestor marker,
     // is skipped without error.
     if (seq <= st.gateVersion(top, key)) {

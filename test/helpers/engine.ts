@@ -117,7 +117,7 @@ export const text = (b: Uint8Array | undefined): string | undefined => (b === un
 // ---------------------------------------------------------------------------------------------------------------------
 
 import { create } from "@bufbuild/protobuf";
-import { ChangeKind, KeyChangeSchema, type KeyChange } from "../../src/gen/abpc/v2/types_pb.js";
+import { CasExpectSchema, ChangeKind, KeyChangeSchema, type KeyChange } from "../../src/gen/abpc/v2/types_pb.js";
 import { jsonBytes } from "../../src/engine/index.js";
 
 /** A KeyChange for a write that the server makes directly (`FakeServer.write`). */
@@ -125,6 +125,14 @@ export function kc(key: string, kind: "set" | "delete" | "incr", v?: unknown): K
   if (kind === "delete") return create(KeyChangeSchema, { key, kind: ChangeKind.DELETE });
   if (kind === "incr") return create(KeyChangeSchema, { key, kind: ChangeKind.INCR, delta: BigInt(v as number) });
   return create(KeyChangeSchema, { key, kind: ChangeKind.SET, value: jsonBytes(v), encoding: "json/v1" });
+}
+
+/**
+ * A `CAS` change for a write that the server makes directly (`FakeServer.write`) to a `cas` key: a record carries the change as authored, with its expectation (05 [STATE-20], [STATE-24]), and a client
+ * engine refuses a record that writes a `cas` key with another kind (16 [SEC-3], 05 [STATE-19]).
+ */
+export function kcCas(key: string, v: unknown): KeyChange {
+  return create(KeyChangeSchema, { key, kind: ChangeKind.CAS, value: jsonBytes(v), encoding: "json/v1", expected: create(CasExpectSchema, { expect: { case: "absent", value: true } }) });
 }
 
 /** Drops the session: the engine is offline until the clock moves (the reconnect backoff of 09 [READ-57]). */

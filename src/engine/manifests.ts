@@ -7,7 +7,7 @@
 // `StaticManifests` below builds the same interface from a plain description, for the fake server and the tests.
 
 import type { Roots, RootType } from "../rules/crdt/index.js";
-import type { Range } from "../rules/jsonv1/index.js";
+import type { Range, Schema } from "../rules/jsonv1/index.js";
 import {
   expandKeyTemplate,
   matchKeyTemplate,
@@ -76,8 +76,10 @@ export interface StaticTemplate {
   fencedBy?: string;
   roots?: Record<string, RootType>;
   range?: Range;
-  /** The value encoding that a client can display; default `json/v1`. */
+  /** The value encoding of the template (05 [STATE-6]): default `json/v1` (`yjs/v1` for a CRDT template). A record that writes the key with another one is structurally invalid (16 [SEC-3]). */
   encoding?: string;
+  /** The template's `value_schema`, read (`parseSchema`): a record whose value breaks it is structurally invalid (16 [SEC-3], 05 [STATE-10]). */
+  schema?: Schema;
 }
 
 export interface StaticOpType {
@@ -131,7 +133,7 @@ class StaticVersion implements EngineManifest {
         const cand = segs.slice(0, n).join("/");
         if (entity.has(cand)) parent = cand;
       }
-      this.list.push({ tpl, template: { rule: t.rule, entity: t.entity === true, parent }, spec: t });
+      this.list.push({ tpl, template: { rule: t.rule, entity: t.entity === true, parent, encoding: t.encoding ?? (t.rule === "crdt" ? "yjs/v1" : "json/v1"), ...(t.schema !== undefined ? { schema: t.schema } : {}) }, spec: t });
     }
     for (const [name, o] of Object.entries(spec.opTypes ?? {})) {
       const info: OpTypeInfo = {

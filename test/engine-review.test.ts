@@ -8,7 +8,7 @@ import { MutateRequestSchema } from "../src/gen/abpc/v2/sync_pb.js";
 import { ChangeKind, Code, ErrorClass, RetryReason, StaleCause, SuccessorRuleSchema, type SuccessorRule } from "../src/gen/abpc/v2/types_pb.js";
 import { LaneState } from "../src/engine/follow.js";
 import { ManualClock, reject as mk, rejectWith } from "../src/fake/index.js";
-import { goOffline, goOnline, kc, KS, MANIFEST, mutateRequests, ofType, rejectResult, retryResult, rig, sentIds, tick, types, type Rig } from "./helpers/engine.js";
+import { goOffline, goOnline, kc, kcCas, KS, MANIFEST, mutateRequests, ofType, rejectResult, retryResult, rig, sentIds, tick, types, type Rig } from "./helpers/engine.js";
 
 const rule = (prefix: string, keyspaceId: string): SuccessorRule => create(SuccessorRuleSchema, { prefix, keyspaceId });
 const calls = (r: Rig): string[] => r.server.calls.map((c) => c.method);
@@ -291,7 +291,7 @@ describe("14 [CLI-38], [CLI-40]: the verdict `corrected` or `committed` is decid
     expect(r.engine.view(KS).noEffectKeys(c.mutationId)).toEqual(["notes/n1"]);
     await r.engine.stop();
     // another writer makes the expectation true; the engine restarts; the CAS commits
-    r.server.write(KS, [kc("notes/n1", "set", "old")]);
+    r.server.write(KS, [kcCas("notes/n1", "old")]);
     const r2 = await rig({ storage: r.storage, server: r.server, clock: r.clock, seed: 8 });
     await tick(r2, 5000);
     expect(r2.events.filter((e) => e.type === "committed" || e.type === "corrected").map((e) => [e.type, (e as { keys?: string[] }).keys])).toEqual([["corrected", ["notes/n1"]]]);

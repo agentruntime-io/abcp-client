@@ -576,7 +576,7 @@ describe("a CRDT key in a live query (14 [CLI-13])", () => {
     Y.applyUpdate(other, Y.encodeStateAsUpdate(server));
     const sv = Y.encodeStateVector(other);
     other.getText("text").insert(5, "!");
-    r.server.write(KS, [create(KeyChangeSchema, { key: "doc/d1", kind: ChangeKind.CRDT_UPDATE, update: Y.encodeStateAsUpdate(other, sv) })], { sub: "bob" });
+    r.server.write(KS, [create(KeyChangeSchema, { key: "doc/d1", kind: ChangeKind.CRDT_UPDATE, update: Y.encodeStateAsUpdate(other, sv), encoding: "yjs/v1" })], { sub: "bob" });
     await r.engine.settle();
     expect(w.log()).toEqual(["~doc/d1"]);
     const row = w.live.snapshot().rows[0];

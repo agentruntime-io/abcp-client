@@ -5,7 +5,7 @@ import * as Y from "yjs";
 import { cas, del, incr, jsonBytes, set } from "../src/engine/index.js";
 import { Code, StaleCause, type ErrorClass } from "../src/gen/abpc/v2/types_pb.js";
 import { reject as mk } from "../src/fake/index.js";
-import { goOffline, goOnline, kc, KS, mutateRequests, ofType, rejectResult, rig, sentIds, tick, types, text } from "./helpers/engine.js";
+import { goOffline, goOnline, kc, kcCas, KS, mutateRequests, ofType, rejectResult, rig, sentIds, tick, types, text } from "./helpers/engine.js";
 
 describe("scenario: offline writes, then reconnect (14 [CLI-6], [CLI-21], [CLI-26], [CLI-27], [CLI-31], [CLI-62])", () => {
   it("the user works offline: every action is shown at once, survives a restart of the engine, and goes out in order, once, when the connection returns", async () => {
@@ -88,12 +88,12 @@ describe("scenario: a CONFLICT handed to the app's handler (14 [CLI-47], [CLI-48
         },
       },
     });
-    r.server.write(KS, [kc("notes/n1", "set", "base")]);
+    r.server.write(KS, [kcCas("notes/n1", "base")]);
     await r.engine.settle();
     await goOffline(r);
     // authored against version 1 of the note; Bob changes it meanwhile
     const mine = await r.engine.submit({ keyspaceId: KS, opType: "CasSet", changes: [cas("notes/n1", "mine")] });
-    r.server.write(KS, [kc("notes/n1", "set", "theirs")], { sub: "bob" });
+    r.server.write(KS, [kcCas("notes/n1", "theirs")], { sub: "bob" });
     await goOnline(r);
     await tick(r, 3000);
     expect(seen).toEqual(['theirs="theirs"'.replace('"theirs"', "theirs")]);

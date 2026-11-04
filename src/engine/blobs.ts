@@ -40,12 +40,19 @@
 //
 // SPEC-QUESTION (09 [READ-86]): the text gives no count for `CreateUploadResponse.upload_headers`. Taken: at most `MAX_UPLOAD_HEADERS` (counts.ts).
 //
-// SPEC-QUESTION (09 [READ-94], 14 [CLI-44], [CLI-45], V21 MUST-1): "re-uploads on `BLOB_MISSING`" needs the bytes. When the server answers `BLOB_MISSING` to an action, and no stash of the engine
-// holds the bytes of a blob that the action names (a memory stash after a restart, a cleared storage), no upload can mend it and a resend meets the same answer for ever, holding the action's slot
-// and every later action of its lane. Table 14.1 has no row for it. Taken: a client condition that holds the action alone (scope `action`, code `BLOB_MISSING`, `BLOB_BYTES_LOST` in the engine), with
-// the `held` event and the blob ids in the sync status, no resend while it holds; it clears when the app stages the bytes again under the same blob id (`stageBlob`), and at the bound of every hold
-// (14 [CLI-45]) the action ends as the table says. The app may also cancel the action (nothing was recorded: `Reject{BLOB_MISSING}` records nothing, 09 [READ-89]). `Retry{BLOB_PENDING}` with no
-// bytes is resent as before.
+// 14 Table 14.1, the row for `BLOB_MISSING` for a name in an action's `blob_refs`, when the client holds the blob's bytes in no stash (09 [READ-94], 14 [CLI-44], [CLI-45]): "re-uploads on
+// `BLOB_MISSING`" needs the bytes. When the server answers `BLOB_MISSING` to an action, and no stash of the engine holds the bytes of a blob that the action names (a memory stash after a restart, a
+// cleared storage), no upload can mend it. The client keeps the action and holds it (scope `action`: the action alone), resends it with the hold backoff (04 Table 4.11: the probe of the hold, `armProbe`),
+// and reports to the app that the bytes are missing, so that the app can supply them: the `held` event (code `BLOB_MISSING`) and the sync status name the blobs. The app supplies the bytes with
+// `stageBlob` under the same blob id: the client uploads them and resends the action, and the hold clears when a resend gets another result than `Reject{BLOB_MISSING}`. The bound is the default one
+// (14 [CLI-45]): an action that was ever sent is reported as outcome unknown when it is reached. The app may also cancel the action (nothing was recorded: `Reject{BLOB_MISSING}` records nothing,
+// 09 [READ-89]). `Retry{BLOB_PENDING}` with no bytes is resent as before, and holds nothing.
+//
+// SPEC-QUESTION (14 Table 14.1, the row for `BLOB_MISSING`): the row says that the client "resends it with the hold backoff", and clears "when the app supplies the bytes: the client uploads them and a
+// resend gets another result". Reading A (taken): the supply of the bytes is an event of its own, so the client uploads them and resends at once, as the probe of the hold, without waiting out the backoff
+// (an app that staged the bytes again would otherwise wait up to an hour); the hold clears with that resend's result, and when the result is `BLOB_MISSING` again with the bytes now held, the row no longer
+// applies and the action is repaired and resent as 14 [CLI-44] says for every other `BLOB_MISSING`. Reading B: every resend of a held action waits for the next time that the hold backoff gives, the one after
+// the supply of the bytes included.
 //
 // SPEC-QUESTION (14 [CLI-66], [CLI-76], 09 [READ-94]): [CLI-66] lists "blob cache" on the purge list of a keyspace, and [CLI-76] speaks of "downloaded blob bytes" and says never "the bytes that
 // an unsent action still carries (09 [READ-94])"; no rule names the bytes that a client staged. Reading A (taken): staged bytes are the principal's data and part of the local copy, so the
@@ -464,7 +471,7 @@ export abstract class BlobLayer extends PresenceLayer {
       // a durable stash can fail (a quota, a database that another tab closed): nothing was staged, and the app is told as for an action that cannot be stored (14 [CLI-21])
       throw new LocalRefusal("STORAGE", `the bytes of the blob could not be kept: ${e instanceof Error ? e.message : String(e)}`, storageCauseOf(e));
     }
-    // an action that was held because the engine had lost these bytes is sent again (see the SPEC-QUESTION in the header)
+    // an action that is held because the client held these bytes in no stash is resent (14 Table 14.1, `BLOB_MISSING`; see the header)
     this.post(() => this.bytesStagedAgain(keyspaceId, blobId));
     return { keyspaceId, blobId, sha256, size: staged.size, contentType };
   }
@@ -614,21 +621,22 @@ export abstract class BlobLayer extends PresenceLayer {
   }
 
   /**
-   * The bytes of blobs that a held action names are staged again (`stageBlob` under the same blob id): an action that waited for them (`BLOB_BYTES_LOST`, see the SPEC-QUESTION in the header) is
-   * uploaded again and sent.
+   * The bytes of blobs that a held action names are staged again (`stageBlob` under the same blob id): the app supplies the bytes that the hold of 14 Table 14.1 (`BLOB_MISSING`) waits for. "The client
+   * uploads them and a resend gets another result": the upload is made before the send (`blobsReady`), and the action is resent at once, as the probe of the hold (see the SPEC-QUESTION in the header).
+   * The hold itself clears with the result of that resend (`clearProbeHolds`).
    */
   private bytesStagedAgain(keyspaceId: string, blobId: string): void {
     for (const h of this.holds.all()) {
-      if (h.kind !== "BLOB_BYTES_LOST" || h.blobIds === undefined || !h.blobIds.includes(blobId)) continue;
+      if (h.kind !== "BLOB_MISSING" || h.blobIds === undefined || !h.blobIds.includes(blobId)) continue;
       const e = h.mutationId === undefined ? undefined : this.entries.get(h.mutationId);
       if (e === undefined || !this.stashKeyspaces(e).has(keyspaceId)) continue;
       h.blobIds = h.blobIds.filter((id) => id !== blobId);
-      if (h.blobIds.length > 0) continue; // the other blobs are still lost
-      this.stopHold(h.kind, h.keyspaceId, h.lane, h.mutationId);
+      if (h.blobIds.length > 0) continue; // the other blobs are still missing
       const rt = this.rt(e.mutationId);
       rt.blobs = "unchecked"; // the upload before the send is made again, from the bytes that were staged
       rt.blobRepairs = 0;
       rt.nextAttemptAt = 0;
+      this.probeNow(h);
       this.schedulePump();
     }
   }

@@ -26,7 +26,7 @@ import { decodeMessage, encodeMessage } from "../engine/wire.js";
 import { sha256 } from "../rules/crypto.js";
 import type { Roots, RootType } from "../rules/crdt/index.js";
 import { expandKeyTemplate, matchKeyTemplate, parseKeyTemplate, type KeyTemplate, type Rule, type Template } from "../rules/fold/index.js";
-import { JsonV1Error, getMember, intRange, parseDocument, schemaFromValue, type JsonValue, type Range } from "../rules/jsonv1/index.js";
+import { JsonV1Error, getMember, intRange, parseDocument, schemaFromValue, type JsonValue, type Range, type Schema, type SchemaUse } from "../rules/jsonv1/index.js";
 
 const ROOT_TYPES: ReadonlySet<string> = new Set(["text", "map", "array", "xml_fragment"]);
 
@@ -71,9 +71,12 @@ export class ParsedManifest implements EngineManifest {
         const merge = getMember(attrs, "merge");
         const rule: Rule = merge === "crdt:yjs/v1" ? "crdt" : merge === "cas" ? "cas" : merge === "counter" ? "counter" : "lww";
         const fb = getMember(attrs, "fenced_by");
+        const encoding = getMember(attrs, "encoding");
+        const enc = typeof encoding === "string" ? encoding : rule === "crdt" ? "yjs/v1" : "json/v1";
+        const schema = rule === "crdt" ? undefined : valueSchema(getMember(attrs, "value_schema"), rule === "counter" ? "counter" : enc === "bytes/v1" ? "bytes" : "json");
         const c: Compiled = {
           tpl,
-          template: { rule, entity: getMember(attrs, "entity") === true, parent: "" },
+          template: { rule, entity: getMember(attrs, "entity") === true, parent: "", encoding: enc, ...(schema !== undefined ? { schema } : {}) },
           roots: rootsOf(getMember(attrs, "crdt_roots")),
           range: rule === "counter" ? counterRange(getMember(attrs, "value_schema")) : undefined,
           fencedBy: typeof fb === "string" ? parseKeyTemplate(fb) : undefined,
@@ -164,6 +167,20 @@ function rootsOf(v: JsonValue | undefined): Roots | undefined {
   const out = new Map<string, RootType>();
   for (const [name, t] of v) if (typeof t === "string" && ROOT_TYPES.has(t)) out.set(name, t as RootType);
   return out;
+}
+
+/**
+ * The `value_schema` of a template, read for its use (04 [MAN-18]), for the structural judgement of a record (16 [SEC-3]). A schema that this reader cannot read is no schema: the server judged the manifest at
+ * publish (04 §4.11), and a client does not refuse a record for a schema that it cannot read.
+ */
+function valueSchema(schema: JsonValue | undefined, use: SchemaUse): Schema | undefined {
+  if (schema === undefined) return undefined;
+  try {
+    return schemaFromValue(schema, use);
+  } catch (e) {
+    if (e instanceof JsonV1Error) return undefined;
+    throw e;
+  }
 }
 
 function counterRange(schema: JsonValue | undefined): Range {

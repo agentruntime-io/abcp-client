@@ -55,6 +55,9 @@ function set(key: string, value: string): KeyChange {
   return create(KeyChangeSchema, { key, kind: ChangeKind.SET, value: json(value), encoding: "json/v1" });
 }
 const del = (key: string): KeyChange => create(KeyChangeSchema, { key, kind: ChangeKind.DELETE });
+/** A `CAS` of a `cas` key (05 [STATE-19]); the record carries the change as authored, with its expectation (05 [STATE-24]). */
+const casAbsent = (key: string, value: string): KeyChange =>
+  create(KeyChangeSchema, { key, kind: ChangeKind.CAS, value: json(value), encoding: "json/v1", expected: { expect: { case: "absent", value: true } } });
 const incr = (key: string, delta: bigint): KeyChange => create(KeyChangeSchema, { key, kind: ChangeKind.INCR, delta });
 const update = (key: string, hex: string): KeyChange =>
   create(KeyChangeSchema, { key, kind: ChangeKind.CRDT_UPDATE, update: fromHex(hex), encoding: "yjs/v1" });
@@ -107,7 +110,7 @@ describe("05 [STATE-38] the version-gated test and 09 [READ-16] overlapping deli
 
   it("the deletion seq of a deleted ancestor marker gates the keys of its subtree", () => {
     const st = new ReplicaState();
-    applyRecord(st, rules, op(1, set("m/x", "{}"), set("m/x/title", '"a"')));
+    applyRecord(st, rules, op(1, casAbsent("m/x", "{}"), set("m/x/title", '"a"')));
     applyRecord(st, rules, op(2, del("m/x")));
     expect(st.tombstone("m/x")).toMatchObject({ kind: "entity", version: 2n });
     expect(st.key("m/x/title")).toBeUndefined();
