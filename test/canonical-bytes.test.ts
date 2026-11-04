@@ -110,13 +110,9 @@ describe("06 [LOG-71] value digests, E, C, W and record_hash (record-hash vector
   }
 });
 
-// Round 18 (spec draft 16, omniview 6e5fe6f): the vectors the code does not pass yet, with the batch that will (the server's list is
-// server/internal/vectors/pending.go). Remove an entry when its work lands.
-const PENDING = new Map<string, string>([
-  ["request-digest-009", "R19-B2: 12 [ADM-94] (J7), every split and archive prefix is cleared"],
-  ["request-digest-010", "R19-B2: 12 [ADM-94] (J7), every split and archive prefix is cleared"],
-  ["request-digest-011", "R19-B2: 12 [ADM-94] (J7), every split and archive prefix is cleared"],
-]);
+// The vectors the code does not pass yet, with the batch that will (the server's list is server/internal/vectors/pending.go).
+// Remove an entry when its work lands; round 19's request-digest-009 to 011 (J7) landed with the split and archive prefixes.
+const PENDING = new Map<string, string>([]);
 
 // Since round 18 (12 [ADM-94], m9) the digest also clears `RedactRequest.keys` and the `key` of every OVERRIDE change whose key
 // matches a template that is `personal` in the manifest version in force; a vector lists those keys in `personal_keys` (the
@@ -181,6 +177,40 @@ describe("12 [ADM-94] the personal keys of a request digest, beyond the vectors"
   it("only an OVERRIDE change is judged: the key of a change of another kind stays", () => {
     const set = requestDigest(MutationSchema, override(1, "patient/p7/email"), personal);
     expect(toHex(set.canonical)).toContain(toHex(utf8("patient/p7/email")));
+  });
+});
+
+describe("12 [ADM-94] (J7) the split and archive prefixes of a request digest, beyond the vectors", () => {
+  const split = (reason: string, ...rules: [string, string][]) =>
+    fromVectorJson(messageDesc("abpc.v2.SplitKeyspaceRequest"), {
+      keyspace_id: "acme/crm",
+      reason,
+      rules: rules.map(([prefix, id]) => ({ prefix, new_keyspace_id: id })),
+    });
+  const archive = (prefix: string) =>
+    fromVectorJson(messageDesc("abpc.v2.ArchiveKeyspaceRequest"), {
+      keyspace_id: "acme/crm-old",
+      reason: "old",
+      successors: [{ prefix, keyspace_id: "acme/crm-ana" }, { keyspace_id: "acme/crm-archive" }],
+    });
+  const digest = (type: string, m: Parameters<typeof requestDigest>[1]) => requestDigest(messageDesc(type), m);
+
+  it("no prefix of a rule or of a successor is in the digest, the keyspace ids, their number and the reason are", () => {
+    const base = digest("abpc.v2.SplitKeyspaceRequest", split("by owner", ["user/ana@example.com/", "acme/crm-ana"], ["", "acme/crm-rest"]));
+    const prefixes = digest("abpc.v2.SplitKeyspaceRequest", split("by owner", ["user/bob@example.com/", "acme/crm-ana"], ["rest/", "acme/crm-rest"]));
+    expect(toHex(prefixes.digest)).toBe(toHex(base.digest));
+    expect(toHex(base.canonical)).not.toContain(toHex(utf8("user/")));
+    const successor = digest("abpc.v2.SplitKeyspaceRequest", split("by owner", ["user/ana@example.com/", "acme/crm-bob"], ["", "acme/crm-rest"]));
+    expect(toHex(successor.digest)).not.toBe(toHex(base.digest));
+    const fewer = digest("abpc.v2.SplitKeyspaceRequest", split("by owner", ["user/ana@example.com/", "acme/crm-ana"]));
+    expect(toHex(fewer.digest)).not.toBe(toHex(base.digest));
+    const reason = digest("abpc.v2.SplitKeyspaceRequest", split("another", ["user/ana@example.com/", "acme/crm-ana"], ["", "acme/crm-rest"]));
+    expect(toHex(reason.digest)).not.toBe(toHex(base.digest));
+
+    const a1 = digest("abpc.v2.ArchiveKeyspaceRequest", archive("user/ana@example.com/"));
+    const a2 = digest("abpc.v2.ArchiveKeyspaceRequest", archive(""));
+    expect(toHex(a1.digest)).toBe(toHex(a2.digest));
+    expect(toHex(a1.canonical)).not.toContain(toHex(utf8("user/")));
   });
 });
 
