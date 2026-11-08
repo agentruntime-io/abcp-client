@@ -237,15 +237,12 @@ describe.skipIf(!testServerAvailable)("the engine against the test binary (three
       expect((await settle(ts.control.setFault({ clear: true }))).ok).toBe(true);
       expect(await timed("note/cleared")).toBeLessThan(DELAY_MS);
     }
-    // the slots of later milestones answer Unimplemented, whatever P4 has built: the restore hook (R3) and the break-glass trigger (16 [SEC-44])
-    const slots: [string, () => Promise<unknown>][] = [
-      ["Restore", () => ts.control.restore({ app: "tracker", keyspace: KS })],
-      ["BreakGlass", () => ts.control.breakGlass({})],
-    ];
-    for (const [name, call] of slots) {
-      const r = await settle(call());
-      expect(r.ok ? undefined : r.code, name).toBe(Code.Unimplemented);
-    }
+    // the restore hook (R3-P1b) is built: a restore that names no backup point is refused as a request
+    const restore = await settle(ts.control.restore({ app: "tracker", keyspace: KS }));
+    expect(restore.ok ? undefined : restore.code, "Restore").toBe(Code.InvalidArgument);
+    // the break-glass trigger (16 [SEC-44]) is a slot of a later milestone, and answers Unimplemented
+    const breakGlass = await settle(ts.control.breakGlass({}));
+    expect(breakGlass.ok ? undefined : breakGlass.code, "BreakGlass").toBe(Code.Unimplemented);
   });
 
   it("a crash: StopNode stops a node at once, its engine holds its work, and StartNode brings it back on the stores that it kept", async () => {
