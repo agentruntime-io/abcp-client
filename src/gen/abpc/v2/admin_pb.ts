@@ -1590,7 +1590,8 @@ export type GetKeyspaceStatusResponse = Message<"abpc.v2.GetKeyspaceStatusRespon
 
   /**
    * its own in A and C, or, after a lost range or split, until a restore or
-   * its deletion (spec/13 [PLC-44], spec/12 [ADM-35])
+   * its deletion (spec/13 [PLC-44], spec/12 [ADM-35]); never, once its epoch
+   * advance before a deletion has been made (spec/12 [ADM-10], spec/13 [PLC-82])
    *
    * the whole successor map: a split's rules or an archive's successors, in the order
    *
