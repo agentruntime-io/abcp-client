@@ -148,8 +148,9 @@ describe("05 [STATE-38] the version-gated test and 09 [READ-16] overlapping deli
     const row = st.key("doc/d");
     expect(row?.version).toBe(6n);
     expect(toHex(row?.doc?.canonical() ?? new Uint8Array())).toBe("000000010000000000000005000000000000000200000000");
+    // S-01: the key's version (6) gates it too, so the redelivery is skipped (the SPEC-QUESTION at ReplicaState.gateVersion)
     const dup = applyRecord(st, rules, op(6, update("doc/d", "01010501840500016200")));
-    expect(dup).toEqual({ moved: false, skipped: 0 });
+    expect(dup).toEqual({ moved: false, skipped: 1 });
     expect(st.key("doc/d")?.version).toBe(6n);
     expect(toHex(st.key("doc/d")?.doc?.canonical() ?? new Uint8Array())).toBe("000000010000000000000005000000000000000200000000");
   });

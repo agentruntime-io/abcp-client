@@ -888,13 +888,18 @@ export abstract class ReactionLayer extends ReplicaLayer {
     if (e === trigger) return true;
     if (e.registered) return false;
     if (!e.everSent) return true;
+    // B3-M7: `sent`, a request that left and was never answered (a crash in between): its outcome is unknown, and `pollNow` asks the source
     if (e.lastResult?.kind === "reject") return true;
     return e.lastResult?.kind === "retry" && e.lane === "SEQUENCED";
   }
 
-  /** Whether the source's answer `known = false`, `voided = false` frees a GATED action whose last result was a Retry to be moved (14 [CLI-52]). */
+  /**
+   * Whether the source's answer `known = false`, `voided = false` frees an action to be moved (14 [CLI-52]): a GATED action whose last result was a Retry, and (B3-M7) an
+   * action whose last request was never answered: the source recorded nothing for it, and a split or archived source applies nothing more.
+   */
   protected mayMoveAfterAnswer(f: Follow, e: OutboxEntry): boolean {
-    return (f.stopped === "MOVED" || f.stopped === "ARCHIVED") && e.lane === "GATED" && !e.registered && e.lastResult?.kind === "retry";
+    if (!(f.stopped === "MOVED" || f.stopped === "ARCHIVED") || e.registered) return false;
+    return (e.lane === "GATED" && e.lastResult?.kind === "retry") || e.lastResult?.kind === "sent";
   }
 
   /**

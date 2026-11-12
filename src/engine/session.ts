@@ -12,7 +12,7 @@
 // Revocation (`ACCESS_REVOKED`, `SUBJECT_REVOKED`, `GRANT_CHANGED`, `DELETED`): the session reads the frame and calls what 14 §14.9 and
 // §14.10 define, which `revocation.ts` implements ([CLI-66], [CLI-67], [CLI-77], [CLI-79]).
 
-import { create, toBinary } from "@bufbuild/protobuf";
+import { create, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
 import {
   GetMutationResultsRequestSchema,
   LoadStateRequestSchema,
@@ -25,6 +25,7 @@ import {
   type LoadStateResponse,
   type PresenceFrame,
   type SubscribeResponse,
+  type UpdateSubscriptionResponse,
 } from "../gen/abpc/v2/sync_pb.js";
 import {
   Code,
@@ -102,8 +103,29 @@ export abstract class SessionLayer extends SenderLayer {
     liveSince: number | undefined;
     /** The reason of the `Retry` that the last `Subscribe` got and that the client retries on (14 [CLI-41], [CLI-44]); undefined when none. */
     retrying: string | undefined;
-  } = { state: "idle", id: "", abort: undefined, hbMs: 15_000, watchdog: undefined, startedMono: 0, closing: undefined, reconnectAfter: undefined, attempts: 0, fatal: false, liveSince: undefined, retrying: undefined };
+    /** The `UpdateSubscription` calls of the live session, one after the other (09 [READ-62]); a new session starts a new chain. */
+    subChain: Promise<void>;
+    /** The session was refused for `max_keyspaces_per_session` (A.7, 09 [READ-35]): nothing is resent until what the engine follows changes (B3-M3). */
+    overCap: { followed: number } | undefined;
+  } = {
+    state: "idle",
+    id: "",
+    abort: undefined,
+    hbMs: 15_000,
+    watchdog: undefined,
+    startedMono: 0,
+    closing: undefined,
+    reconnectAfter: undefined,
+    attempts: 0,
+    fatal: false,
+    liveSince: undefined,
+    retrying: undefined,
+    subChain: Promise.resolve(),
+    overCap: undefined,
+  };
   private wakeSleep: (() => void) | undefined;
+  /** The keyspaces that the last `Subscribe` named (B3-M3). */
+  private lastSubscribeNamed = 0;
   private readonly epochFlows = new Set<string>();
   private readonly loadWaits = new Map<string, Promise<void>>();
 
@@ -118,11 +140,45 @@ export abstract class SessionLayer extends SenderLayer {
     this.epochFlows.clear();
     this.loadWaits.clear();
     this.sess.watchdog?.();
-    this.sess = { state: "idle", id: "", abort: undefined, hbMs: this.sess.hbMs, watchdog: undefined, startedMono: 0, closing: undefined, reconnectAfter: undefined, attempts: 0, fatal: false, liveSince: undefined, retrying: undefined };
+    this.sess = {
+      state: "idle",
+      id: "",
+      abort: undefined,
+      hbMs: this.sess.hbMs,
+      watchdog: undefined,
+      startedMono: 0,
+      closing: undefined,
+      reconnectAfter: undefined,
+      attempts: 0,
+      fatal: false,
+      liveSince: undefined,
+      retrying: undefined,
+      subChain: Promise.resolve(),
+      overCap: undefined,
+    };
   }
 
   protected sessionId(): string {
     return this.sess.id;
+  }
+
+  /**
+   * 09 [READ-62] (B3-M2): "A client MUST have at most one `UpdateSubscription` in flight per session: it sends the next one only after the previous one has been answered or
+   * has failed." Every `UpdateSubscription` of the engine goes through this queue of the live session. A call whose session is over before its turn is not sent, and gives
+   * undefined: the next session names the keyspaces from the cursors (09 [READ-57]).
+   */
+  protected updateSubscriptionQueued(fields: Omit<MessageInitShape<typeof UpdateSubscriptionRequestSchema>, "sessionId" | "$typeName">): Promise<UpdateSubscriptionResponse | undefined> {
+    const s = this.sess;
+    const sid = s.id;
+    const turn = s.subChain.then(() => {
+      if (s.state !== "live" || s.id !== sid || sid === "") return undefined;
+      return this.transport.updateSubscription(create(UpdateSubscriptionRequestSchema, { ...fields, sessionId: sid }));
+    });
+    s.subChain = turn.then(
+      () => undefined,
+      () => undefined,
+    );
+    return turn;
   }
 
   protected abortSession(): void {
@@ -253,7 +309,12 @@ export abstract class SessionLayer extends SenderLayer {
       await this.run(() => this.onSessionEnded(end, lived));
       if (this.sess.fatal || !this.running) return;
       const appHold = this.hasAppHold();
-      if (appHold !== undefined) {
+      const over = this.sess.overCap;
+      if (over !== undefined) {
+        // A.7, 09 [READ-35] (B3-M3): the `Subscribe` is not sent again unchanged; it waits until what the engine follows changes
+        while (this.running && !this.stopped && this.follows.size === over.followed) await this.sleep(Number.MAX_SAFE_INTEGER);
+        this.sess.overCap = undefined;
+      } else if (appHold !== undefined) {
         // 14 [CLI-45]: the probe of an app-wide hold is the next subscribe, after the hold backoff (its own timer wakes the loop)
         await this.sleep(Number.MAX_SAFE_INTEGER);
       } else {
@@ -293,6 +354,7 @@ export abstract class SessionLayer extends SenderLayer {
     for (const f of this.followList()) if (this.needsWidening(f)) await this.widenKeyspace(f);
     if (!this.running) return { kind: "clean" };
     const { follows, cursors } = this.fitSubscribe(this.followList().filter((f) => this.subscribable(f)));
+    this.lastSubscribeNamed = cursors.length;
     const ac = new AbortController();
     const s = this.sess;
     s.abort = ac;
@@ -373,6 +435,14 @@ export abstract class SessionLayer extends SenderLayer {
    * session, which `Subscribed` starts for each followed keyspace that is not on it yet, each request within that size (one cursor of at most 1,000 prefixes is
    * far under it, and one entry each, far under the 10,000 that [ARC-63] allows). The `Subscribe` names one keyspace at least, whatever its size.
    */
+  /**
+   * The most cursors that a `Subscribe` names (B3-M3): `maxSubscribeCursors`, and the `limits.max_keyspaces_per_session` in force (09 [READ-35]: a `Subscribe` of more is refused
+   * whole). The rest are named in adds, which the server answers with a rejection each over the limit.
+   */
+  private subscribeCap(): number {
+    return Math.min(this.maxSubscribeCursors, this.limits.maxKeyspacesPerSession);
+  }
+
   private fitSubscribe(all: Follow[]): { follows: Follow[]; cursors: KeyspaceCursor[] } {
     let size = toBinary(SubscribeRequestSchema, create(SubscribeRequestSchema, { supportedFeatures: [...this.features], clientId: this.clientId })).byteLength;
     const follows: Follow[] = [];
@@ -381,7 +451,7 @@ export abstract class SessionLayer extends SenderLayer {
       const c = this.cursorOf(f);
       const n = toBinary(KeyspaceCursorSchema, c).byteLength;
       size += 1 + varintLength(n) + n; // the tag of `keyspaces` (field 1), the length and the cursor
-      if (follows.length > 0 && (size > this.maxSubscribeBytes || follows.length >= this.maxSubscribeCursors)) break;
+      if (follows.length > 0 && (size > this.maxSubscribeBytes || follows.length >= this.subscribeCap())) break;
       follows.push(f);
       cursors.push(c);
     }
@@ -461,6 +531,7 @@ export abstract class SessionLayer extends SenderLayer {
         break;
       case "ResourceExhausted":
         if (r?.code === Code.QUOTA_EXCEEDED && r.details["quota"] === "max_sessions_per_principal") this.holdApp("SESSION_CAP", codeName(Code.QUOTA_EXCEEDED));
+        else if (r?.code === Code.QUOTA_EXCEEDED && r.details["quota"] === "max_keyspaces_per_session") await this.onKeyspaceCap();
         break;
       case "Unavailable":
         if (error.retry?.reason === 6 /* AUTHORIZER_UNAVAILABLE */) this.holdApp("AUTHORIZER_UNAVAILABLE", "AUTHORIZER_UNAVAILABLE");
@@ -480,6 +551,35 @@ export abstract class SessionLayer extends SenderLayer {
       default:
         break;
     }
+  }
+
+  /**
+   * A `Subscribe` refused for `max_keyspaces_per_session` (B3-M3). A.7: "Stop and report; never resend unchanged in a loop." 09 [READ-35]: "a client that resumes more
+   * cursors than the limit in force is refused whole until its `Subscribe` names no more keyspaces than the `limits.max_keyspaces_per_session` of a fresh `LoadState`
+   * response; which keyspaces it stops following is the app's choice." The engine asks a fresh `LoadState` for the limit; when the next `Subscribe` names fewer keyspaces
+   * than the refused one it is sent with the reconnect backoff; otherwise the refusal is reported and the session waits until what the engine follows changes.
+   */
+  private async onKeyspaceCap(): Promise<void> {
+    const named = this.lastSubscribeNamed;
+    const probe = this.followList().find((f) => f.loaded);
+    if (probe !== undefined) {
+      try {
+        const resp = await this.transport.loadState(
+          create(LoadStateRequestSchema, { cursor: create(KeyspaceCursorSchema, this.cursorFields(probe)), clientId: this.clientId, pageToken: "", pageSize: 1, supportedFeatures: [...this.features] }),
+        );
+        this.applyLimits(resp.limits);
+      } catch (e) {
+        this.noteInternalError(e);
+      }
+    }
+    if (this.subscribeCap() < named) return; // the limit is known now: the next `Subscribe` names fewer keyspaces
+    this.sess.overCap = { followed: this.follows.size };
+    this.emit({
+      type: "protocol-error",
+      what: "Subscribe",
+      detail: `ResourceExhausted QUOTA_EXCEEDED max_keyspaces_per_session: the Subscribe named ${named} keyspaces, the limit in force is ${this.limits.maxKeyspacesPerSession}; the engine stops until the app changes what it follows (09 [READ-35], A.7)`,
+      keyspaces: [],
+    });
   }
 
   /** The hold NO_TOKEN: the client has no valid token (14 [CLI-68]); it asks the app for one, again with the hold backoff. */
@@ -528,7 +628,9 @@ export abstract class SessionLayer extends SenderLayer {
         s.retrying = undefined;
         this.onRuntimeChanged();
         s.id = body.value.sessionId;
-        s.hbMs = body.value.heartbeatIntervalMs > 0 ? body.value.heartbeatIntervalMs : 15_000;
+        s.subChain = Promise.resolve(); // 09 [READ-62]: the queue is per session
+        s.overCap = undefined;
+        s.hbMs =body.value.heartbeatIntervalMs > 0 ? body.value.heartbeatIntervalMs : 15_000;
         this.applyLimits(body.value.limits);
         // 09 [READ-73]: a new session: the topics of the engine join again and publish their entries again
         this.presenceSessionStarted();
@@ -736,12 +838,16 @@ export abstract class SessionLayer extends SenderLayer {
   private async addNow(f: Follow): Promise<void> {
     f.awaitingAdd = true;
     let resp;
+    const s = this.sess;
+    const sid = s.id;
     try {
-      resp = await this.transport.updateSubscription(create(UpdateSubscriptionRequestSchema, { sessionId: this.sess.id, add: [this.cursorOf(f)] }));
+      // 09 [READ-62] (B3-M2): one `UpdateSubscription` in flight per session; the cursor is read when the request leaves
+      resp = await this.updateSubscriptionQueued({ add: [this.cursorOf(f)] });
     } catch {
-      this.sess.abort?.abort(); // the session resumes from the cursors (09 [READ-57])
+      if (s.id === sid) s.abort?.abort(); // the session resumes from the cursors (09 [READ-57])
       return;
     }
+    if (resp === undefined) return; // the session ended before the request's turn
     await this.run(() => {
       for (const rej of resp.rejected) {
         if (rej.keyspaceId !== f.id) continue;
@@ -763,7 +869,8 @@ export abstract class SessionLayer extends SenderLayer {
         }
         return;
       }
-      f.onSession = true;
+      // 09 [READ-39] (B3-M1): "A client MUST take cursors, adds and drops from frames, not from unary responses": the keyspace is on the session when its
+      // `KeyspaceAdded` comes (`onKeyspaceAdded`), which may come before this answer or after it, or be followed by a drop
       f.addFailures = 0;
     });
   }
@@ -815,18 +922,23 @@ export abstract class SessionLayer extends SenderLayer {
   protected resumeKeyspace(f: Follow): void {
     // 14 [CLI-3], 09 [READ-46]: resume the keyspace from the client's own cursor, by a re-add
     if (this.sess.state !== "live") return;
+    // 09 [READ-39] (B3-M1): a keyspace that the session dropped for good, that waits for a load, or that a hold keeps off the session is not added again
+    if (!this.subscribable(f) || f.needsLoad !== undefined) return;
     f.resuming = true;
     this.addToSession(f);
   }
 
   protected rebindSession(): void {
     if (this.sess.state !== "live") return;
+    const s = this.sess;
+    const sid = s.id;
     this.detach(
       (async () => {
         try {
-          await this.transport.updateSubscription(create(UpdateSubscriptionRequestSchema, { sessionId: this.sess.id, clientId: this.clientId }));
+          // 09 [READ-62] (B3-M2): in the session's queue of `UpdateSubscription` calls
+          if ((await this.updateSubscriptionQueued({ clientId: this.clientId })) === undefined) return;
         } catch {
-          this.sess.abort?.abort();
+          if (s.id === sid) s.abort?.abort();
           return;
         }
         // 14 [CLI-78]: "once the rebind succeeds it MUST publish its presence again at once, in every topic where it has an entry, because the rebind ended the
@@ -1045,7 +1157,7 @@ export abstract class SessionLayer extends SenderLayer {
       else if (o === undefined && (e.registered || e.everSent) && e.sentInEpoch > 0 && e.sentInEpoch < epoch) out.push({ id: e.mutationId, kind: "pending", ordinal: e.ordinal });
     }
     for (const j of this.journal.values()) {
-      if (j.keyspaceId === f.id && j.verifiedEpoch < epoch) out.push({ id: j.mutationId, kind: "journal", ordinal: j.ordinal });
+      if (j.keyspaceId === f.id && j.verifiedEpoch < epoch && !this.stuckJournal.has(j.mutationId)) out.push({ id: j.mutationId, kind: "journal", ordinal: j.ordinal });
     }
     return out.sort((a, b) => a.ordinal - b.ordinal);
   }
@@ -1106,8 +1218,9 @@ export abstract class SessionLayer extends SenderLayer {
       await this.flushDirty();
       await this.checkRetirements(f);
       this.epochFlows.delete(f.id);
-      // every answer is in: re-identify and re-stamp, then the keyspace is sent to again ([CLI-63], [CLI-64])
-      this.reidentify("EPOCH_CHANGED");
+      // every answer is in: re-identify and re-stamp, then the keyspace is sent to again ([CLI-63], [CLI-64]); a keyspace that the client stopped following
+      // meanwhile is sent nothing more, and needs no re-identification (B3-M5)
+      if (f.stopped === undefined) this.reidentify("EPOCH_CHANGED");
       this.stopHold("EPOCH_RESOLUTION", f.id);
       if (this.sess.state === "live" && !f.onSession && this.subscribable(f)) this.addToSession(f);
       else this.kick();
@@ -1139,7 +1252,8 @@ export abstract class SessionLayer extends SenderLayer {
   }
 
   private async answerPending(f: Follow, e: OutboxEntry, ans: GetMutationResultResponse): Promise<void> {
-    const spend = (this.opInfoFor(e)?.spend ?? false) && !e.spendResent;
+    // 14 [CLI-83], [CLI-7] (B3-M5): a spend action of a keyspace that the client stopped following is not resent; its unknown outcome is reported
+    const spend = (this.opInfoFor(e)?.spend ?? false) && !e.spendResent && f.stopped === undefined;
     if (ans.known && ans.result !== undefined) {
       const o = ans.result.outcome;
       if (o.case === "appended" || (o.case === "decided" && o.value.status === 1)) {
@@ -1207,7 +1321,8 @@ export abstract class SessionLayer extends SenderLayer {
 
   private async answerJournal(f: Follow, j: JournalEntry, ans: GetMutationResultResponse): Promise<void> {
     // 14 [CLI-76]: a journal entry whose content a redaction erased is no longer the whole action, and a lost spend action is not resent from it: it ends as one of unknown outcome
-    const spend = j.spend && !j.spendResent && j.redacted !== true;
+    // 14 [CLI-83], [CLI-7] (B3-M5): nor is one of a keyspace that the client stopped following
+    const spend = j.spend && !j.spendResent && j.redacted !== true && f.stopped === undefined;
     const stub = this.stubOf(j);
     const reverted = (): void => {
       this.emit({ type: "reverted", mutationId: j.mutationId, keyspaceId: j.keyspaceId, seq: this.seqOf(j.outcome), logEpoch: j.outcome.logEpoch });

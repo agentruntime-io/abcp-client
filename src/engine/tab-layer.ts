@@ -70,6 +70,8 @@ export interface RuntimeSnapshot {
   loadsWithSkipped: number;
   anomalies: Record<string, number>;
   stopped: Record<string, string>;
+  /** The keyspaces whose local copy the flusher purged (14 [CLI-66], [CLI-67], [CLI-77]): a follower shows nothing of them either, and runs its purge hooks (B3-M4). */
+  purged?: string[];
   /** The `client_id` of the flusher's session: what a follower tab tells the user's own presence entry by (14 [CLI-61], 09 [READ-75]). */
   clientId: string;
   /** The stash of blob bytes, as the flusher has it (see `SyncStatus`). */
@@ -199,7 +201,8 @@ export abstract class TabLayer extends RevocationLayer {
     super(cfg);
     this.tabHost = cfg.tab;
     this.provider = cfg.store ?? cfg.tab?.storage;
-    this.handOverWhenHidden = cfg.handOverWhenHidden ?? false;
+    // 14 [CLI-61] (S-07, A8-S3): "where the platform throttles a hidden tab so that it cannot, the flusher MUST hand its role over to a visible tab"
+    this.handOverWhenHidden = cfg.handOverWhenHidden ?? cfg.tab?.throttlesHidden === true;
     this.sharedDevice = (cfg.mode ?? "personal") === "shared-device";
     this.setHorizonWarning(cfg.horizonWarning);
     this.copyPolicy = cfg.copyPolicy ?? "keep";
@@ -555,10 +558,12 @@ export abstract class TabLayer extends RevocationLayer {
   protected runtimeSnapshot(): RuntimeSnapshot {
     const anomalies: Record<string, number> = {};
     const stopped: Record<string, string> = {};
+    const purged: string[] = [];
     let loadsWithSkipped = 0;
     for (const f of this.follows.values()) {
       if (f.anomalies > 0) anomalies[f.id] = f.anomalies;
       if (f.stopped !== undefined) stopped[f.id] = f.stopped;
+      if (f.purged) purged.push(f.id);
       loadsWithSkipped += f.loadsWithSkipped;
     }
     return {
@@ -571,6 +576,7 @@ export abstract class TabLayer extends RevocationLayer {
       loadsWithSkipped,
       anomalies,
       stopped,
+      purged,
       clientId: this.clientId,
       blobStash: this.blobStashMode(),
       stagedBlobs: this.stashStats().count,
@@ -784,10 +790,12 @@ export abstract class TabLayer extends RevocationLayer {
     const light = await this.loadStoredLight();
     const s = light ?? (await this.loadStored());
     const ids = new Set<string>();
+    const purged = new Set(this.runtimeMirror?.purged ?? []);
     for (const img of s.replicas) {
       if (!this.isMyImage(img)) continue; // another principal's cache on a shared device (14 [CLI-59])
       ids.add(img.keyspaceId);
       const have = this.follows.get(img.keyspaceId);
+      if (purged.has(img.keyspaceId) && have?.purged === true) continue; // B3-M4: an image that the flusher's purge has not removed yet is not shown again
       const entryCount = "entries" in img.base ? img.base.entries.length : (img as ReplicaSummary).entryCount;
       const same =
         have !== undefined &&
@@ -841,7 +849,16 @@ export abstract class TabLayer extends RevocationLayer {
       } else f.invalidate();
     }
     const stopped = this.runtimeMirror?.stopped ?? {};
-    for (const f of this.follows.values()) f.stopped = stopped[f.id];
+    for (const f of this.follows.values()) {
+      f.stopped = stopped[f.id];
+      // 14 [CLI-66], [CLI-61] (B3-M4): "one purge covers them": the flusher purged the store, and this tab purges what it holds of the keyspace in memory, its
+      // downloaded blob bytes and, through its purge hooks, the pages of its query layer
+      if (purged.has(f.id) && !f.purged) {
+        this.purgeMemory(f);
+        this.blobCacheLoadReplaced(f);
+        this.detach(this.runPurgeHooks(f, f.stopped ?? "PURGED"));
+      }
+    }
   }
 
   /**

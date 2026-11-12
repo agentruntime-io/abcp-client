@@ -14,7 +14,7 @@ import { VersionTopology, DEFAULT_FEATURES } from "../rules/fold/index.js";
 import { BoundedSet, pushBounded } from "./bounded.js";
 import { DEFAULT_BLOB_CACHE_BYTES, DEFAULT_MAX_DOWNLOAD_BYTES, DEFAULT_MAX_STAGED_BYTES, DEFAULT_TRANSFER_TIMEOUT, fetchBlobHttp, MemoryBlobStash, type BlobHttp, type BlobStash } from "./blob-store.js";
 import { systemClock, systemRandom, type Clock, type Random } from "./clock.js";
-import { MAX_CHANGES_PER_ACTION, MAX_INTEREST_PREFIXES, MAX_PRESENCE_MIN_INTERVAL_MS, MAX_PRESENCE_STATE_BYTES } from "./counts.js";
+import { MAX_CHANGES_PER_ACTION, MAX_INTEREST_PREFIXES, MAX_KEYSPACES_PER_SESSION, MAX_PRESENCE_MIN_INTERVAL_MS, MAX_PRESENCE_STATE_BYTES } from "./counts.js";
 import { CanonError, decodeContent } from "./entry.js";
 import { StorageError } from "./errors.js";
 import { EventBus } from "./events.js";
@@ -88,7 +88,10 @@ export interface EngineConfig {
   tab?: TabHost;
   /** Opens the storage of the partition when `storage` is not given (14 [CLI-74]); a tab's host has one. */
   store?: StorageProvider;
-  /** The flusher hands its role over to a visible tab when its own tab is hidden (14 [CLI-61]); default false. */
+  /**
+   * The flusher hands its role over to a visible tab when its own tab is hidden (14 [CLI-61]); default: the tab host's `throttlesHidden` (true for the browser
+   * host), else false.
+   */
   handOverWhenHidden?: boolean;
   /** The share of `max_offline` at which `offline-horizon` is emitted: above 0 and below 1; default 0.8 (14 [CLI-56]). */
   horizonWarning?: number;
@@ -155,6 +158,8 @@ export interface Limits {
   presenceMinPublishIntervalMs: number;
   /** One blob, in octets (09 [READ-86], 04 Table 4.10a). */
   maxBlobBytes: number;
+  /** The keyspaces that one session follows (09 [READ-35], 04 Table 4.10a): a `Subscribe` names no more (B3-M3). */
+  maxKeyspacesPerSession: number;
 }
 
 /**
@@ -182,6 +187,8 @@ export const FLOOR_LIMITS: Limits = {
   presenceMinPublishIntervalMs: 1_000,
   // no floor and no maximum in 04 Table 4.10a: the default
   maxBlobBytes: 100 * 1024 * 1024,
+  // 04 Table 4.10a: floor 20, default 100, maximum 10,000
+  maxKeyspacesPerSession: 20,
 };
 
 /** What the engine keeps of an outbox entry in memory only: its runtime state, rebuilt from the answers of the server after a restart. */
@@ -577,6 +584,8 @@ export abstract class EngineCore {
     take("max_presence_members_per_topic", l.maxPresenceMembersPerTopic, FLOOR_LIMITS.maxPresenceMembersPerTopic, (n) => (next.maxPresenceMembersPerTopic = n));
     take("presence_ttl_seconds", l.presenceTtlSeconds, FLOOR_LIMITS.presenceTtlMs / 1000, (n) => (next.presenceTtlMs = n * 1000));
     take("max_blob_bytes", l.maxBlobBytes, FLOOR_LIMITS.maxBlobBytes, (n) => (next.maxBlobBytes = n));
+    // 09 [READ-35] (B3-M3): the `Subscribe` names no more keyspaces than the value in force, which a `Subscribed` frame and a fresh `LoadState` response give
+    take("max_keyspaces_per_session", l.maxKeyspacesPerSession, FLOOR_LIMITS.maxKeyspacesPerSession, (n) => (next.maxKeyspacesPerSession = n), MAX_KEYSPACES_PER_SESSION);
     if (l.presenceMinPublishIntervalMs === 0) next.presenceMinPublishIntervalMs = FLOOR_LIMITS.presenceMinPublishIntervalMs;
     else take("presence_min_publish_interval_ms", l.presenceMinPublishIntervalMs, FLOOR_LIMITS.presenceMinPublishIntervalMs, (n) => (next.presenceMinPublishIntervalMs = n), MAX_PRESENCE_MIN_INTERVAL_MS);
     const changed = next.maxOfflineMs !== this.limits.maxOfflineMs;

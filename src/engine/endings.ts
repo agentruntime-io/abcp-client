@@ -50,6 +50,11 @@ export abstract class EndingLayer extends EngineCore {
   protected readonly ending = new Set<string>();
   /** The lane watermarks of the `Mutate` response that is being applied have been taken: they are after the results that it carries ([CLI-27]). */
   protected freshReading = false;
+  /**
+   * The journalled actions whose end met a full store (14 [CLI-84], B3-M6): never put back into the outbox (14 [CLI-53]); their journal entries stay as they are, and
+   * `drainStuck` ends them once the store has room. Memory only: a restart asks for them again (14 [CLI-53]).
+   */
+  protected readonly stuckJournal = new Map<string, { stub: OutboxEntry; spec: EndSpec }>();
   /** The conflict flows under way (a handler may take as long as the user does), by mutation id: the epoch flow waits for one before it acts on the next answer (14 [CLI-53]). */
   protected readonly conflictFlows = new Map<string, Promise<void>>();
   /** Waiters for the cursor of a keyspace to reach a seq (the hold `CONFLICT_WAIT`). */
@@ -68,6 +73,7 @@ export abstract class EndingLayer extends EngineCore {
   protected resetRuntime(): void {
     super.resetRuntime();
     this.ending.clear();
+    this.stuckJournal.clear();
     this.conflictFlows.clear();
     this.cursorWaiters.clear();
     this.freshReading = false;
@@ -99,7 +105,9 @@ export abstract class EndingLayer extends EngineCore {
   }
 
   protected lastResultText(e: OutboxEntry): string | undefined {
-    return e.lastResult === undefined ? undefined : `${e.lastResult.kind}: ${e.lastResult.what}`;
+    // B3-M7: a request with no answer yet tells the app nothing new: the result before it is the last one
+    const r = e.lastResult?.kind === "sent" ? e.lastResult.prev : e.lastResult;
+    return r === undefined ? undefined : `${r.kind}: ${r.what}`;
   }
 
   // ---------------------------------------------------------------------------------------------------------------------
@@ -197,9 +205,24 @@ export abstract class EndingLayer extends EngineCore {
       await this.tx(ops);
     } catch (err) {
       if (err instanceof StoreFull && err.store !== "outbox") {
-        // 14 [CLI-84]: the entry stays in the outbox, final and never sent again, until the app acknowledges entries of that store
-        e.stuck = { sink: err.store === "exports" ? "export" : "deadLetter", reason: spec.reason, ...(spec.reject !== undefined ? { reject: spec.reject } : {}), ...(spec.outcomeUnknown !== undefined ? { cause: spec.outcomeUnknown } : {}), ...(spec.dependencyOf !== undefined ? { dependencyOf: spec.dependencyOf } : {}) };
         this.ending.delete(e.mutationId);
+        if (spec.journal === true) {
+          // 14 [CLI-53] (B3-M6): "an action in it is never resubmitted, resent or put back into the outbox": the journal entry stays as it is, and the end is
+          // made again when the store has room; a restart asks for it again
+          this.stuckJournal.set(e.mutationId, { stub: e, spec });
+          f?.invalidate();
+          return;
+        }
+        // 14 [CLI-84]: the entry stays in the outbox, final and never sent again, until the app acknowledges entries of that store. B3-M6: it keeps its own sink,
+        // and what becomes of its dependents (the replacement that the user chose, 14 [CLI-34], [CLI-47])
+        e.stuck = {
+          sink: spec.sink,
+          reason: spec.reason,
+          ...(spec.reject !== undefined ? { reject: spec.reject } : {}),
+          ...(spec.outcomeUnknown !== undefined ? { cause: spec.outcomeUnknown } : {}),
+          ...(spec.dependencyOf !== undefined ? { dependencyOf: spec.dependencyOf } : {}),
+          ...(spec.dependents !== "fail" ? { dependents: spec.dependents } : {}),
+        };
         try {
           await this.tx([this.putOp(e)]);
         } catch {
@@ -626,13 +649,26 @@ export abstract class EndingLayer extends EngineCore {
       } else {
         delete e.stuck;
         try {
-          await this.endAction(e, { sink: s.sink, reject: s.reject, reason: s.reason, ...(s.cause !== undefined ? { outcomeUnknown: s.cause } : {}), dependents: "fail", ...(s.dependencyOf !== undefined ? { dependencyOf: s.dependencyOf } : {}) });
+          await this.endAction(e, {
+            sink: s.sink,
+            reject: s.reject,
+            reason: s.reason,
+            ...(s.cause !== undefined ? { outcomeUnknown: s.cause } : {}),
+            dependents: s.dependents ?? "fail", // B3-M6: the replacement that the user chose stays the dependents' (14 [CLI-34])
+            ...(s.dependencyOf !== undefined ? { dependencyOf: s.dependencyOf } : {}),
+          });
         } catch {
           e.stuck = s;
         }
         if (this.entries.has(e.mutationId) && e.stuck === undefined) e.stuck = s;
       }
       this.follows.get(e.keyspaceId)?.invalidate();
+    }
+    // B3-M6: the journalled actions whose end waited for a store with room; one whose journal entry is gone (a purge, a window that passed) has nothing left to end
+    for (const [id, w] of [...this.stuckJournal]) {
+      this.stuckJournal.delete(id);
+      if (!this.journal.has(id)) continue;
+      await this.endAction(w.stub, w.spec).catch((err: unknown) => this.noteInternalError(err));
     }
   }
 

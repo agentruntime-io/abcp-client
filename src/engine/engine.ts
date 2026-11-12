@@ -413,14 +413,16 @@ export class Engine extends TabLayer {
       for (const [k, p] of [...this.ownPresence]) if (p.keyspaceId === id) this.ownPresence.delete(k);
       await this.tx([{ op: "deleteReplica", keyspaceId: id }, ...this.followedOps()]);
       this.touchPersisted();
+      if (!this.online()) this.kick(); // B3-M3: a session refused for `max_keyspaces_per_session` waits for what the engine follows to change
       if (this.online() && f.onSession) {
         this.detach(
           (async () => {
+            const sid = this.sessionId();
             try {
-              await this.transport.updateSubscription(create(UpdateSubscriptionRequestSchema, { sessionId: this.sessionId(), remove: [id] }));
+              await this.updateSubscriptionQueued({ remove: [id] }); // 09 [READ-62] (B3-M2): in the session's queue
             } catch (e) {
               this.noteRevoked(e);
-              this.abortSession(); // the session resumes from the cursors that the client holds now (09 [READ-57])
+              if (this.sessionId() === sid) this.abortSession(); // the session resumes from the cursors that the client holds now (09 [READ-57])
             }
           })(),
         );

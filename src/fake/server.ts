@@ -269,6 +269,7 @@ interface AppLimitsInit {
   presenceTtlSeconds: number;
   presenceMinPublishIntervalMs: number;
   maxBlobBytes: number;
+  maxKeyspacesPerSession: number;
 }
 
 const DEFAULT_LIMITS: AppLimitsInit = {
@@ -286,6 +287,7 @@ const DEFAULT_LIMITS: AppLimitsInit = {
   presenceTtlSeconds: 30,
   presenceMinPublishIntervalMs: 1000,
   maxBlobBytes: 100 << 20,
+  maxKeyspacesPerSession: 100,
 };
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1556,6 +1558,10 @@ export class FakeServer {
     }
     if (new Set(req.keyspaces.map((c) => c.keyspaceId)).size !== req.keyspaces.length) {
       throw new RpcError("InvalidArgument", "a keyspace is named twice", { reject: mkReject(Code.INVALID_ENVELOPE) });
+    }
+    // 09 [READ-35]: a `Subscribe` that names more keyspaces than the limit is refused whole
+    if (this.limits.maxKeyspacesPerSession > 0 && req.keyspaces.length > this.limits.maxKeyspacesPerSession) {
+      throw new RpcError("ResourceExhausted", "too many keyspaces", { reject: mkReject(Code.QUOTA_EXCEEDED, { details: { quota: "max_keyspaces_per_session" } }) });
     }
     if (this.maxSessions !== undefined && [...this.sessions].filter((s) => subjectOf(s.principal) === subjectOf(principal)).length >= this.maxSessions) {
       throw new RpcError("ResourceExhausted", "too many sessions", { reject: mkReject(Code.QUOTA_EXCEEDED, { details: { quota: "max_sessions_per_principal" } }) });

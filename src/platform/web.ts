@@ -100,6 +100,8 @@ export class WebTab implements TabHost {
   private id: string;
   readonly locks: CrossTabLocks;
   readonly storage: StorageProvider;
+  /** 14 [CLI-61]: a browser throttles the timers of a hidden tab, so its flusher hands over to a visible tab by default. */
+  readonly throttlesHidden = true;
   private readonly channels = new Set<TabChannel>();
   /** The channel of tab ids, open for as long as the page is: it answers for the id that this page holds. */
   private readonly idChannel: TabChannel | undefined;

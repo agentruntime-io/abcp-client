@@ -101,7 +101,7 @@ export abstract class ErasureLayer extends EndingLayer {
   /** The ids of the blobs of the keyspace that the engine holds bytes of: the cache of downloads and the staged bytes (`blobs.ts`). */
   protected abstract blobIdsHeld(keyspaceId: string): Promise<Set<string>>;
   /** Drops the cached and the staged bytes of the blobs, but those that a pending action names (`blobs.ts`). */
-  protected abstract blobsErased(keyspaceId: string, ids: ReadonlySet<string>): void;
+  protected abstract blobsErased(keyspaceId: string, ids: ReadonlySet<string>): Promise<void>;
 
   protected resetRuntime(): void {
     super.resetRuntime();
@@ -362,6 +362,7 @@ export abstract class ErasureLayer extends EndingLayer {
     this.after(resendDelay(er.attempts++, undefined, this.random), async () => {
       if (this.role !== "flusher") return;
       try {
+        await this.judgeBlobs(f, er); // FBA-28: the staged bytes go before the transaction, as on the first attempt
         await this.erasureTx(f, er, [{ op: "deleteReplica", keyspaceId: f.id }]);
       } catch (e) {
         this.noteInternalError(e);
@@ -374,17 +375,15 @@ export abstract class ErasureLayer extends EndingLayer {
   // Blobs
 
   /**
-   * Judges the blobs that the engine holds bytes of (14 [CLI-76], the reading in the header): those that erased values named and nothing that remains names are dropped. Run after the
-   * erasure is durable, since it only frees what is held.
+   * Judges the blobs that the engine holds bytes of (14 [CLI-76], the reading in the header): those that erased values named and nothing that remains names are dropped.
+   *
+   * FBA-28: run before the transaction that moves the persisted cursor past the record (14 [CLI-76] "or before that advance, so that a crash repeats the purge and never skips
+   * it"): the stash of staged bytes is no part of that transaction, and the candidates are known only in memory. Throws when the stash cannot be read or cannot erase: the caller
+   * then does not move the cursor, and tries again. A crash before the transaction leaves the cursor below the record, so the restart applies it again and judges the blobs again.
+   * It only frees what is held, so running it before the erasure is durable loses nothing.
    */
   protected async judgeBlobs(f: Follow, er: PendingErasure): Promise<void> {
-    let held: Set<string>;
-    try {
-      held = await this.blobIdsHeld(f.id);
-    } catch (e) {
-      this.noteInternalError(e);
-      return;
-    }
+    const held = await this.blobIdsHeld(f.id);
     if (held.size === 0) return;
     const dec = new TextDecoder();
     const erasedText = er.erased.map((b) => dec.decode(b)).join("\n");
@@ -410,6 +409,6 @@ export abstract class ErasureLayer extends EndingLayer {
     }
     const text = remains.join("\n");
     const gone = new Set(candidates.filter((id) => !refs.has(id) && !text.includes(id)));
-    if (gone.size > 0) this.blobsErased(f.id, gone);
+    if (gone.size > 0) await this.blobsErased(f.id, gone);
   }
 }

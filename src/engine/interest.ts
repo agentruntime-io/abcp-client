@@ -157,13 +157,13 @@ export abstract class InterestLayer extends HorizonLayer {
   }
 
   private async sendSetInterest(f: Follow): Promise<void> {
+    const sid = this.sessionId();
     try {
-      await this.transport.updateSubscription(
-        create(UpdateSubscriptionRequestSchema, { sessionId: this.sessionId(), setInterest: [create(UpdateSubscriptionRequest_InterestSchema, { keyspaceId: f.id, interestPrefixes: [...f.interest] })] }),
-      );
+      // 09 [READ-62] (B3-M2): in the session's queue of `UpdateSubscription` calls
+      await this.updateSubscriptionQueued({ setInterest: [create(UpdateSubscriptionRequest_InterestSchema, { keyspaceId: f.id, interestPrefixes: [...f.interest] })] });
     } catch (e) {
       this.noteRevoked(e);
-      this.abortSession(); // the session resumes from the cursors, with the interest that the client holds now (09 [READ-57])
+      if (this.sessionId() === sid) this.abortSession(); // the session resumes from the cursors, with the interest that the client holds now (09 [READ-57])
     }
   }
 

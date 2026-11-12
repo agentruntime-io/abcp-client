@@ -120,6 +120,11 @@ export interface TabHost {
   channel(name: string): TabChannel;
   /** Whether this tab is visible. A platform throttles a hidden tab, so that its flusher may not keep a session alive (14 [CLI-61]). */
   visible?(): boolean;
+  /**
+   * The platform throttles a hidden tab so that its flusher cannot keep the session and presence alive (a browser's timer throttling): the flusher
+   * then hands its role over to a visible tab by default (14 [CLI-61]), unless `EngineConfig.handOverWhenHidden` says otherwise.
+   */
+  readonly throttlesHidden?: boolean;
   /** Calls `fn` when this tab's visibility changes. */
   onVisibility?(fn: (visible: boolean) => void): () => void;
   /**

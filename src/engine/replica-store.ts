@@ -179,28 +179,42 @@ export abstract class ReplicaStoreLayer extends ErasureLayer {
     for (const p of pages) for (const e of p.entries) entries.push(e);
     const begin: StorageOp = { op: "replicaBegin", keyspaceId: f.id, head: this.headOf(f), base: { manifestVersion: first.manifestVersion, logEpoch: first.logEpoch, checkpointSeq: first.checkpointSeq, entries } };
     try {
-      if (er !== undefined) await this.erasureTx(f, er, [begin]);
-      else await this.tx([begin]);
+      if (er !== undefined) {
+        await this.judgeBlobs(f, er); // FBA-28: before the transaction that moves the cursor
+        await this.erasureTx(f, er, [begin]);
+      } else await this.tx([begin]);
       f.image = { ok: true, seqs: new Set(), headMs: this.serverNow() };
       this.touchPersisted();
     } catch (e) {
-      this.imageFailed(f, e);
-      if (er !== undefined) this.retryErasure(f, er);
+      if (er !== undefined) {
+        this.erasureFailed(f, e);
+        this.retryErasure(f, er);
+      } else this.imageFailed(f, e);
     }
-    if (er !== undefined) await this.judgeBlobs(f, er);
   }
 
-  /** The erasure of a keyspace whose image is not kept: the entries and drafts that it replaced (14 [CLI-76]). */
+  /** The erasure of a keyspace whose image is not kept: the entries and drafts that it replaced (14 [CLI-76]). The staged bytes go first (FBA-28). */
   private async erasureOnly(f: Follow, er: PendingErasure): Promise<void> {
-    if (this.role === "flusher") {
-      try {
-        await this.erasureTx(f, er, []);
-      } catch (e) {
-        this.noteInternalError(e);
-        this.retryErasure(f, er);
-      }
+    if (this.role !== "flusher") {
+      await this.judgeBlobs(f, er).catch((e: unknown) => this.noteInternalError(e));
+      return;
     }
-    await this.judgeBlobs(f, er);
+    try {
+      await this.judgeBlobs(f, er);
+      await this.erasureTx(f, er, []);
+    } catch (e) {
+      this.noteInternalError(e);
+      this.retryErasure(f, er);
+    }
+  }
+
+  /**
+   * A transaction of an erasure failed, or the purge that goes before it (FBA-28): the image no longer follows the state, but it is kept as it is, with its cursor below what was
+   * erased, so that a crash before the retry repeats the purge (B3-S12, 14 [CLI-76] "so that a crash repeats the purge and never skips it"). The retry's transaction deletes it.
+   */
+  private erasureFailed(f: Follow, e: unknown): void {
+    this.noteInternalError(e);
+    f.image = { ok: false, seqs: new Set(), headMs: 0 };
   }
 
   /** The redactions as the rewrite of an image reads them: each erases the changes below its record, but the value that a key still holds (a former path that is present again, 06 [LOG-44]). */
@@ -297,6 +311,7 @@ export abstract class ReplicaStoreLayer extends ErasureLayer {
       extra.push({ op: "deleteReplica", keyspaceId: f.id });
     }
     try {
+      await this.judgeBlobs(f, er); // FBA-28: before the transaction that moves the cursor (the images' values are in `er` by now)
       await this.erasureTx(f, er, extra);
       if (following) {
         for (const r of fresh) f.image.seqs.add(r.seq);
@@ -304,10 +319,9 @@ export abstract class ReplicaStoreLayer extends ErasureLayer {
       } else f.image = { ok: false, seqs: new Set(), headMs: 0 };
       this.touchPersisted();
     } catch (e) {
-      this.imageFailed(f, e);
+      this.erasureFailed(f, e);
       this.retryErasure(f, er);
     }
-    await this.judgeBlobs(f, er);
   }
 
   /** The head moved with no record (a delivery watermark, the time of a sync): written at most once in `everyMs`, unless `force`. */
@@ -338,15 +352,18 @@ export abstract class ReplicaStoreLayer extends ErasureLayer {
         if (img !== undefined) extra.push(...this.erasedImageOps(f, img, [], er));
       }
       extra.push({ op: "replicaExtend", keyspaceId: f.id, head: this.headOf(f), entries: [...entries] });
-      if (er !== undefined) await this.erasureTx(f, er, extra);
-      else await this.tx(extra);
+      if (er !== undefined) {
+        await this.judgeBlobs(f, er); // FBA-28: before the transaction that moves the cursor
+        await this.erasureTx(f, er, extra);
+      } else await this.tx(extra);
       f.image.headMs = this.serverNow();
       this.touchPersisted();
     } catch (e) {
-      this.imageFailed(f, e);
-      if (er !== undefined) this.retryErasure(f, er);
+      if (er !== undefined) {
+        this.erasureFailed(f, e);
+        this.retryErasure(f, er);
+      } else this.imageFailed(f, e);
     }
-    if (er !== undefined) await this.judgeBlobs(f, er);
   }
 
   /** The image no longer follows the state: it is dropped, so that a restart loads the keyspace instead of restoring a state that is behind. */

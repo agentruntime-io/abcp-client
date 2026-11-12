@@ -38,11 +38,17 @@ export type StoredOutcome =
 
 /** The last answer an action got, for the report of 14 [CLI-83] and the dead-letter entry of 14 [CLI-28]. */
 export interface LastResult {
-  kind: "retry" | "reject" | "appended" | "decided" | "rpc";
+  /**
+   * `sent` (B3-M7, 14 [CLI-52]): a request that carries the action left, and no answer to it has come: it is written with the stamping before the request leaves,
+   * so that after a crash a stale `Retry` of an earlier request never lets a split or an archive move an action whose outcome is unknown. `prev` is the result before it.
+   */
+  kind: "retry" | "reject" | "appended" | "decided" | "rpc" | "sent";
   /** A code name, a retry reason name or an RPC status. */
   what: string;
   errorClass?: number;
   atMs: number;
+  /** For `sent`: the result that the action had before the request left, which the app is still told. */
+  prev?: LastResult;
 }
 
 /** An action in the outbox (14 [CLI-22]). */
@@ -95,7 +101,17 @@ export interface OutboxEntry {
    * The action reached its end, but the store that it is due in is full (14 [CLI-84]): it stays in the outbox, final and never
    * sent again, until the app acknowledges entries of that store and the move can be made.
    */
-  stuck?: { sink: "deadLetter" | "export" | "journal"; reason: string; reject?: Reject; cause?: string; dependencyOf?: string; quarantine?: boolean };
+  stuck?: {
+    /** The sink that the action is due in (B3-M6: its own, and never that of the store that overflowed, which may be a dependent's); `none` for a CONFLICT the user resolved or a cancel. */
+    sink: "deadLetter" | "export" | "journal" | "none";
+    reason: string;
+    reject?: Reject;
+    cause?: string;
+    dependencyOf?: string;
+    quarantine?: boolean;
+    /** What becomes of its dependents when it moves (14 [CLI-34], [CLI-47]): the replacement that the user chose is kept (B3-M6). Absent: they fail. */
+    dependents?: "fail" | "keep" | { replacedBy: string };
+  };
 }
 
 /** The keys on which an action's applied result differs from its prediction (14 [CLI-38], [CLI-40]). */

@@ -321,6 +321,12 @@ function plan(st: ReplicaState, rules: Rules, rec: RecordMessage, sel: Selection
     if (deleted.size === 0) return false;
     return top.ancestors(key).some((a) => deleted.has(a));
   };
+  // The outermost marker key that the record deletes among key and its ancestor markers.
+  const outermostDeleted = (key: string): string => {
+    let out = key;
+    for (const a of top.ancestors(key)) if (deleted.has(a) && a.length < out.length) out = a;
+    return out;
+  };
   const nestedDeleted = new Map<string, string[]>(); // a deleted marker key -> the deleted marker keys of its subtree
   for (const other of deletedList) {
     for (const a of top.ancestors(other)) {
@@ -343,7 +349,11 @@ function plan(st: ReplicaState, rules: Rules, rec: RecordMessage, sel: Selection
     if (c.kind === ChangeKind.DELETE) {
       step.delete = true;
       if (r.tpl.entity) {
-        const sub: Subtree = { root: key, markRoot: p.mark, staged: opts.staged?.(st, rec, key) === true, nested: [] };
+        // STATE-35, STATE-43, STATE-45 (S-02): a nested marker key that the same record deletes holds the tombstone that the
+        // outermost deletion of the record gives its nested markers, whatever the order of the changes. Its own DELETE stays a
+        // subtree deletion ([STATE-43] "because its own DELETE is a subtree deletion too", for the prefixes of [STATE-51]), but
+        // its kind is the outermost one's. The server's fold does the same.
+        const sub: Subtree = { root: key, markRoot: p.mark, staged: opts.staged?.(st, rec, outermostDeleted(key)) === true, nested: [] };
         // STATE-45: the nested marker keys that are present, or hold a tombstone, just before the record, and the ones that the
         // same record deletes, get an entity tombstone too.
         const nested = new Set<string>(st.nestedMarkers(top, key));

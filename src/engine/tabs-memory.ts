@@ -211,6 +211,8 @@ export class MemoryTab implements TabHost {
   private readonly pageListeners = new Set<(e: "hide" | "show") => void>();
   private readonly channels = new Set<MemoryChannel>();
   crashed = false;
+  /** The tab stands for a platform that throttles hidden tabs (14 [CLI-61]): a test sets it before the engine opens. */
+  throttlesHidden = false;
 
   constructor(
     private readonly device: MemoryDevice,

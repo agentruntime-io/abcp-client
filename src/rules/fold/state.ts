@@ -369,13 +369,21 @@ export class ReplicaState {
    * every deleted ancestor marker ({@link effectiveVersion}); for a present CRDT key that holds a base, the `crdt_covered_seq` of
    * the base it holds.
    *
-   * SPEC-QUESTION: 05 [STATE-38] "for a present CRDT key, the `crdt_covered_seq` of the base it holds". A key that the fold built
-   * from records has covered 0 until a SYSTEM `SET` gives it a base, so every update record passes the test, which is harmless:
-   * an update that the key already integrated folds to no effect ([STATE-76]) and the key's version never goes back.
+   * SPEC-QUESTION (S-01, A2-S2): 05 [STATE-38] "MUST apply a change to key k from record seq s only if s is greater than k's
+   * version (tombstones included; for a present CRDT key, the `crdt_covered_seq` of the base it holds, [STATE-75])". Reading (a):
+   * for a present CRDT key the test is against `crdt_covered_seq` alone. A key that the fold built from records has covered 0
+   * until a SYSTEM `SET` gives it a base, so under (a) every older record passes: a redelivered update of an expired document
+   * is integrated into the new one, a redelivered DELETE deletes the key, and a redelivered OVERRIDE moves its attribution back
+   * (09 [READ-16] overlapping delivery). Reading (b): the parenthesis adds a floor and does not replace the version, so the test
+   * is against max(version, crdt_covered_seq). The code takes (b): a load gives `crdt_covered_seq` equal to the version
+   * ([STATE-75], 09 [READ-14]), so nothing that must apply is skipped, and records at or below the key's version are already in
+   * it.
    */
   gateVersion(top: Topology, key: string): bigint {
     const k = this.keys.get(key);
-    if (k !== undefined && k.rule === "crdt" && k.state === StateValue && k.doc !== null) return k.crdtCoveredSeq;
+    if (k !== undefined && k.rule === "crdt" && k.state === StateValue && k.doc !== null) {
+      return k.crdtCoveredSeq > k.version ? k.crdtCoveredSeq : k.version;
+    }
     return this.effectiveVersion(top, key);
   }
 

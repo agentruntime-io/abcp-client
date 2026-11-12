@@ -356,18 +356,25 @@ export abstract class SenderLayer extends ReactionLayer {
 
   /** Records the stamping before the request leaves ([CLI-27]), then sends. */
   private async dispatch(f: Follow, all: OutboxEntry[], hasSequenced: boolean): Promise<void> {
-    const before = all.map((e) => ({ everSent: e.everSent, sentInEpoch: e.sentInEpoch }));
+    const before = all.map((e) => ({ everSent: e.everSent, sentInEpoch: e.sentInEpoch, lastResult: e.lastResult }));
+    const now = this.serverNow();
     all.forEach((e) => {
       e.everSent = true;
       e.sentInEpoch = f.logEpoch;
+      // 14 [CLI-52], [CLI-24] (B3-M7): the request leaves with no answer yet; a crash before the answer leaves this, not the `Retry` of an earlier request
+      const prev = e.lastResult?.kind === "sent" ? e.lastResult.prev : e.lastResult;
+      e.lastResult = { kind: "sent", what: "no answer", atMs: now, ...(prev !== undefined ? { prev } : {}) };
     });
     try {
       await this.tx(all.map((e) => this.putOp(e)));
     } catch (err) {
       // the stamping could not be recorded: the request does not leave, and the slots are given back
       all.forEach((e, i) => {
-        e.everSent = (before[i] as { everSent: boolean }).everSent;
-        e.sentInEpoch = (before[i] as { sentInEpoch: number }).sentInEpoch;
+        const b = before[i] as { everSent: boolean; sentInEpoch: number; lastResult: OutboxEntry["lastResult"] };
+        e.everSent = b.everSent;
+        e.sentInEpoch = b.sentInEpoch;
+        if (b.lastResult === undefined) delete e.lastResult;
+        else e.lastResult = b.lastResult;
       });
       if (!(err instanceof StorageError) && !(err instanceof Error)) throw err;
       return;
@@ -536,7 +543,9 @@ export abstract class SenderLayer extends ReactionLayer {
           // refused by authentication before it was read, so an action that this was the first send of was never processed: it counts as
           // never sent, and is quarantined as an action that was never sent is
           for (const e of live) {
-            if (e.outcome === undefined && e.lastResult === undefined && e.attempts === 0 && !e.registered) {
+            // the request that this answers wrote the `sent` marker (B3-M7): the action had no result before it
+            const firstSend = e.lastResult === undefined || (e.lastResult.kind === "sent" && e.lastResult.prev === undefined);
+            if (e.outcome === undefined && firstSend && e.attempts === 0 && !e.registered) {
               e.everSent = false;
               e.sentInEpoch = 0;
               this.markDirty(e);

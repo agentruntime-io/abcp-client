@@ -847,27 +847,36 @@ export abstract class BlobLayer extends PresenceLayer {
   /**
    * A redaction erased the only values that named these blobs (14 [CLI-76], `erasure.ts`): their cached bytes go, and so do the bytes that the engine staged for them, but those that a pending action
    * names (the outbox, the locked entries of other principals): the user's new writes stay, with what they carry (09 [READ-94]). A dead-letter entry or an export-hook entry that names one
-   * keeps its place with its values erased, and no longer keeps the bytes. A stash that fails leaves its bytes, and the failure is recorded.
+   * keeps its place with its values erased, and no longer keeps the bytes.
+   *
+   * FBA-28, 14 [CLI-76] "or before that advance, so that a crash repeats the purge and never skips it": the stash is no part of the outbox's transaction, so the caller awaits this
+   * before the transaction that moves the persisted cursor past the record. A stash that fails leaves its bytes, the others are still tried, and the first failure is thrown: the
+   * caller does not move the cursor, and tries the erasure again.
    */
-  protected blobsErased(keyspaceId: string, ids: ReadonlySet<string>): void {
+  protected async blobsErased(keyspaceId: string, ids: ReadonlySet<string>): Promise<void> {
     for (const id of ids) {
       this.cache.delete(keyspaceId, id);
       this.committed.delete(this.blobKey(keyspaceId, id));
     }
-    this.detach(
-      (async () => {
-        const pending = new Set<string>();
-        for (const e of [...this.entries.values(), ...this.lockedEntries]) {
-          if (!this.stashKeyspaces(e).has(keyspaceId)) continue;
-          try {
-            for (const id of decodeContent(e.content).blobRefs) pending.add(id);
-          } catch (err) {
-            if (!(err instanceof CanonError)) throw err;
-          }
-        }
-        for (const id of ids) if (!pending.has(id)) await this.stashDelete(keyspaceId, id);
-      })().catch((e: unknown) => this.noteInternalError(e)),
-    );
+    const pending = new Set<string>();
+    for (const e of [...this.entries.values(), ...this.lockedEntries]) {
+      if (!this.stashKeyspaces(e).has(keyspaceId)) continue;
+      try {
+        for (const id of decodeContent(e.content).blobRefs) pending.add(id);
+      } catch (err) {
+        if (!(err instanceof CanonError)) throw err;
+      }
+    }
+    let failed: unknown;
+    for (const id of ids) {
+      if (pending.has(id)) continue;
+      try {
+        await this.stashDelete(keyspaceId, id);
+      } catch (e) {
+        failed ??= e;
+      }
+    }
+    if (failed !== undefined) throw failed;
   }
 
   /** A load with `resumed = false` installed confirmed state: it passed over the `BLOB_DELETED` records below its checkpoint, so the cache of the keyspace goes (14 [CLI-76]). */
