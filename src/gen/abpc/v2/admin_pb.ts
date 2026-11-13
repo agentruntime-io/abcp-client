@@ -1361,10 +1361,14 @@ export const SplitKeyspaceResponseSchema: GenMessage<SplitKeyspaceResponse> = /*
 /**
  * from_seq 0 = the first retained record; to_seq 0 = the head when the export starts. A from_seq at or below the
  * prune floor starts the export at floor + 1 with the prune-floor checkpoint (spec/06 [LOG-52], [LOG-58]); the
- * archive's manifest.json says where it started (spec/12 [ADM-50], [ADM-106]). A non-zero to_seq below the start
- * that spec/12 [ADM-50] gives is refused with InvalidArgument and Reject{INVALID_ENVELOPE}. The export of a deleted
- * keyspace with no verified checkpoint below its first kept record is unanchored: it starts at that record, with no
- * checkpoint (spec/12 [ADM-50], [ADM-106]).
+ * archive's manifest.json says where it started (spec/12 [ADM-50], [ADM-106]). An export whose start is above the head
+ * is refused first, whatever its from_seq and to_seq, with InvalidArgument and Reject{INVALID_ENVELOPE}, except that a
+ * frozen keyspace gets FailedPrecondition and Reject{HISTORY_DIVERGED}; a non-zero to_seq below the start that
+ * spec/12 [ADM-50] gives is refused with InvalidArgument and Reject{INVALID_ENVELOPE}. The
+ * head of a frozen keyspace's export is the last record of its log that lies in its timeline. The export of a deleted
+ * keyspace (or of a frozen one whose ledger removed records that its timeline lacks) with no verified checkpoint
+ * below its first kept record is unanchored: it starts at that record, with no checkpoint (spec/12 [ADM-50],
+ * [ADM-106]).
  *
  * @generated from message abpc.v2.ExportKeyspaceRequest
  */

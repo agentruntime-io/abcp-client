@@ -406,14 +406,14 @@ export type EpochAdvancedRequest = Message<"abpc.v2.EpochAdvancedRequest"> & {
   newEpoch: number;
 
   /**
-   * the log_epoch of the record at base_seq (in the source, for a split
+   * the log_epoch of the record at base_seq (in the source, for the first
    *
    * @generated from field: uint32 base_epoch = 5;
    */
   baseEpoch: number;
 
   /**
-   * successor); 0 when base_seq is 0
+   * epoch of a split successor; spec/06 [LOG-48]); 0 when base_seq is 0
    *
    * the seq of the last record kept from the previous timeline (spec/06 [LOG-67])
    *
