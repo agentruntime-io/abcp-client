@@ -894,12 +894,14 @@ export abstract class ReactionLayer extends ReplicaLayer {
   }
 
   /**
-   * Whether the source's answer `known = false`, `voided = false` frees an action to be moved (14 [CLI-52]): a GATED action whose last result was a Retry, and (B3-M7) an
-   * action whose last request was never answered: the source recorded nothing for it, and a split or archived source applies nothing more.
+   * Whether the source's answer `known = false`, `voided = false` frees an action to be moved (14 [CLI-52]): only a GATED action whose
+   * last result was a Retry. Not (V43 MUST 2) an action whose last request was never answered (`sent`): its outcome is unknown, and
+   * `known = false` may mean its binding expired after it was applied (07 [MUT-51], 14 [CLI-83]); 14 [CLI-7] ends it as outcome
+   * unknown, which `pollNow` does next.
    */
   protected mayMoveAfterAnswer(f: Follow, e: OutboxEntry): boolean {
     if (!(f.stopped === "MOVED" || f.stopped === "ARCHIVED") || e.registered) return false;
-    return (e.lane === "GATED" && e.lastResult?.kind === "retry") || e.lastResult?.kind === "sent";
+    return e.lane === "GATED" && e.lastResult?.kind === "retry";
   }
 
   /**

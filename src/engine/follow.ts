@@ -153,6 +153,12 @@ export class Follow {
   loadFailures = 0;
   /** Consecutive adds that a `Retry` rejected, the exponent of the client backoff before the next one (14 [CLI-43], [CLI-44]). */
   addFailures = 0;
+  /**
+   * The add of the keyspace was rejected `QUOTA_EXCEEDED` (09 [READ-35], A.7 "Stop and report; never resend unchanged in a loop"): how many keyspaces the
+   * engine followed, and the `max_keyspaces_per_session` in force, then. It is not added again until the engine follows fewer or the limit rises; which
+   * keyspaces to stop following is the app's choice. Reported in `SyncStatus.stopped` as `QUOTA_EXCEEDED`.
+   */
+  overSessionCap: { followed: number; limit: number } | undefined = undefined;
   /** Whether the first cold load of this follow was made (for the `COLD_LOAD` cause). */
   everLoaded = false;
   /** The load answered `skipped_unsupported` (14 [CLI-41]). */

@@ -29,10 +29,9 @@ describe("B3-M7: 14 [CLI-52], [CLI-24] a resend in flight at a crash is an unkno
     const asked = r2.server.calls.findIndex((c) => c.method === "getMutationResult" && (c.request as { mutationId: string }).mutationId === mutationId);
     const moved = r2.events.findIndex((e) => e.type === "rerouted" && "mutationId" in e && e.mutationId === mutationId);
     expect(asked).toBeGreaterThanOrEqual(0);
-    if (moved >= 0) {
-      const movedCall = r2.server.calls.findIndex((c) => c.method === "mutate" && (c.request as { mutations: { mutationId: string; keyspaceId: string }[] }).mutations.some((m) => m.mutationId === mutationId && m.keyspaceId === "dst2"));
-      expect(movedCall).toBeGreaterThan(asked);
-    }
+    // V43 MUST 2: known = false leaves the outcome unknown: 14 [CLI-7] ends it so, never a re-route
+    expect(moved).toBe(-1);
+    expect(r2.events.some((e) => e.type === "outcome-unknown" && "mutationId" in e && e.mutationId === mutationId)).toBe(true);
     expect(leftAtCrash).toBe("sent"); // what a crash leaves: no answer, not the Retry of the first request
   });
 });

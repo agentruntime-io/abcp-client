@@ -1643,6 +1643,11 @@ export class FakeServer {
         rejected.push(create(UpdateSubscriptionResponse_RejectionSchema, { keyspaceId: c.keyspaceId, outcome: { case: "retry", value: create(RetrySchema, { reason: RetryReason.KEYSPACE_SEEDING, afterMs: 1000 }) } }));
         continue;
       }
+      if (this.limits.maxKeyspacesPerSession > 0 && !s.follows.has(c.keyspaceId) && s.follows.size >= this.limits.maxKeyspacesPerSession) {
+        // 09 [READ-35]: "an add over the limit is listed in `UpdateSubscriptionResponse.rejected` with `Reject{QUOTA_EXCEEDED}`"
+        rejected.push(create(UpdateSubscriptionResponse_RejectionSchema, { keyspaceId: c.keyspaceId, outcome: { case: "reject", value: mkReject(Code.QUOTA_EXCEEDED, { details: { quota: "max_keyspaces_per_session" } }) } }));
+        continue;
+      }
       this.addFollow(s, c);
     }
     // 09 [READ-62], [READ-64]: `set_interest` after `add`; each entry is checked in order: the form, that the session follows the keyspace, the limit

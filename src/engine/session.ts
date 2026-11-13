@@ -71,6 +71,14 @@ const SESSION_LIVE_RESET_MS = 60_000;
 export const MAX_SUBSCRIBE_BYTES = 16 * 1024 * 1024;
 
 /** The octets that a varint of `n` takes. */
+/**
+ * 14 [CLI-7] (V43 S2): "When the client stops following the keyspace (`ACCESS_REVOKED`, `GRANT_CHANGED`, `MOVED`, `ARCHIVED`, `DELETED` or `NOT_FOUND`)".
+ * An unknown drop reason is not in the list: 15 [COMPAT-42] adds the keyspace again.
+ */
+function stoppedFollowing(f: Follow): boolean {
+  return f.stopped !== undefined && f.stopped !== "UNKNOWN_DROP_REASON";
+}
+
 function varintLength(n: number): number {
   let len = 1;
   for (let v = n; v >= 128; v = Math.floor(v / 128)) len++;
@@ -336,6 +344,12 @@ export abstract class SessionLayer extends SenderLayer {
 
   private subscribable(f: Follow): boolean {
     if (!f.loaded || f.stopped !== undefined || f.frozen !== undefined) return false;
+    const cap = f.overSessionCap;
+    if (cap !== undefined) {
+      // 09 [READ-35], A.7 (V43 MUST 1): an add refused for the keyspace limit is not sent again until what the engine follows, or the limit, changes
+      if (this.follows.size >= cap.followed && this.limits.maxKeyspacesPerSession <= cap.limit) return false;
+      f.overSessionCap = undefined;
+    }
     for (const h of this.holds.all()) {
       if (h.scope === "keyspace" && h.keyspaceId === f.id && h.kind !== "KEYSPACE_NOT_FOUND" && h.kind !== "EPOCH_RESOLUTION") return false;
     }
@@ -569,7 +583,10 @@ export abstract class SessionLayer extends SenderLayer {
         );
         this.applyLimits(resp.limits);
       } catch (e) {
+        // V43 S1: without a fresh limit the engine cannot tell whether a smaller `Subscribe` would do: the refusal is handled as a transport
+        // failure of the session, which resumes with the reconnect backoff and probes again on the next refusal
         this.noteInternalError(e);
+        return;
       }
     }
     if (this.subscribeCap() < named) return; // the limit is known now: the next `Subscribe` names fewer keyspaces
@@ -865,7 +882,7 @@ export abstract class SessionLayer extends SenderLayer {
           else if (code === Code.KEYSPACE_NOT_FOUND) {
             f.stopped = "NOT_FOUND";
             this.holdKeyspace("KEYSPACE_NOT_FOUND", "NOT_FOUND", f.id, this.serverNow() + this.limits.keyspaceNotFoundWaitMs);
-          }
+          } else if (code === Code.QUOTA_EXCEEDED && rej.outcome.value.details["quota"] === "max_keyspaces_per_session") this.onAddOverCap(f);
         }
         return;
       }
@@ -873,6 +890,28 @@ export abstract class SessionLayer extends SenderLayer {
       // `KeyspaceAdded` comes (`onKeyspaceAdded`), which may come before this answer or after it, or be followed by a drop
       f.addFailures = 0;
     });
+  }
+
+  /**
+   * An add rejected `QUOTA_EXCEEDED` (V43 MUST 1). 09 [READ-35]: "an add over the limit is listed in `UpdateSubscriptionResponse.rejected` with
+   * `Reject{QUOTA_EXCEEDED}` … which keyspaces it stops following is the app's choice"; A.7: "Stop and report; never resend unchanged in a loop." The
+   * keyspace is marked (see `subscribable`), shown in the sync status, and named to the app; the engine stops following nothing on its own.
+   */
+  private onAddOverCap(f: Follow): void {
+    f.overSessionCap = { followed: this.follows.size, limit: this.limits.maxKeyspacesPerSession };
+    this.onRuntimeChanged();
+    this.emit({
+      type: "protocol-error",
+      what: "UpdateSubscription",
+      detail: `QUOTA_EXCEEDED max_keyspaces_per_session: the keyspace ${f.id} is over the limit of ${this.limits.maxKeyspacesPerSession} keyspaces per session and does not sync; it is added again when the app follows fewer keyspaces (09 [READ-35], A.7)`,
+      keyspaces: [f.id],
+    });
+  }
+
+  /** 09 [READ-35] (V43 MUST 1): after the app stops following a keyspace, the keyspaces whose add was refused for the limit are added again, once. */
+  protected readdOverCap(): void {
+    if (this.sess.state !== "live") return;
+    for (const f of this.followList()) if (f.overSessionCap !== undefined && !f.onSession && !f.awaitingAdd && this.subscribable(f)) this.addToSession(f);
   }
 
   /** Loads a keyspace that needs it, then adds it to the live session. */
@@ -1219,8 +1258,9 @@ export abstract class SessionLayer extends SenderLayer {
       await this.checkRetirements(f);
       this.epochFlows.delete(f.id);
       // every answer is in: re-identify and re-stamp, then the keyspace is sent to again ([CLI-63], [CLI-64]); a keyspace that the client stopped following
-      // meanwhile is sent nothing more, and needs no re-identification (B3-M5)
-      if (f.stopped === undefined) this.reidentify("EPOCH_CHANGED");
+      // meanwhile for good is sent nothing more, and needs no re-identification (B3-M5); one that is added again (15 [COMPAT-42] an unknown drop reason,
+      // the hold KEYSPACE_NOT_FOUND) may be sent to again, so the client re-identifies (V43 S2, 14 [CLI-64])
+      if (f.stopped === undefined || f.stopped === "UNKNOWN_DROP_REASON" || f.stopped === "NOT_FOUND") this.reidentify("EPOCH_CHANGED");
       this.stopHold("EPOCH_RESOLUTION", f.id);
       if (this.sess.state === "live" && !f.onSession && this.subscribable(f)) this.addToSession(f);
       else this.kick();
@@ -1253,7 +1293,7 @@ export abstract class SessionLayer extends SenderLayer {
 
   private async answerPending(f: Follow, e: OutboxEntry, ans: GetMutationResultResponse): Promise<void> {
     // 14 [CLI-83], [CLI-7] (B3-M5): a spend action of a keyspace that the client stopped following is not resent; its unknown outcome is reported
-    const spend = (this.opInfoFor(e)?.spend ?? false) && !e.spendResent && f.stopped === undefined;
+    const spend = (this.opInfoFor(e)?.spend ?? false) && !e.spendResent && !stoppedFollowing(f);
     if (ans.known && ans.result !== undefined) {
       const o = ans.result.outcome;
       if (o.case === "appended" || (o.case === "decided" && o.value.status === 1)) {
@@ -1322,7 +1362,7 @@ export abstract class SessionLayer extends SenderLayer {
   private async answerJournal(f: Follow, j: JournalEntry, ans: GetMutationResultResponse): Promise<void> {
     // 14 [CLI-76]: a journal entry whose content a redaction erased is no longer the whole action, and a lost spend action is not resent from it: it ends as one of unknown outcome
     // 14 [CLI-83], [CLI-7] (B3-M5): nor is one of a keyspace that the client stopped following
-    const spend = j.spend && !j.spendResent && j.redacted !== true && f.stopped === undefined;
+    const spend = j.spend && !j.spendResent && j.redacted !== true && !stoppedFollowing(f);
     const stub = this.stubOf(j);
     const reverted = (): void => {
       this.emit({ type: "reverted", mutationId: j.mutationId, keyspaceId: j.keyspaceId, seq: this.seqOf(j.outcome), logEpoch: j.outcome.logEpoch });

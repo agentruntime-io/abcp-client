@@ -563,6 +563,7 @@ export abstract class TabLayer extends RevocationLayer {
     for (const f of this.follows.values()) {
       if (f.anomalies > 0) anomalies[f.id] = f.anomalies;
       if (f.stopped !== undefined) stopped[f.id] = f.stopped;
+      else if (f.overSessionCap !== undefined) stopped[f.id] = "QUOTA_EXCEEDED"; // 09 [READ-35], A.7 (V43 MUST 1)
       if (f.purged) purged.push(f.id);
       loadsWithSkipped += f.loadsWithSkipped;
     }

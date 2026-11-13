@@ -427,6 +427,7 @@ export class Engine extends TabLayer {
           })(),
         );
       }
+      this.readdOverCap(); // 09 [READ-35] (V43 MUST 1): the app followed fewer keyspaces: one whose add was refused for the limit is added again
       return true;
     });
   }
@@ -640,6 +641,7 @@ export class Engine extends TabLayer {
       if (!f.purged) cursors[f.id] = { seq: f.state.seq, logEpoch: f.state.logEpoch };
       interest[f.id] = [...f.interest];
       if (f.stopped !== undefined) stopped[f.id] = f.stopped;
+      else if (f.overSessionCap !== undefined) stopped[f.id] = "QUOTA_EXCEEDED"; // 09 [READ-35], A.7 (V43 MUST 1)
       if (f.anomalies > 0) anomalies[f.id] = f.anomalies;
       loadsWithSkipped += f.loadsWithSkipped;
     }
