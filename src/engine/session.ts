@@ -79,6 +79,11 @@ function stoppedFollowing(f: Follow): boolean {
   return f.stopped !== undefined && f.stopped !== "UNKNOWN_DROP_REASON";
 }
 
+/** V48 MUST 1: a failure that may heal by itself: no RPC status (the network), `Unavailable` or a deadline. */
+function isTransportFailure(e: unknown): boolean {
+  return !(e instanceof RpcError) || e.status === "Unavailable" || e.status === "DeadlineExceeded";
+}
+
 function varintLength(n: number): number {
   let len = 1;
   for (let v = n; v >= 128; v = Math.floor(v / 128)) len++;
@@ -342,12 +347,22 @@ export abstract class SessionLayer extends SenderLayer {
     return (f.needsLoad !== undefined || !f.loaded) && f.stopped === undefined && !this.holds.has("PROTOCOL_ERROR", f.id) && !this.holds.has("HISTORY_DIVERGED", f.id) && !this.holds.has("UNKNOWN_DROP_REASON", f.id);
   }
 
+  /**
+   * The followed keyspaces that count against `max_keyspaces_per_session` (V48 S1): 09 §9.2 "a keyspace that was dropped … is no longer followed, so
+   * it counts no more". A keyspace that the server dropped (`stopped`) or whose copy was purged is left out, whatever the app still follows.
+   */
+  private sessionCounted(): number {
+    let n = 0;
+    for (const f of this.follows.values()) if (f.stopped === undefined && !f.purged) n++;
+    return n;
+  }
+
   private subscribable(f: Follow): boolean {
     if (!f.loaded || f.stopped !== undefined || f.frozen !== undefined) return false;
     const cap = f.overSessionCap;
     if (cap !== undefined) {
       // 09 [READ-35], A.7 (V43 MUST 1): an add refused for the keyspace limit is not sent again until what the engine follows, or the limit, changes
-      if (this.follows.size >= cap.followed && this.limits.maxKeyspacesPerSession <= cap.limit) return false;
+      if (this.sessionCounted() >= cap.followed && this.limits.maxKeyspacesPerSession <= cap.limit) return false;
       f.overSessionCap = undefined;
     }
     for (const h of this.holds.all()) {
@@ -575,18 +590,22 @@ export abstract class SessionLayer extends SenderLayer {
    */
   private async onKeyspaceCap(): Promise<void> {
     const named = this.lastSubscribeNamed;
-    const probe = this.followList().find((f) => f.loaded);
-    if (probe !== undefined) {
+    // V48 MUST 1: the probe asks a keyspace that the engine follows and may read (not one stopped, revoked, purged or frozen, whose LoadState a
+    // server refuses every time); a probe refused with an ABPC reject tries the next one
+    const candidates = this.followList().filter((f) => f.loaded && !f.purged && !f.revoked && f.stopped === undefined && f.frozen === undefined);
+    for (const probe of candidates) {
       try {
         const resp = await this.transport.loadState(
           create(LoadStateRequestSchema, { cursor: create(KeyspaceCursorSchema, this.cursorFields(probe)), clientId: this.clientId, pageToken: "", pageSize: 1, supportedFeatures: [...this.features] }),
         );
         this.applyLimits(resp.limits);
+        break;
       } catch (e) {
-        // V43 S1: without a fresh limit the engine cannot tell whether a smaller `Subscribe` would do: the refusal is handled as a transport
-        // failure of the session, which resumes with the reconnect backoff and probes again on the next refusal
         this.noteInternalError(e);
-        return;
+        // V43 S1: a transport failure leaves the limit unknown: the refusal is handled as a transport failure of the session, which resumes with
+        // the reconnect backoff and probes again on the next refusal. Any other failure says nothing of the limit and does not heal by itself:
+        // the next keyspace is asked, and when none answers the refusal is reported below (A.7 "Stop and report; never resend unchanged in a loop")
+        if (isTransportFailure(e)) return;
       }
     }
     if (this.subscribeCap() < named) return; // the limit is known now: the next `Subscribe` names fewer keyspaces
@@ -713,8 +732,14 @@ export abstract class SessionLayer extends SenderLayer {
     this.presenceKick(f.id); // 09 [READ-73]: the session follows the keyspace now: its topics join
   }
 
-  /** The drop reasons of A.6 (14 [CLI-51], [CLI-52], [CLI-80], 15 [COMPAT-42]). */
   private async onKeyspaceDropped(d: ControlFrame_KeyspaceDropped): Promise<void> {
+    await this.keyspaceDropped(d);
+    // V48 S1: a keyspace that the client stops following counts no more against the limit (09 §9.2): one whose add was refused for it may fit now
+    if (this.follows.get(d.keyspaceId)?.stopped !== undefined) this.readdOverCap();
+  }
+
+  /** The drop reasons of A.6 (14 [CLI-51], [CLI-52], [CLI-80], 15 [COMPAT-42]). */
+  private async keyspaceDropped(d: ControlFrame_KeyspaceDropped): Promise<void> {
     const f = this.follows.get(d.keyspaceId);
     if (f === undefined) return;
     f.onSession = false;
@@ -898,7 +923,7 @@ export abstract class SessionLayer extends SenderLayer {
    * keyspace is marked (see `subscribable`), shown in the sync status, and named to the app; the engine stops following nothing on its own.
    */
   private onAddOverCap(f: Follow): void {
-    f.overSessionCap = { followed: this.follows.size, limit: this.limits.maxKeyspacesPerSession };
+    f.overSessionCap = { followed: this.sessionCounted(), limit: this.limits.maxKeyspacesPerSession };
     this.onRuntimeChanged();
     this.emit({
       type: "protocol-error",
