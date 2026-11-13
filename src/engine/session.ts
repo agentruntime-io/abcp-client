@@ -348,12 +348,22 @@ export abstract class SessionLayer extends SenderLayer {
   }
 
   /**
-   * The followed keyspaces that count against `max_keyspaces_per_session` (V48 S1): 09 §9.2 "a keyspace that was dropped … is no longer followed, so
-   * it counts no more". A keyspace that the server dropped (`stopped`) or whose copy was purged is left out, whatever the app still follows.
+   * Whether a followed keyspace counts against `max_keyspaces_per_session` (V48 S1, V53 S-1): 09 [READ-64] "a keyspace that was dropped (READ-65) is no
+   * longer followed, so it counts no more". Left out, whatever the app still follows: a keyspace that the server dropped for good (`stopped`), one whose
+   * copy was purged, and one that a `HISTORY_DIVERGED` or `UPGRADE_REQUIRED` hold keeps off the session. A drop with either of those reasons holds the
+   * keyspace instead of stopping it, but the server freed its slot all the same; the keyspace is named again only when its hold ends, by an add that the
+   * limit judges like any other. A keyspace dropped to be loaded again (`RESUME_TOO_OLD`, `EPOCH_CHANGED`) is added again at once and keeps its place.
    */
+  private countsInSession(f: Follow): boolean {
+    if (f.stopped !== undefined || f.purged) return false;
+    if (f.onSession || f.awaitingAdd) return true;
+    return !this.holds.has("HISTORY_DIVERGED", f.id) && !this.holds.has("UPGRADE_REQUIRED", f.id);
+  }
+
+  /** The followed keyspaces that count against `max_keyspaces_per_session` (see `countsInSession`). */
   private sessionCounted(): number {
     let n = 0;
-    for (const f of this.follows.values()) if (f.stopped === undefined && !f.purged) n++;
+    for (const f of this.follows.values()) if (this.countsInSession(f)) n++;
     return n;
   }
 
@@ -734,8 +744,10 @@ export abstract class SessionLayer extends SenderLayer {
 
   private async onKeyspaceDropped(d: ControlFrame_KeyspaceDropped): Promise<void> {
     await this.keyspaceDropped(d);
-    // V48 S1: a keyspace that the client stops following counts no more against the limit (09 §9.2): one whose add was refused for it may fit now
-    if (this.follows.get(d.keyspaceId)?.stopped !== undefined) this.readdOverCap();
+    // V48 S1, V53 S-1: a keyspace that the client stops following, or holds off the session, counts no more against the limit (09 [READ-64]): one whose
+    // add was refused for it may fit now
+    const f = this.follows.get(d.keyspaceId);
+    if (f !== undefined && !this.countsInSession(f)) this.readdOverCap();
   }
 
   /** The drop reasons of A.6 (14 [CLI-51], [CLI-52], [CLI-80], 15 [COMPAT-42]). */
