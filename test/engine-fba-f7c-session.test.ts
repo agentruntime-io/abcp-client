@@ -74,6 +74,51 @@ describe("V48 MUST 1: A.7, 09 [READ-35] the limit probe asks a keyspace that can
     expect(ofType(r, "protocol-error").filter((e) => e.what === "Subscribe" && /max_keyspaces_per_session/.test(e.detail))).toHaveLength(1);
     expect(r.engine.status().connection).not.toBe("live");
   });
+
+  // V53 S-2, second half: a probe that fails with a transport error leaves the limit unknown (V43 S1). It is not a reject: the next keyspace is not asked,
+  // nothing is reported, and the session resumes with the reconnect backoff and probes again, until the probe answers
+  for (const status of ["Unavailable", "DeadlineExceeded"] as const) {
+    it(`READ35_A7_AProbeThatFailsWith${status}IsRetriedWithTheBackoffNotSkippedNorReported`, async () => {
+      const r = await rig({ keyspaces: [KS, "ks2"] });
+      await tick(r, 1000);
+      const probed = (req: unknown): string | undefined => (req as { cursor?: { keyspaceId: string } }).cursor?.keyspaceId;
+      const failures = 4;
+      r.server.inject("loadState", { kind: "status", status }, { times: failures });
+      r.server.inject("subscribe", { kind: "status", status: "ResourceExhausted", reject: mk(Code.QUOTA_EXCEEDED, { details: { quota: "max_keyspaces_per_session" } }) }, { times: 10_000 });
+      const subsBefore = subscribes(r);
+      const callsBefore = r.server.calls.length;
+      const probes = (): (string | undefined)[] => r.server.calls.slice(callsBefore).filter((c) => c.method === "loadState").map((c) => probed(c.request));
+      const overCap = (): unknown => (r.engine as unknown as { sess: { overCap?: unknown } }).sess.overCap;
+      const reports = (): number => ofType(r, "protocol-error").filter((e) => e.what === "Subscribe" && /max_keyspaces_per_session/.test(e.detail)).length;
+      r.server.disconnect();
+      await tick(r);
+      // not a tight loop: the first moments of the failure make one probe and one Subscribe, then the backoff spaces the retries
+      expect(probes().length).toBeLessThanOrEqual(2);
+      expect(subscribes(r) - subsBefore).toBeLessThanOrEqual(2);
+      const series: number[] = [];
+      for (let i = 0; i < 40; i++) {
+        await tick(r, 1000);
+        series.push(probes().length);
+        // while the probe fails: no move to the next keyspace, no stop, no report
+        if (probes().length <= failures) {
+          expect(probes().every((k) => k === probes()[0])).toBe(true);
+          expect(overCap()).toBeUndefined();
+          expect(reports()).toBe(0);
+        }
+      }
+      for (let i = 0; i < 20; i++) await tick(r, 30_000);
+      // the retries are the failures plus the one that answered; each is one Subscribe and one probe of the same (first) keyspace, never the next
+      expect(probes()).toHaveLength(failures + 1);
+      expect(new Set(probes()).size).toBe(1);
+      expect(probes()).not.toContain("ks2");
+      expect(subscribes(r) - subsBefore).toBe(failures + 1);
+      // spaced in time: the retries did not all happen in the first seconds
+      expect(series[4]).toBeLessThan(failures + 1);
+      // once the probe answers (the limit is no lower than what the Subscribe named) the F7d outcome follows: stop and report once, no resend
+      expect(overCap()).toEqual({ followed: 2 });
+      expect(reports()).toBe(1);
+    });
+  }
 });
 
 describe("V48 S1: 09 [READ-35] a keyspace that the server dropped counts no more against the limit", () => {
