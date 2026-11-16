@@ -94,7 +94,10 @@ export interface CommittedEvent extends Base {
   keyspaceId: string;
   /** `seq` of an `Appended`, `decision_seq` of a `Decided`. */
   seq: bigint;
-  /** The epoch the outcome was committed in (`log_epoch` of the `Appended` or `Decided`); with `keyspaceId` and `seq` it is the read-your-writes token (`readYourWritesToken`, 13 [PLC-27]). */
+  /**
+   * The epoch the outcome was committed in (`log_epoch` of the `Appended` or `Decided`, at least 1); with `keyspaceId` and `seq` it is the read-your-writes token
+   * (`readYourWritesToken`, 13 [PLC-27]). 0 only when the engine held no outcome for the action: such a token is never relied on (`copyHasWrite` answers "cannot-tell").
+   */
   logEpoch: number;
 }
 

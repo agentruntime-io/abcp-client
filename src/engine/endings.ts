@@ -475,6 +475,7 @@ export abstract class EndingLayer extends EngineCore {
   }
 
   private reportRetired(e: OutboxEntry, reported: "committed" | "corrected", keys: Set<string>, cause: "NO_EFFECT" | undefined, seq: bigint): void {
+    // logEpoch 0 only for an entry with no outcome held (not expected here): copyHasWrite never relies on a token of epoch 0 (13 [PLC-27]; V87 M1)
     if (reported === "committed") this.emit({ type: "committed", mutationId: e.mutationId, keyspaceId: e.keyspaceId, seq, logEpoch: e.outcome?.logEpoch ?? 0 });
     else this.emit({ type: "corrected", mutationId: e.mutationId, keyspaceId: e.keyspaceId, seq, keys: [...keys], ...(cause !== undefined ? { cause } : {}) });
   }

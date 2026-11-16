@@ -39,8 +39,18 @@ describe("13 [PLC-27]: the token", () => {
 
 describe("13 [PLC-27] progress-row test (copyHasWrite)", () => {
   const token = { keyspaceId: "k", logEpoch: 2, seq: 10n };
-  it("epoch above: has the write", () => {
-    expect(copyHasWrite(token, { epoch: 3, copiedSeq: 0n })).toBe("has-write");
+  it("epoch above: the copy was rebuilt, and the token is not relied on (V87 M1)", () => {
+    // 13 [PLC-27]: "If the progress row shows a higher log_epoch, the copy was rebuilt after a restore or split, and the reader MUST NOT rely on the token"
+    expect(copyHasWrite(token, { epoch: 3, copiedSeq: 0n })).toBe("cannot-tell");
+    expect(copyHasWrite(token, { epoch: 3, copiedSeq: 99n })).toBe("cannot-tell");
+    expect(copyHasWrite(token, { epoch: 3, copiedSeq: 99n }, { covered: 99n })).toBe("cannot-tell");
+  });
+  it("a token with no epoch (0) never passes, against a row of any epoch", () => {
+    const t0 = { keyspaceId: "k", logEpoch: 0, seq: 10n };
+    for (const epoch of [0, 1, 2, 7]) {
+      expect(copyHasWrite(t0, { epoch, copiedSeq: 99n })).toBe("cannot-tell");
+    }
+    expect(copyHasWrite(t0, { epoch: 0, copiedSeq: 0n, purged: true })).toBe("deleted");
   });
   it("epoch equal, copied_seq at or above seq: has the write", () => {
     expect(copyHasWrite(token, { epoch: 2, copiedSeq: 10n })).toBe("has-write");
