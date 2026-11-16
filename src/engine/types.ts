@@ -94,6 +94,8 @@ export interface CommittedEvent extends Base {
   keyspaceId: string;
   /** `seq` of an `Appended`, `decision_seq` of a `Decided`. */
   seq: bigint;
+  /** The epoch the outcome was committed in (`log_epoch` of the `Appended` or `Decided`); with `keyspaceId` and `seq` it is the read-your-writes token (`readYourWritesToken`, 13 [PLC-27]). */
+  logEpoch: number;
 }
 
 export interface CorrectedEvent extends Base {

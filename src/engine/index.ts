@@ -75,6 +75,7 @@ export { jsonBytes, set, setNull, del, incr, cas, crdtUpdate } from "./changes.j
 export { CLIENT_BACKOFF, HOLD_BACKOFF, RECONNECT_BACKOFF, fullJitter, bound, resendDelay } from "./backoff.js";
 export { DEFAULT_CLASS, codeName, reactionOf, type Reaction } from "./codes.js";
 export { makeReject } from "./endings.js";
+export { readYourWritesToken, copyHasWrite, type ReadYourWritesToken, type CopyProgress, type CopyVerdict } from "./token.js";
 export { newUuid } from "./ids.js";
 export { DEFAULT_HORIZON_WARNING } from "./horizon.js";
 export { TOKEN_REFRESH_LEAD_MS, type CopyPolicy, type PurgeHook } from "./revocation.js";

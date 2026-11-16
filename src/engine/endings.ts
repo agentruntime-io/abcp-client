@@ -475,7 +475,7 @@ export abstract class EndingLayer extends EngineCore {
   }
 
   private reportRetired(e: OutboxEntry, reported: "committed" | "corrected", keys: Set<string>, cause: "NO_EFFECT" | undefined, seq: bigint): void {
-    if (reported === "committed") this.emit({ type: "committed", mutationId: e.mutationId, keyspaceId: e.keyspaceId, seq });
+    if (reported === "committed") this.emit({ type: "committed", mutationId: e.mutationId, keyspaceId: e.keyspaceId, seq, logEpoch: e.outcome?.logEpoch ?? 0 });
     else this.emit({ type: "corrected", mutationId: e.mutationId, keyspaceId: e.keyspaceId, seq, keys: [...keys], ...(cause !== undefined ? { cause } : {}) });
   }
 
