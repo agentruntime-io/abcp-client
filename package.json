@@ -1,7 +1,20 @@
 {
   "name": "@agentruntime/abpc-client",
-  "version": "0.0.0",
+  "version": "2.0.0-alpha.4",
   "private": true,
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/agentruntime-io/abpc-client"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
   "description": "ABPC v2 client engine with its local query layer (spec chapter 14).",
   "type": "module",
   "main": "./dist/index.js",
@@ -9,7 +22,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "gen": "buf generate"
   },
   "dependencies": {
     "@bufbuild/protobuf": "2.10.0",
