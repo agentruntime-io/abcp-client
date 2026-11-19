@@ -1,0 +1,222 @@
+// ABPC v2.0 — policy-host contract (spec/08).
+// PolicyHostService is implemented by app policy hosts, pool hosts included (spec/08 [GATE-106]), and by out-of-process
+// C-layer modules, and called by ABPC. HostService is implemented by ABPC and called by hosts and C-layer modules under
+// service principals.
+// Transport: as spec/02 §2.9 binds each service. ABPC calls PolicyHostService and AuthorizerService over gRPC with the
+// binary protobuf codec, which every host and authorizer serves; a Reject or a Retry travels as the error detail that
+// spec/02 §2.9 defines. Of an answer whose strings are not valid UTF-8, or whose Timestamps are out of range
+// (spec/02 [ARC-61]), a host's answer is an invalid host result, and an authorizer's answer counts as an authorizer
+// that cannot answer (spec/08 [GATE-22], spec/10 [AUTH-45]).
+syntax = "proto3";
+
+package abpc.v2;
+
+import "abpc/v2/types.proto";
+import "abpc/v2/sync.proto";
+import "google/protobuf/timestamp.proto";
+
+enum HostProfile {
+  HOST_PROFILE_UNSPECIFIED = 0;
+  HOST_PROFILE_PROJECTION = 1;   // profile P: decides from ABPC state, writes nothing during Evaluate
+  HOST_PROFILE_RESOURCE = 2;     // profile R: an external system of record, Try/Confirm/Cancel (TCC)
+}
+
+// Both sides authenticate (spec/08 [GATE-30]): ABPC checks the host's TLS server certificate; the host checks
+// ABPC's bearer token, which is always required (mTLS MAY be added), against the deployment's JWKS, found by OpenID
+// Connect Discovery at the deployment's issuer URL, and refuses a call whose token app_id is not an app it serves or
+// differs from the request's app_id. The token holds no sub claim, so that it never passes as a user token. An answer
+// from a host ABPC could not authenticate counts as Unavailable.
+// No RPC of this service tells a host of a redaction: a host observes a REDACTED record only by following the
+// keyspace's log or loading its state, as a service principal (spec/08 [GATE-103]).
+service PolicyHostService {
+  rpc Describe(DescribeRequest) returns (DescribeResponse);
+  rpc Evaluate(EvaluateRequest) returns (EvaluateResponse);
+  // At-least-once, ack-based notice of every terminal decision to each of its recipients: the hosts that evaluated the
+  // intent and the decision's gate host, also for an op type the host no longer gates (spec/08 [GATE-43]).
+  rpc DecisionFinalized(DecisionFinalizedRequest) returns (DecisionFinalizedResponse);
+  // At-least-once, ack-based notice of every epoch advance of any keyspace of the app, sent to the recipients that
+  // spec/08 [GATE-100] names, in increasing new_epoch per keyspace. An RPC that a v2.x revision adds here is called
+  // only on a host whose DescribeResponse.features lists its feature (spec/08 [GATE-19]).
+  rpc EpochAdvanced(EpochAdvancedRequest) returns (EpochAdvancedResponse);
+}
+
+message DescribeRequest {}
+
+message DescribeResponse {
+  string build = 1;                       // at most 256 octets, no U+0000, or no Describe result (spec/08 [GATE-19], [GATE-32]);
+                                          // copied as Provenance.gate_build (spec/06 [LOG-34])
+  repeated uint32 manifest_versions = 2;  // manifest versions this host supports
+  repeated string op_types = 3;           // the op types it gates, module op types included (spec/08 [GATE-106])
+  HostProfile profile = 4;                // one per host, shared by every op type it gates (spec/08 [GATE-66])
+  repeated string features = 5;           // the feature ids it understands (spec/08 [GATE-19], spec/15 [COMPAT-27])
+}
+
+message EvaluateRequest {
+  string app_id = 1;
+  string keyspace_id = 2;
+  uint32 log_epoch = 3;                   // the epoch the attempt runs in. Deliveries are de-duplicated by (app_id,
+                                          // keyspace_id, log_epoch, intent id) (spec/08 [GATE-45]); a reservation is
+                                          // keyed by (app_id, keyspace_id, intent.mutation_id), never by an epoch
+                                          // (spec/08 [GATE-34]). A profile R host refuses a Try whose log_epoch is older
+                                          // than an epoch it has learned of for the keyspace (spec/08 [GATE-72])
+  uint32 manifest_version = 4;            // the version stored in the intent entry, re-validated against the version
+                                          // in force before the attempt (spec/08 [GATE-16])
+  Mutation intent = 5;                    // the GATED mutation as registered, unchanged by resends (spec/08 [GATE-16])
+  Principal principal = 6;                // stamped by ABPC
+  map<string, uint64> min_versions = 7;   // key or prefix ("…/") → seq the host must have seen; at most 1,000
+                                          // entries (spec/08 [GATE-17], [GATE-37])
+  google.protobuf.Timestamp deadline = 8; // the earlier of now + the host's timeout_ms and the intent's decision_deadline
+                                          // (spec/08 [GATE-16]); the host answers before it ([GATE-40])
+  uint32 attempt = 9;                     // 1 for the first attempt of the intent, increased by 1 for each later one (spec/08 [GATE-16])
+  string read_capability = 10;            // token for HostService.ReadKeys on keyspace_id, valid for this attempt only,
+                                          // bound to the app and, when the app config names it, to the host's service
+                                          // principal (spec/08 [GATE-18])
+  repeated string required_features = 11;
+  uint64 min_seq = 12;                    // 0, or, when more than 1,000 keys would need a min_versions entry, the
+                                          // highest seq among the waited records: the host decides only from a state at or
+                                          // above it (spec/08 [GATE-17], [GATE-37])
+}
+
+message EvaluateResponse {
+  message Commit {
+    repeated KeyChange effects = 1;       // only within the op type's `effects` templates (spec/08 [GATE-22]), each with
+                                          // the seen_version that spec/08 [GATE-27] gives it
+    map<string, uint64> read_versions = 2;  // key or prefix → version the decision was based on; at most 1,000 entries
+  }
+  // Within the caps of spec/08 [GATE-39], or an invalid host result (spec/08 [GATE-22]): the whole encoded Rejection
+  // at most 8 KiB, and its strings valid UTF-8 (spec/02 [ARC-61]). message and details never hold a value of a key:
+  // they are copied into the DECISION's Reject, which a redaction cannot blank.
+  message Rejection {
+    string app_code = 1;                  // namespaced (spec/08 [GATE-39]); a malformed one does not void the rejection: the
+                                          // REJECTED decision's Reject has app_code cleared and
+                                          // details["app_code_invalid"] = "true" (spec/08 [GATE-23])
+    string message = 2;                   // display text, at most 1,024 octets
+    map<string, string> details = 3;      // at most 32 entries; keys at most 64 octets, values at most 1,024 octets
+  }
+  message Unavailable {
+    uint32 retry_after_ms = 1;            // at most 60,000; ABPC treats a larger value as 60,000 (spec/08 [GATE-20], [GATE-38]); 0 names no delay: ABPC waits its own backoff alone (spec/04 Table 4.11, spec/08 [GATE-50])
+  }
+  oneof result {
+    Commit commit = 1;
+    Rejection reject = 2;                 // terminal: GATE_REJECTED
+    Unavailable unavailable = 3;          // never a decision
+  }
+}
+
+// A host de-duplicates deliveries by (app_id, keyspace_id, decision.log_epoch, intent id) (spec/08 [GATE-45]); the
+// reservation a delivery concerns is keyed by (app_id, keyspace_id, intent id) alone (spec/08 [GATE-34]). At an epoch
+// advance (spec/06 §6.9), a DECISION that the advance discarded is no longer delivered. An intent left without a
+// decision whose entry survives the advance (a logged intent whose INTENT record is at or below the base seq, or an
+// unlogged intent whose entry the restore kept, spec/07 [MUT-104]) ends with a REJECTED decision,
+// Reject{STALE, cause EPOCH}, or Reject{CANCELLED} at an advance that precedes a deletion (spec/08 [GATE-93]), keyed by
+// the new epoch and delivered here like any other; a profile R host that confirmed the intent treats it as a reversal
+// and compensates by its own records. An intent lost with the old timeline gets no
+// delivery: the host learns of the advance from EpochAdvanced and checks only the reservations the advance can have
+// touched (spec/08 [GATE-93], [GATE-104]). A host acts on no delivery whose DECISION an advance it has processed lost
+// (spec/08 [GATE-105]).
+message DecisionFinalizedRequest {
+  string app_id = 1;
+  string keyspace_id = 2;
+  Record decision = 3;                    // the DECISION record, blanked as the log's copy is after a redaction (spec/08
+                                          // [GATE-44]); its log_epoch and intent id key the delivery
+}
+
+message DecisionFinalizedResponse {}      // an ack; ABPC redelivers until acked
+
+// Sent at every epoch advance of a keyspace (spec/06 §6.9, spec/08 [GATE-100]), with the values of its EPOCH_ADVANCED
+// record (spec/06 [LOG-48]); a catch-up notice of the latest advance, for a module declared while none declared it, or declared out of process after it was last in process (spec/08 [GATE-100]),
+// carries the same values (spec/08 [GATE-100]). A host processes the notices of a keyspace in increasing new_epoch and idempotently by
+// (app_id, keyspace_id, new_epoch) (spec/08 [GATE-101]). A record (log_epoch, seq) of the keyspace lies in the kept
+// prefix when seq <= base_seq and log_epoch <= base_epoch; a profile R host checks only the reservations whose
+// DECISION lies outside it, and those made by a Try of an earlier epoch with no DECISION received (spec/08 [GATE-104]).
+message EpochAdvancedRequest {
+  string app_id = 1;
+  string keyspace_id = 2;
+  uint32 previous_epoch = 3;
+  uint32 new_epoch = 4;
+  uint32 base_epoch = 5;                  // the log_epoch of the record at base_seq (in the source, for the first
+                                          // epoch of a split successor; spec/06 [LOG-48]); 0 when base_seq is 0
+  uint64 base_seq = 6;                    // the seq of the last record kept from the previous timeline (spec/06 [LOG-67])
+  google.protobuf.Timestamp advanced_at = 7;  // the server_time of the EPOCH_ADVANCED record
+}
+
+message EpochAdvancedResponse {}          // an ack; ABPC redelivers until acked, and sends the keyspace's next notice
+                                          // only after it
+
+// Implemented by an app that uses a remote authorizer (AppConfig.authorizer, spec/10 §10.6). Called by ABPC.
+// Authenticated as PolicyHostService is (spec/10 [AUTH-43]): the bearer token is always required, and the authorizer
+// refuses a call whose token app_id is not an app it serves or differs from CheckRequest.app_id. AuthorizerService gains
+// no RPC in v2.x: a new authorizer contract is a new service behind a feature (spec/15 [COMPAT-28]).
+service AuthorizerService {
+  rpc Check(CheckRequest) returns (CheckResponse);
+}
+
+message CheckRequest {
+  string app_id = 1;
+  Principal principal = 2;                // the full stamped principal: issuer, sub, kind, device_id and actor_chain;
+                                          // ABPC caches an answer per (principal, keyspace_id, action) (spec/10 [AUTH-44])
+  string keyspace_id = 3;                 // "**" for an app-level call (spec/10 [AUTH-32])
+  string action = 4;                      // e.g. "read", "write:IssueFieldSet", "presence"; "write:*" only for the calls
+                                          // and with the meaning that spec/10 [AUTH-43] gives it (spec/08 [GATE-58])
+}
+
+message CheckResponse {
+  bool allow = 1;
+  uint32 max_age_seconds = 2;             // how long ABPC may cache this answer; 0 means not at all (spec/10 [AUTH-43])
+}
+
+service HostService {
+  rpc GetDecision(GetDecisionRequest) returns (GetDecisionResponse);
+  rpc ReadKeys(ReadKeysRequest) returns (ReadKeysResponse);
+}
+
+message GetDecisionRequest { string keyspace_id = 1; string intent_id = 2; }
+
+// What the server knows of an intent id in the keyspace's current timeline (spec/08 [GATE-46]). A host treats 0, and
+// any value it does not know, as an answer it cannot act on: it releases and compensates nothing on it, and asks again.
+enum IntentState {
+  INTENT_STATE_UNSPECIFIED = 0;
+  INTENT_STATE_PENDING = 1;               // registered and not yet decided; after an epoch advance, only for an id that was
+                                          // registered again (spec/08 [GATE-104])
+  INTENT_STATE_TERMINAL = 2;              // decided; `decision` holds the DECISION record of the current timeline, and is
+                                          // always set (spec/08 [GATE-46])
+  INTENT_STATE_VOIDED = 3;                // the intent was lost to an epoch advance: the id carries a voided marker, or
+                                          // the STALE{EPOCH} binding that replaced one (spec/07 [MUT-105])
+  INTENT_STATE_UNKNOWN = 4;               // the server holds no intent entry, binding of a registered intent or voided
+                                          // marker for the id
+}
+
+message GetDecisionResponse {
+  reserved 1;
+  reserved "terminal";                    // replaced by state (spec/08 [GATE-46])
+  Record decision = 2;                    // set only for INTENT_STATE_TERMINAL; blanked as the log's copy is after a
+                                          // redaction (spec/08 [GATE-46])
+  IntentState state = 3;
+}
+
+message ReadKeysRequest {
+  string read_capability = 1;             // from EvaluateRequest; or empty for a service principal's own grants
+  string keyspace_id = 2;
+  repeated string keys = 3;               // no count cap in v2.0; the 16 MiB message bound is its only limit (spec/08 [GATE-47])
+  repeated string prefixes = 4;           // key prefixes ending with "/" (spec/03 [ID-14]); returns keys below each
+                                          // prefix and the prefix version. At most 1,000, or InvalidArgument with
+                                          // Reject{INVALID_ENVELOPE} (spec/08 [GATE-47])
+  string page_token = 5;                  // bound to its request, as_of_seq and log_epoch (spec/08 [GATE-47])
+  uint32 page_size = 6;                   // 0 = 1,000; at most 10,000, a larger value counts as 10,000; a page also ends
+                                          // before 16 MiB in the call's codec (spec/08 [GATE-47])
+}
+
+message ReadKeysResponse {
+  repeated KeyEntry entries = 1;          // in ascending order of the key's UTF-8 octets across the pages of one read, each key
+                                          // once (spec/08 [GATE-47])
+  map<string, uint64> prefix_versions = 2;  // the version of each requested prefix, on every page (spec/08 [GATE-47])
+  uint64 as_of_seq = 3;
+  string next_page_token = 4;
+  uint32 log_epoch = 5;                   // the keyspace's epoch at as_of_seq, the same on every page (spec/08 [GATE-47]);
+                                          // a host append takes its base_log_epoch and guards in it (spec/07 [MUT-90])
+  google.protobuf.Timestamp app_resumed_at = 6;  // on every page: the resume time of the app's latest suspension
+                                                 // (spec/12 [ADM-18]) when the server answers the page; unset when the
+                                                 // app has never been suspended. Every module counts every floor after
+                                                 // a resume from it, the bounds of spec/11 [COORD-12] and [COORD-67]
+                                                 // included (spec/08 [GATE-47], spec/11 [COORD-90], [COORD-117])
+}

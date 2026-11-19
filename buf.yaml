@@ -1,0 +1,10 @@
+# The protos under proto/abpc are verbatim copies of the ABPC v2 wire files. They are the input of `npm run gen`.
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+breaking:
+  use:
+    - FILE

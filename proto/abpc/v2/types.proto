@@ -1,0 +1,530 @@
+// ABPC v2.0 — shared types. Normative together with the spec chapters (spec/README.md).
+// Field numbers are frozen at v2.0; later additions follow spec/15-compatibility.md.
+// Every enum's 0 value means "unknown" to a reader; spec/15 marks each enum closed or open, with the reaction to a
+// value a reader does not know. Hashes cover unknown fields as received (spec/07 [MUT-45]).
+// Transport: these messages travel as spec/02 §2.9 binds every service; a Reject or a Retry attached to a failed call
+// is its one error detail, as spec/02 [ARC-57] says. Every string field holds valid UTF-8, and every Timestamp lies in
+// the range that spec/02 [ARC-61] gives, so that both codecs carry every message.
+syntax = "proto3";
+
+package abpc.v2;
+
+import "google/protobuf/timestamp.proto";
+
+// ───────────────────────────── Identity ─────────────────────────────
+
+enum PrincipalKind {
+  PRINCIPAL_KIND_UNSPECIFIED = 0;
+  PRINCIPAL_KIND_USER = 1;
+  PRINCIPAL_KIND_SERVICE = 2;   // policy hosts, orchestrators, C-layer modules, app back ends
+  PRINCIPAL_KIND_DEVICE = 3;
+}
+
+// Stamped by the server on every record, from a verified token or as one of the two principals that the server stamps
+// itself (spec/10 [AUTH-14], §10.2). Never taken from the request body.
+message Principal {
+  string app_id = 1;
+  string sub = 2;
+  PrincipalKind kind = 3;
+  string device_id = 4;              // from the token's device_id claim; for kind DEVICE without it, the sub (spec/10 [AUTH-13])
+  repeated string actor_chain = 5;   // from `act` delegation (outermost first)
+  bool admin_issuer = 6;             // token came from the app's admin issuer (spec/10 §10.1)
+  string issuer = 7;                 // the verified `iss`; `sub` is unique only per issuer
+}
+
+// ───────────────────────────── Key changes ─────────────────────────────
+
+enum ChangeKind {
+  CHANGE_KIND_UNSPECIFIED = 0;
+  CHANGE_KIND_SET = 1;          // lww templates only (spec/05 §5.4)
+  CHANGE_KIND_DELETE = 2;       // removes the key; deleting an entity marker hides its subtree (spec/05 §5.6)
+  CHANGE_KIND_INCR = 3;         // counter templates only
+  CHANGE_KIND_CAS = 4;          // cas templates: set if `expected` matches (cas templates accept CAS, DELETE, OVERRIDE)
+  CHANGE_KIND_CRDT_UPDATE = 5;  // crdt templates only; opaque update in `update`
+  CHANGE_KIND_OVERRIDE = 6;     // admin-issuer principals with override:<template>, op type abpc.Override (spec/12 §12.8);
+                    // a CRDT override carries `update` (a normal CRDT transaction)
+}
+
+// Exactly one member is set; none set → INVALID_ENVELOPE (spec/05 [STATE-24]).
+message CasExpect {
+  oneof expect {
+    uint64 version = 1;   // the key's current version must equal this
+    bytes value = 2;      // the key's current value bytes must equal this
+    bool absent = 3;      // true only (false → INVALID_ENVELOPE): the key is absent and is not a retained entity
+                          // tombstone (spec/05 [STATE-23])
+  }
+}
+
+// key, kind and seen_version are the non-value fields; every other field, one that a later revision adds and an
+// unknown one included, is a value field, which a redaction blanks (spec/06 [LOG-71], [LOG-76]).
+message KeyChange {
+  string key = 1;                 // concrete key path (spec/03 §3.3)
+  ChangeKind kind = 2;
+  bytes value = 3;                // SET, CAS, OVERRIDE; empty with `is_null` for an explicit null
+  bool is_null = 4;               // explicit null value (spec/05 §5.3)
+  string encoding = 5;            // value encoding, e.g. "json/v1", "bytes/v1", "yjs/v1"
+  sint64 delta = 6;               // INCR. 0 is always valid: on an absent counter it creates the counter at 0; on a
+                                  // present one the value is unchanged and the key's version advances (spec/05 [STATE-27]);
+                                  // the counter's range still applies (spec/05 [STATE-28])
+  bytes update = 7;               // CRDT_UPDATE
+  CasExpect expected = 8;         // CAS
+  uint64 seen_version = 9;        // version of the key the author saw; 0 = never seen (spec/05 §5.8), or, for a gate
+                                  // effect, a key the host did not read (spec/08 §8.4). A server-written change carries
+                                  // the key's current version (spec/06 [LOG-85])
+}
+
+// ───────────────────────────── Preconditions ─────────────────────────────
+
+// One target and one check are set, else INVALID_ENVELOPE; a target that is no key or key prefix → INVALID_KEY
+// (spec/05 [STATE-53], spec/07 Table 7-2 item 7).
+message Precondition {
+  oneof target {
+    string key = 1;
+    string prefix = 2;            // ends with "/"; matches every key below it (spec/05 §5.7)
+  }
+  oneof check {
+    uint64 unchanged_since = 3;   // version of target ≤ this seq (client's confirmed watermark)
+    bool exists = 4;              // key only; true only (false → INVALID_ENVELOPE)
+    bool absent = 5;              // key only; true only (false → INVALID_ENVELOPE)
+    string after_mutation = 6;    // key only: current version was produced by this mutation id
+    uint64 expected_seq = 7;      // key only: current version equals this
+  }
+  uint32 log_epoch = 8;           // epoch the check was taken in; 0 as spec/05 [STATE-55] says, refused with
+                                  // INVALID_ENVELOPE from a SERVICE principal (spec/07 [MUT-108]); another epoch →
+                                  // STALE{EPOCH}, except as spec/05 [STATE-81] says for a spend action (spec/05 §5.7,
+                                  // spec/06 §6.9)
+}
+
+// ───────────────────────────── Results and errors ─────────────────────────────
+
+enum Lane {
+  LANE_UNSPECIFIED = 0;
+  LANE_SEQUENCED = 1;
+  LANE_GATED = 2;
+}
+
+// What a client engine does with an action that got this code (spec/A, spec/14 §14.6).
+enum ErrorClass {
+  ERROR_CLASS_UNSPECIFIED = 0;  // never sent; a client handles it, and any class it does not know, as HOLD, except the reject of a REJECTED
+                                // decision, which is handled as DEAD_LETTER (spec/15 [COMPAT-39]), and ends the hold at its
+                                // bound as spec/14 [CLI-45] says
+  ERROR_CLASS_RETRY = 1;        // resend the same action later, unchanged
+  ERROR_CLASS_HOLD = 2;         // stop the affected lane or keyspace until the condition clears, for at most the code's
+                                // bound (spec/14 [CLI-45]); keep the action
+  ERROR_CLASS_DEAD_LETTER = 3;  // final; hand to the app with the reason; dependents fail
+  ERROR_CLASS_CONFLICT = 4;     // final for this action; the conflict callback tells the user, and a new action is authored
+                                // only on the user's instruction, never automatically (spec/02 [ARC-50]), except as
+                                // spec/02 [ARC-52] allows
+}
+
+// Open enum (spec/15 [COMPAT-44], Table 15.2): a v2.x revision may add codes, each with its class; a client handles a
+// code it does not know by its Reject.error_class (spec/15 [COMPAT-39]).
+enum Code {
+  CODE_UNSPECIFIED = 0;
+  CODE_INVALID_ENVELOPE = 1;
+  CODE_INVALID_KEY = 2;
+  CODE_WRITE_NOT_ALLOWED = 3;
+  CODE_UNKNOWN_OP_TYPE = 4;
+  CODE_SCHEMA_INVALID = 5;
+  CODE_PAYLOAD_TOO_LARGE = 6;
+  CODE_QUOTA_EXCEEDED = 7;
+  CODE_RANGE_EXCEEDED = 8;
+  CODE_STALE = 9;
+  CODE_TOMBSTONED = 10;
+  CODE_POLICY_CHANGED = 11;      // class CONFLICT: the op type's dispatch, template rule or template state changed since
+                                 // authoring. Also ends an intent at once, as REJECTED, when a check of its re-validation
+                                 // after a manifest change fails, whether its reject would be recorded or not, such as
+                                 // UNKNOWN_OP_TYPE or UPGRADE_REQUIRED. That reject concerns the whole action: change_index
+                                 // is unset, details["code"] names a failed check's other code, and details["replacement"]
+                                 // the replacement that a failed check gives. It never waits for the deadline (spec/08
+                                 // [GATE-24] step 4)
+  CODE_IDEMPOTENCY_KEY_REUSED = 12;
+  CODE_ID_CONFLICT = 13;
+  CODE_CLIENT_FORKED = 14;
+  CODE_CLIENT_UNKNOWN = 15;
+  CODE_PERMISSION_DENIED = 16;   // also the detail of Unauthenticated for a token issued before a subject's not_before,
+                                 // with details["cause"] = "SUBJECT_REVOKED" (spec/10 [AUTH-51])
+  CODE_KEYSPACE_NOT_FOUND = 17;
+  CODE_KEYSPACE_ARCHIVED = 18;   // class DEAD_LETTER: archived or split, as details["lifecycle"] says (no lifecycle: ARCHIVED).
+                                 // Queued actions are re-routed only to split successors; for an archive, nothing is
+                                 // re-routed and they are dead-lettered with this code and the successors (spec/14 [CLI-52])
+  CODE_KEYSPACE_DELETED = 19;
+  CODE_UPGRADE_REQUIRED = 20;
+  CODE_UNSUPPORTED_FEATURE = 21;
+  CODE_GATE_REJECTED = 22;       // class DEAD_LETTER: the gate's terminal "no". A malformed app_code does not void it: the
+                                 // server clears app_code and sets details["app_code_invalid"] = "true" (spec/08 [GATE-23])
+  CODE_CANCELLED = 23;           // class DEAD_LETTER: by CancelIntent, or by the server, with details["cause"] naming why:
+                                 // "REDACTED" (spec/12 [ADM-64]), "APP_DELETED" (spec/12 [ADM-20]) or "KEYSPACE_DELETED"
+                                 // (spec/12 [ADM-35]); Appendix A.12 lists the causes
+  CODE_INTENT_EXPIRED = 24;      // class DEAD_LETTER: no decision before decision_deadline; details["cause"] = "APP_SUSPENDED"
+                                 // when the deadline passed while the app was suspended (spec/12 [ADM-17], [ADM-18]), or
+                                 // "INVALID_HOST_RESULT" when the intent's latest attempt that ended was an invalid host
+                                 // result (spec/08 [GATE-52])
+  CODE_OFFLINE_TOO_LONG = 25;    // class DEAD_LETTER, recorded: older than the offline horizon, details["cause"] = "HORIZON",
+                                 // or authored under a version out of the support window, "SUPPORT_WINDOW" (spec/07 [MUT-89])
+  CODE_HISTORY_DIVERGED = 26;
+  CODE_OVERRIDE_FORBIDDEN = 27;
+  CODE_ACTOR_MISMATCH = 28;
+  CODE_BLOB_MISSING = 29;
+  CODE_BLOB_DELETED = 30;
+  CODE_DEPENDENCY_FAILED = 31;   // client-side only: an action this one depends on failed (spec/14 §14.4)
+  CODE_APP_SUSPENDED = 32;       // class HOLD: the app is suspended (spec/12 §12.2.3)
+  CODE_ADMIN_REFUSED = 33;       // class DEAD_LETTER: an AdminService refusal; the Appendix A.9 reason is in details["reason"]
+  CODE_CONTENDED = 34;           // class CONFLICT: the data the action depends on kept changing. A GATED intent ends REJECTED
+                                 // with it after N consecutive commit-time conflicts (N: AppLimits.contended_after_conflicts);
+                                 // details["keys"] lists the contested keys and prefixes, in the form that spec/08 [GATE-25]
+                                 // gives; a possible owner-authorized write has no "keys" member (spec/08 [GATE-25],
+                                 // spec/11 [COORD-94])
+}
+
+enum StaleCause {
+  STALE_CAUSE_UNSPECIFIED = 0;
+  STALE_CAUSE_VERSION_MISMATCH = 1;
+  STALE_CAUSE_PARENT_DELETED = 2;
+  STALE_CAUSE_LEASE = 3;          // caller is not the owner of a fencing key, or it expired (spec/11 §11.2); also, at a
+                                  // decision commit, an owner-keeping change whose ownership a revocation ended, or a
+                                  // change that sets a non-null owner, requested or a gate effect, whose author a
+                                  // revocation reached later than the intent's authorization time less the revocation
+                                  // margin of spec/11 [COORD-94], the revocation counted from the later of its
+                                  // not_before and its recording, and only when its not_before is at or before the commit's
+                                  // T (spec/08 [GATE-8] step 3, [GATE-24] steps 6 and 8)
+  STALE_CAUSE_OVERRIDDEN = 4;     // the key was overridden after the author's seen_version
+  STALE_CAUSE_DOC_RESET = 5;      // a CRDT key's history was squashed by a redaction after the author's seen_version (its
+                                  // reset seq, spec/05 [STATE-85]). The conflict handler, as for OVERRIDDEN;
+                                  // the user's unsent text is kept as a local draft, outside the outbox, and is never
+                                  // re-applied automatically: only by the user's choice, as a new action (spec/14 [CLI-49])
+  STALE_CAUSE_EPOCH = 6;          // taken in another log_epoch: the action's base_log_epoch or a precondition's log_epoch
+                                  // (spec/05 [STATE-81], [STATE-55]); an intent that an epoch advance ended undecided
+                                  // (spec/06 [LOG-83]); a resend of a mutation id that an advance voided, other than a spend
+                                  // (spec/07 [MUT-105]); or a fence whose owning key was written in another epoch
+                                  // (spec/11 [COORD-33])
+  STALE_CAUSE_MOVING = 7;         // the entity is frozen (the entity-freeze primitive; a built-in move freezes it): a change to
+                                  // its marker, to a key below it or to its freeze marker (a move's moved key), other than
+                                  // the freeze-exempt op types of the freeze template; details["moved_to"] names the target
+                                  // (spec/11 [COORD-104])
+  STALE_CAUSE_REDACTED = 8;       // a change authored before a redaction of the key: its seen_version is below the key's
+                                  // reset seq (spec/05 [STATE-85]); lww, cas and counter keys, a CRDT key gets DOC_RESET
+}
+
+message Stale {
+  string key = 1;            // the key or prefix that failed
+  uint64 current_seq = 2;
+  StaleCause cause = 3;
+  Principal holder = 4;      // LEASE or EPOCH: the current owner, when there is one, as spec/11 [COORD-33] fills it; never for an owner-authorized write that spec/11 [COORD-94] answers
+}
+
+// Where keys of a split or archived keyspace now live (spec/12 §12.5). An empty prefix is the catch-all. Which rule a key
+// matches, if any, a reserved key's included, is defined once in spec/12 [ADM-45]. A keyspace's successor map holds at
+// most 1,000 rules and 256 KiB of SuccessorRule encodings, measured as spec/12 [ADM-45] says.
+message SuccessorRule {
+  string prefix = 1;
+  string keyspace_id = 2;
+}
+
+// A keyspace's lifecycle state (spec/12 §12.4), in LoadStateResponse.lifecycle. On KEYSPACE_ARCHIVED,
+// Reject.details["lifecycle"] holds the short name of SPLIT or ARCHIVED (spec/14 [CLI-52]); a client given neither
+// treats the keyspace as ARCHIVED.
+enum KeyspaceLifecycle {
+  KEYSPACE_LIFECYCLE_UNSPECIFIED = 0;
+  KEYSPACE_LIFECYCLE_ACTIVE = 1;
+  KEYSPACE_LIFECYCLE_ARCHIVED = 2;   // nothing is re-routed to an archive successor and no seen_version is reset: queued
+                                     // actions are dead-lettered with KEYSPACE_ARCHIVED and the successors, and the user may
+                                     // author anew there against loaded state (spec/14 [CLI-52])
+  KEYSPACE_LIFECYCLE_SPLIT = 3;      // queued actions are re-routed to the split successor that holds their keys, which
+                                     // keep their versions (spec/14 [CLI-52], spec/02 [ARC-51])
+}
+
+message Reject {
+  Code code = 1;
+  ErrorClass error_class = 2;  // always the code's class in Appendix A (spec/07 [MUT-22]). A client that does not know the
+                               // class handles it as HOLD, except the reject of a REJECTED decision, which is handled as
+                               // DEAD_LETTER (spec/15 [COMPAT-39])
+  string app_code = 3;       // namespaced app code, e.g. "tracker.KEY_SPACE_EXHAUSTED"
+  optional int32 change_index = 4;  // never negative, and a reader treats a negative value as unset (spec/07 [MUT-20]). Set
+                                    // only when the reject concerns one change of the action: its 0-based index in
+                                    // Mutation.changes. Unset otherwise, for a gate effect too, which details["effect_key"]
+                                    // names, for the POLICY_CHANGED that ends a failed re-validation (spec/08 [GATE-24]
+                                    // step 4), and for the PERMISSION_DENIED of a possible owner-authorized write (spec/07
+                                    // [MUT-20], spec/11 [COORD-94])
+  string message = 5;        // sanitized, never raw storage errors
+  Stale stale = 6;           // STALE only
+  repeated SuccessorRule successors = 7;  // KEYSPACE_ARCHIVED after a split or archive: for a rejected action, at most two
+                                          // rules of the successor map that its keys match, chosen and ordered as spec/12
+                                          // [ADM-45] says; for a call that carries no action (CreateKeyspace, a blob upload),
+                                          // the whole map, in the order of a split's rules or an archive's successors
+                                          // (spec/12 [ADM-45], spec/07 [MUT-92], [MUT-95]). LoadStateResponse.successors
+                                          // holds the whole map
+  map<string, string> details = 8;        // a reader ignores keys it does not know (spec/15). E.g. "reason" (ADMIN_REFUSED,
+                                          // Appendix A.9), "lifecycle" (KEYSPACE_ARCHIVED), "quota" (QUOTA_EXCEEDED: a
+                                          // quota of spec/04 Table 4.10, or "seq" for the seq bound of spec/06 [LOG-2]),
+                                          // "keyspaces" (ADMIN_REFUSED WRONG_STATE, spec/04 [MAN-62]), "keys" (CONTENDED),
+                                          // "effect_key" (an effect's RANGE_EXCEEDED, STALE MOVING, STALE LEASE, STALE EPOCH or POLICY_CHANGED),
+                                          // "code" (POLICY_CHANGED after a re-validation), "replacement" (POLICY_CHANGED,
+                                          // spec/07 Table 7-4), "cause" (CANCELLED, INTENT_EXPIRED, OFFLINE_TOO_LONG,
+                                          // PERMISSION_DENIED), "app_code_invalid" (GATE_REJECTED), "moved_to" (STALE with
+                                          // PARENT_DELETED or MOVING, spec/11 §11.4.7). A gate's details are capped
+                                          // (spec/08 [GATE-39])
+  string correlation_id = 9;
+}
+
+enum RetryReason {
+  RETRY_REASON_UNSPECIFIED = 0;
+  RETRY_REASON_GATE_UNAVAILABLE = 1;
+  RETRY_REASON_GATE_TIMEOUT = 2;
+  RETRY_REASON_CONTENTION = 3;              // the commit lock timed out (spec/07 [MUT-74]), the bounded re-run of a commit call
+                                            // reached its limit (spec/13 [PLC-10]), a stale config_version, a wait for the
+                                            // app's config lock past its lease, or a create that finds it held alone or awaited by an UpdateAppConfig or a reset run, or, in every placement, a create whose T is after that lock's deadline or that starts no statement because its lease has ended, or an UpdateAppConfig that starts no DDL statement because its lease has ended (spec/12 [ADM-111]), a B or D commit call
+                                            // refused by the version row (spec/13 [PLC-87]): the row's pending mark above the call's T, or the version below the row (A.5), an
+                                            // UpdateAppConfig whose write of the row waits past its lease (A.5), or a GATED intent's decision commit
+                                            // conflicted fewer than N consecutive times; at N it ends CONTENDED (spec/08 §8.4).
+                                            // A lock timeout at the decision commit is not a conflict: the intent stays
+                                            // PENDING and the server re-runs the commit. Only attempts that reach the conflict
+                                            // checks (spec/08 [GATE-24] steps 7–8) count towards N; others neither count
+                                            // nor reset the count
+  RETRY_REASON_RATE_LIMITED = 4;
+  RETRY_REASON_STORAGE_UNAVAILABLE = 5;
+  RETRY_REASON_AUTHORIZER_UNAVAILABLE = 6;
+  RETRY_REASON_LANE_NOT_READY = 7;          // the lane wait (after_client_seq) is not satisfied yet (spec/07 [MUT-37])
+  RETRY_REASON_OUT_OF_ORDER = 8;            // an earlier client_seq of this lane is missing; the later mutations of the lane
+                                            // in the request get NOT_PROCESSED (spec/07 [MUT-57])
+  RETRY_REASON_COMMIT_DATABASE_ERROR = 9;   // placement B/D: the user's database failed (spec/13 §13.6)
+  RETRY_REASON_BLOB_PENDING = 10;
+  RETRY_REASON_NOT_PROCESSED = 11;          // an earlier mutation in this request stopped the lane
+  RETRY_REASON_KEYSPACE_SEEDING = 12;       // a split successor whose seeding has not finished; never KEYSPACE_NOT_FOUND
+                                            // (spec/12 §12.5)
+  RETRY_REASON_BLOB_WITHHELD = 13;          // a blob that the erasure withholds until a blob step judges it
+                                            // (spec/12 [ADM-103]): the answer of a blob call that names it, as spec/09
+                                            // [READ-4] lists them, such as GetBlob (Unavailable, spec/09 [READ-90]) and
+                                            // DeleteBlob (spec/09 [READ-91]). A mutation that names it in blob_refs never
+                                            // gets this reason: the action is accepted as for any committed blob
+                                            // (spec/09 [READ-89]). The client asks again after Retry.after_ms; one that
+                                            // does not know the reason retries it (spec/15 [COMPAT-40])
+}
+
+message Retry {
+  uint32 after_ms = 1;       // the client waits at least this long before it resends (spec/07 [MUT-9], spec/14 [CLI-43]);
+                             // at most 3,600,000 (spec/04 Table 4.11); 0 names no delay: the client waits its own backoff
+                             // alone (spec/14 [CLI-43])
+  RetryReason reason = 2;
+}
+
+// ───────────────────────────── Records ─────────────────────────────
+
+enum RecordKind {
+  RECORD_KIND_UNSPECIFIED = 0;
+  RECORD_KIND_OP = 1;
+  RECORD_KIND_INTENT = 2;
+  RECORD_KIND_DECISION = 3;
+  RECORD_KIND_SYSTEM = 4;
+}
+
+enum DecisionStatus {
+  DECISION_STATUS_UNSPECIFIED = 0;
+  DECISION_STATUS_COMMITTED = 1;
+  DECISION_STATUS_REJECTED = 2;
+}
+
+// Who decided, for every DECISION, as spec/06 [LOG-34] gives it per case.
+message Provenance {
+  uint32 manifest_version = 1;
+  string gate_host = 2;
+  string gate_build = 3;
+  Principal gate_principal = 4;   // the principal that decided, or unset, in each case as spec/06 [LOG-34] says; for a
+                                  // policy host, the identity that ABPC verified (spec/08 [GATE-30])
+}
+
+message Decision {
+  string intent_id = 1;
+  DecisionStatus status = 2;
+  // REJECTED only: GATE_REJECTED; CANCELLED (by CancelIntent, or by the server with a details["cause"], as for
+  // CODE_CANCELLED); INTENT_EXPIRED; CONTENDED; STALE{EPOCH} for an intent that an epoch advance ended undecided
+  // (spec/06 [LOG-83]); POLICY_CHANGED for a failed re-validation, before an attempt or at the decision commit, with
+  // change_index unset (spec/08 [GATE-16], [GATE-24] step 4); or a final failure at the decision commit (spec/08 §8.4):
+  // of the requested changes' own checks (STALE, STALE{REDACTED} included, and STALE{LEASE} of an owner-keeping or
+  // owner-setting change that fails its re-check against a revocation, spec/08 [GATE-24] step 6; TOMBSTONED,
+  // RANGE_EXCEEDED, QUOTA_EXCEEDED, SCHEMA_INVALID of a requested CRDT update whose nesting passes 32 (spec/05 [STATE-71]),
+  // and PAYLOAD_TOO_LARGE of a CRDT update that would take its key's stored size
+  // or document length over the limit in force, spec/05 [STATE-72]), or, for a gate effect, one of the checks that are final for an effect, with the
+  // codes that spec/08 [GATE-24] step 8 and [GATE-28] give them (STALE, STALE{MOVING}, POLICY_CHANGED, RANGE_EXCEEDED);
+  // for a possible owner-authorized write, such a failure that reads the keyspace is PERMISSION_DENIED instead,
+  // with no Stale and no details that name a key (spec/11 [COORD-94]).
+  // An effect is named by details["effect_key"], with change_index unset. Every other failure of an effect is a conflict, retried until CONTENDED (spec/08 [GATE-25]),
+  // never logged with that check's code. A reject that the server makes holds only what spec/06 [LOG-33] gives it
+  Reject reject = 3;
+  Provenance provenance = 4;
+}
+
+enum SystemKind {
+  SYSTEM_KIND_UNSPECIFIED = 0;
+  SYSTEM_KIND_MANIFEST_ACTIVATED = 1;
+  SYSTEM_KIND_TEMPLATE_CONVERSION = 2;
+  SYSTEM_KIND_REDACTED = 3;
+  SYSTEM_KIND_SUBTREE_CLEANUP = 4;
+  SYSTEM_KIND_KEY_EXPIRED = 5;
+  SYSTEM_KIND_LIFECYCLE = 6;          // archived, split, legal hold set or cleared, retention override (spec/06 [LOG-47])
+  SYSTEM_KIND_EPOCH_ADVANCED = 7;     // the first record of every epoch after the first (spec/06 [LOG-48])
+  SYSTEM_KIND_FLOOR_RAISED = 8;       // the features the app requires were raised (spec/06 [LOG-49]); never the prune floor
+  SYSTEM_KIND_BLOB_DELETED = 9;
+  SYSTEM_KIND_PRUNE_FLOOR_RAISED = 10;  // the prune floor was raised, by pruning or by on_expiry (spec/06 [LOG-80]);
+                                        // must_understand false, no changes
+  SYSTEM_KIND_TOMBSTONES_DISCARDED = 11;  // the tombstone floor: every tombstone whose deletion seq is ≤ floor_seq is
+                                          // discarded at this record; must_understand true, body {floor_seq} (spec/06 [LOG-84],
+                                          // spec/05 [STATE-83])
+}
+
+message SystemEvent {
+  SystemKind kind = 1;
+  bool must_understand = 2;   // a reader that does not understand this kind stops for the keyspace
+  bytes body = 3;             // kind-specific: its members and their types are in spec/06 §6.7 ([LOG-39])
+  string encoding = 4;
+}
+
+// Within the record bound, 9 MiB in its binary encoding, whatever writes it, measured as spec/06 [LOG-17] says for every
+// record, and delivered whole (spec/06 [LOG-17]). An action whose record has a measured length above the action limit,
+// the record bound less 64 KiB (spec/06 [LOG-17]), gets PAYLOAD_TOO_LARGE (spec/07 [MUT-76]).
+message Record {
+  uint64 seq = 1;
+  uint32 log_epoch = 2;
+  RecordKind kind = 3;
+  string mutation_id = 4;                       // DECISION: the intent id; SYSTEM: empty
+  string op_type = 5;
+  Principal principal = 6;
+  google.protobuf.Timestamp server_time = 7;
+  google.protobuf.Timestamp authored_at = 8;    // advisory, from the client; validated by spec/07 Table 7-2 item 1, never used
+                                                // in the horizon check (spec/07 [MUT-86]); unset in host and module actions
+                                                // (spec/07 [MUT-90])
+  uint32 manifest_version = 9;
+  repeated string required_features = 10;       // the record's required features, each once, in increasing byte order,
+                                                // as spec/06 [LOG-9] gives them
+  // OP: the action's changes. INTENT: the requested changes (not applied) plus the pending-row change;
+  // only the abpc.intent/{id} change is applied. DECISION COMMITTED: the requested changes, then the gate's
+  // effects, then the intent-row update, all applied; with log_intent false, no intent-row update. DECISION
+  // REJECTED: only the intent-row update, applied; with log_intent false, the requested changes, for audit,
+  // not applied (spec/06 [LOG-32]). SYSTEM: the changes it applies (spec/06).
+  repeated KeyChange changes = 11;
+  repeated uint32 overwrote_newer = 12;         // indexes into `changes`, in increasing order (spec/05 [STATE-62])
+  Decision decision = 13;
+  SystemEvent system = 14;
+  string causation_id = 15;
+  string correlation_id = 16;
+  string reason = 17;                           // set only on an override-only action, which requires it (spec/07
+                                                // [MUT-18], Table 7-2), and on the SYSTEM records that spec/06
+                                                // [LOG-38] names; empty on every other record
+  bytes mac = 18;                               // placement B/D tamper evidence (spec/13 §13.7)
+  repeated KeyEntry previous = 19;              // OVERRIDE: each overridden key's previous entry (spec/12 §12.8)
+  bytes record_hash = 20;                       // server-computed chain hash (spec/06 [LOG-71]):
+                                                // SHA-256(prev_hash || log_epoch || seq || C || W), where prev_hash is
+                                                // the record_hash of the record before it in its timeline; C is the
+                                                // content digest, over the canonical encoding of this record with seq 0,
+                                                // mac, record_hash, overwrote_newer, previous and every change's value
+                                                // fields cleared, followed by the value digests; W is the count of
+                                                // overwrote_newer entries, then each entry, as spec/06 [LOG-71] says.
+                                                // Clients send it back as KeyspaceCursor.after_record_hash for a
+                                                // verifiable resume
+  repeated string blob_refs = 21;               // OP, INTENT and DECISION, a REJECTED one included: the action's
+                                                // Mutation.blob_refs, copied unchanged and in their order; empty on a
+                                                // SYSTEM record (spec/06 [LOG-90]). Not a value field: in E, covered by
+                                                // the record hash, never blanked (spec/06 [LOG-71]). What the server
+                                                // also keeps of them with each blob, and which rule reads which, is in
+                                                // spec/09 §9.9
+}
+
+// ───────────────────────────── State pages ─────────────────────────────
+
+message KeyEntry {
+  string key = 1;
+  bytes value = 2;
+  bool is_null = 3;
+  string encoding = 4;
+  uint64 version = 5;
+  google.protobuf.Timestamp changed_at = 6;
+  string changed_by = 7;             // principal sub (pseudonymous)
+  uint64 crdt_covered_seq = 8;       // 0 for a key that is not a CRDT key (spec/09 [READ-13]); a CRDT key: value is the compacted
+                                     // base up to this seq, which for a CRDT key in the redacted state is its version
+                                     // (spec/09 [READ-14])
+  bool deleted = 9;                  // a retained key or entity tombstone: `version` is the deletion seq, no value (spec/09 §9.2.2)
+  bool redacted = 10;                // a tombstone created by a redaction, which keeps this mark, or an entry in the redacted
+                                     // state (spec/05 [STATE-82]). The client purges its local copies of the key's values,
+                                     // and treats a CRDT key as reset by a redaction: unsent typing becomes a draft and is
+                                     // never re-applied (spec/14 [CLI-76], [CLI-13]; spec/09 [READ-9], [READ-13])
+  bool staged = 11;                  // every staged tombstone (spec/05 [STATE-45]): the key tombstone of a staged entity's
+                                     // marker, or of a nested marker of its subtree, left when the freeze template's module
+                                     // deleted the marker while the entity was staged (spec/11 [COORD-111]). It covers its
+                                     // subtree, as any subtree deletion does (spec/05 [STATE-43]), but blocks no creation
+                                     // (spec/05 [STATE-47]). Every other tombstone of a marker key is an entity tombstone
+}
+
+// One erasure-ledger redaction of a key (spec/12 §12.7.5), as a load returns it, whatever the reader's interest
+// (spec/09 [READ-100]). A key path only, never a value. It holds whatever later happened to
+// the key (re-created, deleted again, or its tombstone no longer retained): the client purges the key's
+// earlier local values, and treats a CRDT key as reset by a redaction (spec/14 [CLI-76], [CLI-13]).
+message KeyRedaction {
+  string key = 1;
+  uint64 redaction_seq = 2;          // the seq of the REDACTED record that the redaction's part in the keyspace names, its
+                                     // last one when it has several, or follows when it appended none (spec/06 [LOG-44],
+                                     // spec/12 [ADM-70])
+  uint32 log_epoch = 3;              // the epoch of that record: (log_epoch, redaction_seq) identifies it across epochs
+                                     // (spec/12 §12.7.5)
+}
+
+message KeyspaceCursor {
+  string keyspace_id = 1;
+  uint64 after_seq = 2;              // 0 = cold load
+  uint32 log_epoch = 3;              // epoch of after_seq; a mismatch forces a cold load
+  repeated string interest_prefixes = 4;  // empty = whole keyspace (spec/09 §9.3)
+  bytes after_record_hash = 5;       // hash of the record at after_seq, for a verifiable resume (spec/13 §13.5)
+}
+
+message ServerInfo {
+  string protocol_name = 1;          // "abpc.v2" (spec/15 [COMPAT-1])
+  string revision = 2;               // at most 256 octets, no U+0000, as host.proto DescribeResponse.build
+  repeated string features = 3;
+  string build = 4;                  // at most 256 octets, no U+0000, as host.proto DescribeResponse.build (spec/06 [LOG-34])
+}
+
+// The app's limits as advertised (spec/07 §7.9), each with its value in force. Names, defaults, ranges, maxima and v2.0
+// floors: spec/04 §4.10, whose maxima serve the message size of spec/02 [ARC-59]. 0 never means unlimited: a client that
+// receives 0 in a field that v2.0 defines reports a protocol error to the app, and uses the field's floor until a correct
+// value arrives, or, for a field without a floor, the field's default; a field added after v2.0, and
+// presence_min_publish_interval_ms, is 0 from a server whose revision does not define it, and the client then uses that
+// field's default and reports no protocol error (spec/07 [MUT-75]).
+message AppLimits {
+  uint32 max_offline_seconds = 1;
+  uint32 max_changes_per_action = 2;          // protocol maximum 2,000 (spec/04 Table 4.10a)
+  uint32 max_action_bytes = 3;                // in the binary encoding; protocol maximum 8 MiB (spec/04 Table 4.10a,
+                                              // spec/07 [MUT-76])
+  uint32 max_keyspaces_per_session = 4;       // protocol maximum 10,000 (spec/04 Table 4.10a), so that a HeartbeatFrame
+                                              // stays within 16 MiB (spec/04 [MAN-75])
+  uint32 max_presence_state_bytes = 5;        // protocol maximum 64 KiB (spec/04 Table 4.10a), so that a PresenceFrame
+                                              // stays within 16 MiB (spec/04 [MAN-75])
+  uint32 max_value_bytes = 6;                 // one value or update; protocol maximum 4 MiB (spec/04 Table 4.10a)
+  uint32 max_mutations_per_request = 7;       // protocol maximum 256 (spec/04 Table 4.10a), so that a MutateResponse
+                                              // stays within 16 MiB (spec/04 [MAN-75])
+  uint32 max_inflight_gated_per_client = 8;   // per client instance, and per subject for laneless mutations; over the cap:
+                                              // Retry{RATE_LIMITED} (spec/07 [MUT-42])
+  uint64 max_blob_bytes = 9;
+  uint32 max_interest_prefixes = 10;          // per followed keyspace; protocol maximum 1,000 (spec/04 Table 4.10a), so
+                                              // that a KeyspaceAdded frame stays within 16 MiB (spec/04 [MAN-75])
+  uint32 presence_ttl_seconds = 11;           // default 30, range 10–300
+  uint32 max_presence_members_per_topic = 12;
+  uint32 max_request_bytes = 13;              // a MutateRequest over it: ResourceExhausted, no detail (spec/07 [MUT-4]);
+                                              // protocol maximum 8 MiB, in the binary encoding (spec/04 Table 4.10a)
+  uint32 contended_after_conflicts = 14;      // N of spec/08 [GATE-25]: consecutive decision-commit conflicts after which a
+                                              // GATED intent ends REJECTED with CONTENDED; a deployment knob, default 3, range 1–10
+  uint32 move_attempt_limit = 15;             // the attempt limit of the module actions that spec/04 [MAN-75] lists: a saga
+                                              // compensation, a built-in move's steps (spec/11 [COORD-71]), an escrow
+                                              // Settle (spec/11 [COORD-90]), and an external pool's Reserve and Release
+                                              // (spec/11 [COORD-118], [COORD-119]); range and default: spec/04 §4.10
+  uint32 contended_backoff_initial_ms = 16;   // the backoff bound after the first decision-commit conflict (spec/08 [GATE-25]);
+                                              // range and default: spec/04 §4.10
+  uint32 contended_backoff_cap_ms = 17;       // the cap of that backoff (spec/08 [GATE-25]); range and default: spec/04 §4.10
+  uint32 keyspace_not_found_wait_seconds = 18;  // the client's bounded wait after KEYSPACE_NOT_FOUND (spec/07 [MUT-101]);
+                                              // range and default: spec/04 Table 4.10a
+  uint32 max_sessions_per_principal = 19;     // the per-principal session cap of spec/09 [READ-35]; its floor is in
+                                              // spec/04 Table 4.10a
+  uint32 presence_min_publish_interval_ms = 20;  // the shortest interval between two publishes of one member of a presence
+                                              // topic that the server applies; a publish sooner than it after the member's
+                                              // last accepted publish may be coalesced, so that only the latest state is
+                                              // delivered, or is refused with Retry{RATE_LIMITED} (spec/09 [READ-79]); its
+                                              // default and maximum are in spec/04 Table 4.10a
+}

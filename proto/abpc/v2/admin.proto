@@ -1,0 +1,556 @@
+// ABPC v2.0 — administration (spec/12). Callers: principals from the app's admin issuer,
+// or the deployment operator for the calls spec/12 Table 12.1 gives it. Every call is audited.
+// A refusal because of state, or of a well-formed app config by a cross-field or environment rule, is
+// FailedPrecondition with Reject{ADMIN_REFUSED} and an Appendix A.9 reason. A malformed field, or one out of its
+// own range, is InvalidArgument with Reject{INVALID_ENVELOPE} (spec/04 §4.11.2), except a malformed keyspace id, which gets
+// Reject{INVALID_KEY} (spec/12 [ADM-9]); and so is a reason that is empty,
+// over 1,024 octets or holds U+0000 (spec/12 [ADM-5]).
+// A call whose effect is already in place answers as the original call did, so that a caller can resend it after
+// an unknown outcome (spec/12 [ADM-10]); that holds while no other admin call of the same target could have intervened, so a
+// caller reads the state or lists its own audit entries before it resends a state-setting call.
+// Transport: AdminService is served as spec/02 §2.9 binds every service, and a Reject or a Retry travels as the error
+// detail that spec/02 §2.9 defines.
+syntax = "proto3";
+
+package abpc.v2;
+
+import "abpc/v2/types.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/timestamp.proto";
+
+service AdminService {
+  // Apps
+  rpc RegisterApp(RegisterAppRequest) returns (RegisterAppResponse);       // deployment operator only
+  rpc GetAppConfig(GetAppConfigRequest) returns (GetAppConfigResponse);    // app admins and the deployment operator
+  rpc UpdateAppConfig(UpdateAppConfigRequest) returns (UpdateAppConfigResponse);   // app admins only
+  rpc SuspendApp(SuspendAppRequest) returns (SuspendAppResponse);          // deployment operator or app admins
+  rpc ResumeApp(ResumeAppRequest) returns (ResumeAppResponse);             // deployment operator only
+  rpc DeleteApp(DeleteAppRequest) returns (DeleteAppResponse);             // app admins only (spec/12 §12.2.4)
+
+  // Manifests
+  rpc PublishManifest(PublishManifestRequest) returns (PublishManifestResponse);
+  rpc ActivateManifest(ActivateManifestRequest) returns (ActivateManifestResponse);
+  rpc RevokeGrace(RevokeGraceRequest) returns (RevokeGraceResponse);
+  rpc SetKeyspaceManifestPin(SetKeyspaceManifestPinRequest) returns (SetKeyspaceManifestPinResponse);
+
+  // Keyspaces
+  rpc ArchiveKeyspace(ArchiveKeyspaceRequest) returns (ArchiveKeyspaceResponse);
+  rpc DeleteKeyspace(DeleteKeyspaceRequest) returns (DeleteKeyspaceResponse);
+  rpc SplitKeyspace(SplitKeyspaceRequest) returns (SplitKeyspaceResponse);
+  rpc ExportKeyspace(ExportKeyspaceRequest) returns (stream ExportKeyspaceResponse);
+  rpc SetLegalHold(SetLegalHoldRequest) returns (SetLegalHoldResponse);
+  rpc SetKeyspaceRetention(SetKeyspaceRetentionRequest) returns (SetKeyspaceRetentionResponse);
+  rpc ReopenKeyspace(ReopenKeyspaceRequest) returns (ReopenKeyspaceResponse);   // after HISTORY_DIVERGED (spec/13 §13.5)
+  rpc GetKeyspaceStatus(GetKeyspaceStatusRequest) returns (GetKeyspaceStatusResponse);   // spec/12 [ADM-99]
+
+  // Access and data governance
+  rpc RevokeAccess(RevokeAccessRequest) returns (RevokeAccessResponse);
+  rpc Redact(RedactRequest) returns (RedactResponse);
+  rpc ListRedactions(ListRedactionsRequest) returns (ListRedactionsResponse);         // spec/12 §12.7.5
+  rpc ListAuditEntries(ListAuditEntriesRequest) returns (ListAuditEntriesResponse);   // spec/12 §12.1.4
+}
+
+// A repeat for a registered app with an equal config succeeds and changes nothing; with any other config it gets
+// ADMIN_REFUSED{ID_ALREADY_USED} (spec/12 [ADM-10], [ADM-11]). config.modules must be empty (spec/04 [MAN-89]).
+message RegisterAppRequest { string app_id = 1; AppConfig config = 2; string reason = 3; }
+message RegisterAppResponse {}
+
+enum Placement {
+  PLACEMENT_UNSPECIFIED = 0;               // = PLACEMENT_A (spec/04 [MAN-90]); an undefined number or JSON name is refused
+                                           // (spec/15 [COMPAT-47])
+  PLACEMENT_A = 1;   // ABPC's Postgres
+  PLACEMENT_B = 2;   // user's Postgres: full log + values
+  PLACEMENT_C = 3;   // A + async read-only copy in the user's Postgres
+  PLACEMENT_D = 4;   // user's Postgres: values + journal; history in ABPC (spec/13)
+}
+
+message Issuer {
+  string issuer_url = 1;                   // OIDC issuer URL, at most 2,048 octets; keys via OIDC discovery unless jwks_uri
+                                           // is set (spec/04 [MAN-70], [MAN-85])
+  string audience = 2;
+  bool admin = 3;                          // admin issuer (spec/10 §10.1)
+  string jwks_uri = 4;                     // at most 2,048 octets (spec/04 [MAN-85])
+  repeated string algorithms = 5;          // allow-list, none twice (spec/04 [MAN-70])
+}
+
+message AuthorizerConfig {
+  // MODE_UNSPECIFIED = MODE_CLAIMS (spec/04 [MAN-90]); an undefined number or JSON name is refused, never read as
+  // CLAIMS (spec/15 [COMPAT-47]). LOCAL_TABLE: development only.
+  enum Mode { MODE_UNSPECIFIED = 0; MODE_CLAIMS = 1; MODE_REMOTE = 2; MODE_LOCAL_TABLE = 3; }
+  Mode mode = 1;
+  string url = 2;                          // REMOTE: an AuthorizerService endpoint (host.proto); at most 2,048 octets;
+                                           // required in REMOTE, empty otherwise (spec/04 [MAN-82])
+  uint32 max_cache_seconds = 3;            // 0 = no cap of its own; otherwise at most 86,400; never longer than a token's
+                                           // lifetime (spec/04 [MAN-82])
+}
+
+// Placement B/D: an ABPC-owned read-only SQL table filled from one entity template (spec/13 §13.9).
+message MappedTable {
+  string table = 1;                        // a table name that matches the row of spec/03 Table 3.1 for mapped names (spec/04 [MAN-84])
+  string row_template = 2;                 // an entity marker template, e.g. "issue/{id}"
+  map<string, string> columns = 3;         // column name -> descendant template with no extra variables
+}
+
+message PolicyHostConfig {
+  string name = 1;                         // referenced by the manifest's gate.host
+  string url = 2;                          // lives in app config, never in the manifest; at most 2,048 octets (spec/04 [MAN-85])
+  uint32 timeout_ms = 3;                   // 100–60,000; 0 = 2,000 (spec/04 [MAN-71])
+}
+
+message RetentionClass {
+  string name = 1;
+  uint32 min_age_days = 2;                 // 0 to 36,500 (spec/04 [MAN-74])
+  uint32 max_age_days = 3;                 // 0 = no maximum; otherwise min_age_days to 36,500
+  // UNSPECIFIED only with max_age_days 0 (spec/12 [ADM-55]); an undefined number or JSON name is refused (spec/15
+  // [COMPAT-47]).
+  enum OnExpiry { ON_EXPIRY_UNSPECIFIED = 0; ON_EXPIRY_ARCHIVE = 1; ON_EXPIRY_DELETE = 2; }
+  OnExpiry on_expiry = 4;
+}
+
+// How the deployment may replace a lost admin issuer (spec/04 [MAN-86], spec/16 [SEC-44]). RegisterApp accepts only
+// the default (DELAYED, 72 h). A later change is compared with the wait in force; at most one change is pending.
+// Stored normalized: unset or MODE_UNSPECIFIED is stored as DELAYED, and delay_seconds 0 under DELAYED as 259,200
+// (spec/04 [MAN-90]).
+message AdminRecovery {
+  enum Mode {
+    MODE_UNSPECIFIED = 0;                  // = MODE_DELAYED; an undefined number or JSON name is refused (spec/15 [COMPAT-47])
+    MODE_DELAYED = 1;                      // the replacement waits delay_seconds after the notice is delivered to both owner contacts
+    MODE_IMMEDIATE = 2;                    // no wait; every other step of the procedure still applies
+  }
+  Mode mode = 1;
+  uint32 delay_seconds = 2;                // DELAYED: 0 = 259,200 (72 h); otherwise 86,400 to 2,592,000.
+                                           // IMMEDIATE: must be 0. Otherwise Reject{INVALID_ENVELOPE}
+}
+
+// A contact of the app's owners: whom the server notifies (spec/12 [ADM-7]), and the verified means of the
+// break-glass procedure (spec/16 [SEC-44]). A contact is in force only after it has answered its confirmation
+// challenge (spec/04 [MAN-87]). Personal data: audit entries never contain it (spec/12 [ADM-94]).
+message OwnerContact {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;                  // not a kind (spec/04 [MAN-87]); an undefined number or JSON name is refused
+                                           // (spec/15 [COMPAT-47])
+    KIND_EMAIL = 1;                       // an RFC 5321 mailbox, at most 254 octets
+    KIND_PHONE = 2;                        // an E.164 number: "+" and 2 to 15 digits
+    KIND_WEBHOOK = 3;                      // the address is an https URL, at most 2,048 octets, that follows spec/04 [MAN-85]
+  }
+  Kind kind = 1;
+  string address = 2;
+}
+
+// A C module the app's admins enable, and the principal it acts under (spec/04 [MAN-89]). RegisterApp accepts none.
+message ModuleConfig {
+  string name = 1;                         // "abpc.lease.v1", "abpc.saga.v1" or "abpc.escrow.v1"; each at most once
+  string host = 2;                         // empty: in process, under the server-stamped module principal (spec/10
+                                           // [AUTH-64]); otherwise the policy_hosts[].name it is reached through
+  string issuer = 3;                       // out of process: the `issuer_url` of a user issuer (admin: false); empty in process
+  string sub = 4;                          // out of process: the sub of its service principal; empty in process
+}
+
+// Field rules: spec/04 §4.10. Every connection the server makes for it (issuer discovery and the jwks_uri of a
+// discovery document, jwks_uri, policy_hosts[].url, authorizer.url, webhook contacts) follows spec/04 [MAN-85],
+// judged by the address actually connected; which breaks are malformed fields (InvalidArgument with
+// Reject{INVALID_ENVELOPE}) and which are refusals (Reject{ADMIN_REFUSED}, reason INVALID_CONFIG) is spec/04
+// [MAN-80]'s and Table 4.13's.
+// The server stores normalized values, and GetAppConfig returns them (spec/04 [MAN-90]). The stored config is at most
+// 1 MiB in the binary encoding: a larger one gets InvalidArgument with Reject{PAYLOAD_TOO_LARGE} (spec/04 [MAN-94]).
+// In the admin enums (Placement, AuthorizerConfig.Mode, AdminRecovery.Mode, RetentionClass.OnExpiry, OwnerContact.Kind),
+// only 0, written as the ..._UNSPECIFIED name or left out, asks for a default or, for RetentionClass.OnExpiry and OwnerContact.Kind, for no value; a number, or in JSON a name, that the
+// server does not define is refused with InvalidArgument and Reject{INVALID_ENVELOPE}, never read as 0 (spec/15
+// [COMPAT-44], [COMPAT-47]).
+message AppConfig {
+  repeated Issuer issuers = 1;
+  repeated PolicyHostConfig policy_hosts = 2;
+  Placement placement = 3;
+  string commit_database_ref = 4;          // B, C, D: reference to the user's database connection; refused in A (spec/13 [PLC-4])
+  string history_region = 5;               // D: region for shipped history; refused outside D (spec/13 [PLC-4])
+  uint32 max_offline_seconds = 6;          // 0 = 2,592,000 (30 days); otherwise 3,600 to 31,536,000
+  repeated RetentionClass retention_classes = 7;
+  map<string, uint64> quotas = 8;          // limits and quotas by name (spec/04 Table 4.10), e.g. "keys_per_keyspace",
+                                           // "max_changes_per_action"; 0 = the deployment default (stored as absent)
+  uint32 resume_window_seconds = 9;        // the resume window; its default and its floor are those of spec/04 [MAN-73]
+                                           // (spec/06 [LOG-62])
+  AuthorizerConfig authorizer = 10;
+  repeated string enabled_features = 11;   // spec/15 §15.2; none twice (spec/04 [MAN-83]); sent back as read (GetAppConfig), changed only as spec/15 §15.2 allows
+  repeated MappedTable mapped_tables = 12; // B and D only
+  uint32 journal_hot_window_seconds = 13;  // in D, 0 = 3,600 (spec/13 §13.4); in every placement 1 to 299, and outside D 300 or more,
+                                           // is refused (spec/13 [PLC-4], spec/04 [MAN-84])
+  string blob_store_ref = 14;              // B and D: optional customer blob store; default ABPC's
+  AdminRecovery admin_recovery = 15;       // RegisterApp: the default only; then app admins only (spec/04 [MAN-86])
+  // At least two and at most 10 (spec/04 Table 4.10a), of at least two different kinds. RegisterApp sets them; then only app admins change
+  // them, and a change takes effect after the longer of 72 h and the recovery wait in force before the call, notifying the old and the
+  // new contacts. When a contact is in force, and when the change takes effect, are spec/04 [MAN-87]'s. Frozen while
+  // the app is suspended, except in recovery mode and except the adoption of spec/12 [ADM-17] (spec/04 [MAN-87],
+  // spec/12 §12.2.3, spec/16 [SEC-44]).
+  repeated OwnerContact owner_contacts = 16;
+  // The exact origins (scheme://host[:port]) from which browsers may call the app cross-origin: https only, except
+  // http://localhost and http://127.0.0.1, each with or without a port other than 80; no wildcards; at most 100. Empty:
+  // every cross-origin request is refused (spec/04 [MAN-88], spec/16 [SEC-39]).
+  repeated string allowed_origins = 17;
+  // The C modules the app's admins enable, with their principals (spec/04 [MAN-89]). Removing a module stops it within
+  // one heartbeat interval. While the app is suspended, the escrow module's change of mode is served only as spec/12
+  // [ADM-17] limits it.
+  repeated ModuleConfig modules = 18;
+}
+
+message GetAppConfigRequest { string app_id = 1; }
+message GetAppConfigResponse {
+  AppConfig config = 1;
+  // 1 after RegisterApp. The number that spec/04 [MAN-69] gives the next change (in B and D it can pass the stored
+  // value by more than 1); it changes with each change that [MAN-69] lists, the reset's renumbering included: an
+  // accepted UpdateAppConfig that changes it, a break-glass change (spec/16 [SEC-44]), a server's addition of
+  // features to enabled_features (one change for the features that one activation or pin adds), and a pending
+  // admin_recovery or owner_contacts change taking effect.
+  uint64 config_version = 2;
+  AdminRecovery admin_recovery_in_force = 3;               // the wait a break-glass request made now uses (spec/04 [MAN-86])
+  AdminRecovery admin_recovery_pending = 4;                // a change not yet in force; unset when none
+  google.protobuf.Timestamp admin_recovery_pending_at = 5; // the earliest time the pending change takes effect; none takes effect while suspended; a break-glass change cancels it
+  repeated OwnerContact owner_contacts_pending = 6;        // an owner_contacts change not yet in force; empty when none (spec/04 §4.10)
+  google.protobuf.Timestamp owner_contacts_pending_at = 7; // the earliest time the pending change takes effect; none takes effect while suspended; a break-glass change cancels it
+  repeated OwnerContact owner_contacts_in_force = 8;       // the contacts notified and verified now (spec/04 [MAN-87]); config.owner_contacts may hold a pending change
+  // Every name that `quotas` accepts (spec/04 Table 4.10), with its value in force: the lower of the app's value, or the
+  // deployment default when the app gives none, and the deployment maximum (spec/04 [MAN-75]). config.quotas holds the
+  // stored values, which a lowered deployment maximum does not change.
+  map<string, uint64> quotas_in_force = 9;
+  // The max_offline the server applies now (spec/07 [MUT-88] says which value is in force after a raise).
+  // config.max_offline_seconds holds the stored value; AppLimits.max_offline_seconds advertises this one.
+  uint32 max_offline_seconds_in_force = 10;
+  // The app's state (spec/12 [ADM-97]). Advisory: every rule judges the state when it applies, not this answer.
+  bool suspended = 11;                                     // the app is suspended (spec/12 §12.2.3)
+  google.protobuf.Timestamp suspended_at = 12;             // the start of the current suspension, as the suspension state
+                                                           // holds it (spec/12 [ADM-18], [ADM-17]); unset when not suspended
+  bool recovery_mode = 13;                                 // after a break-glass change, until ResumeApp (spec/12 [ADM-17])
+  google.protobuf.Timestamp break_glass_pending_until = 14; // while a break-glass request is pending: the earliest time
+                                                           // its change can take effect, its wait counted from now while
+                                                           // its notice is undelivered (spec/16 [SEC-44] step 5); unset
+                                                           // when none is pending
+  google.protobuf.Timestamp delete_scheduled_at = 15;      // while a DeleteApp is scheduled: the earliest time it runs
+                                                           // (DeleteAppResponse.runs_at, spec/12 [ADM-20]); unset otherwise
+  repeated OwnerContact owner_contacts_unconfirmed = 16;   // stored or pending contacts that have not answered their
+                                                           // confirmation challenge, and so are not in force (spec/04 [MAN-87])
+  bool owner_contacts_provisional = 17;                    // a contact in force is still a provisional one of RegisterApp:
+                                                           // no break-glass request can be verified (spec/04 [MAN-87])
+}
+
+// update_mask names the top-level AppConfig fields that the update replaces, each wholly; every other field stays as
+// stored. An empty mask, a path named twice or an unknown path: InvalidArgument with Reject{INVALID_ENVELOPE}. An update
+// whose masked fields already hold the given values succeeds and changes nothing, config_version included, whatever its
+// expected_config_version, so a retry after an unknown outcome succeeds; one whose mask names owner_contacts still
+// adopts the provisional contacts and sends new challenges (spec/12 [ADM-13], spec/04 [MAN-69]).
+// While the app is suspended, an update may change only user issuers (admin: false), except the adoption of spec/12
+// [ADM-17], the escrow module's change of mode as that item limits it, and except in recovery mode after a break-glass change, when any field but the admin-issuer entry may
+// change (spec/12 §12.2.3, spec/16 [SEC-44]).
+message UpdateAppConfigRequest {
+  string app_id = 1;
+  AppConfig config = 2;                    // holds the new value of every field that update_mask names
+  string reason = 3;
+  uint64 expected_config_version = 4;      // must equal the current config_version: otherwise FailedPrecondition,
+                                           // Reject{ADMIN_REFUSED} with reason VERSION_CONFLICT
+  google.protobuf.FieldMask update_mask = 5;   // required; paths are top-level AppConfig field names, e.g. "issuers", each at most once;
+                                               // in JSON the proto3 mapping of FieldMask, lowerCamelCase (spec/12 [ADM-13])
+}
+message UpdateAppConfigResponse {}
+message SuspendAppRequest { string app_id = 1; string reason = 2; }
+message SuspendAppResponse {}
+message ResumeAppRequest { string app_id = 1; string reason = 2; }   // also cancels a scheduled DeleteApp (spec/12 [ADM-20])
+message ResumeAppResponse {}
+// Schedules the deletion of a suspended app, and notifies its owners; it runs at the time that spec/12 [ADM-20] gives,
+// counted from the delivery of that notice to two owner contacts of different kinds.
+// Refused as spec/12 [ADM-20] lists: ADMIN_REFUSED{WRONG_STATE} and ADMIN_REFUSED{LEGAL_HOLD}. The events that cancel
+// it, and the frozen keyspaces that it deletes too, are there as well. After the run, the admin issuer is served only
+// the calls of spec/12 [ADM-22], and every other call is answered as spec/12 Table 12.5 says.
+message DeleteAppRequest { string app_id = 1; string reason = 2; }
+message DeleteAppResponse {
+  google.protobuf.Timestamp runs_at = 1;   // the earliest time the deletion runs; a later delivery of its notice moves
+                                           // it later; until that delivery it counts from the call that scheduled the
+                                           // deletion, never from a repeat; a repeated call returns the earliest time as
+                                           // it stands then (spec/12 [ADM-20])
+}
+
+message PublishManifestRequest {
+  string app_id = 1;
+  bytes manifest = 2;                      // the manifest document, at most 4 MiB (spec/04 [MAN-4])
+  string encoding = 3;                     // "yaml/v1" or "json/v1"
+  uint32 expected_version = 4;             // optimistic guard: the latest published version, or 0 when the app has none
+  string reason = 5;
+}
+// warnings: an entry for each occurrence of an issue, naming its attribute path and requirement id (spec/04 [MAN-78]);
+// at most 1,000, the first in the order that spec/12 [ADM-23] gives `problems`, the rest counted in no field. The
+// republish that spec/04 [MAN-43] answers with the stored version returns the warnings stored with it.
+message PublishManifestResponse { uint32 version = 1; repeated string warnings = 2; }
+
+// Activating the active version again succeeds and changes nothing, its grace window included (spec/12 [ADM-10]).
+message ActivateManifestRequest { string app_id = 1; uint32 version = 2; uint32 grace_seconds = 3; string reason = 4; }
+message ActivateManifestResponse {}
+message RevokeGraceRequest { string app_id = 1; uint32 version = 2; string reason = 3; }
+message RevokeGraceResponse {}
+// A pin's state is the pair (version, expires_at): the same pair is in place, another expires_at replaces the pin's end
+// (spec/12 [ADM-28]).
+message SetKeyspaceManifestPinRequest { string keyspace_id = 1; uint32 version = 2; google.protobuf.Timestamp expires_at = 3; string reason = 4; }
+message SetKeyspaceManifestPinResponse {}
+
+// A repeated archive with the same successors succeeds and changes nothing (spec/12 [ADM-10]); the map keeps the order
+// of the first call (spec/12 [ADM-45]). successors: at most
+// 1,000 rules and 256 KiB, else InvalidArgument with Reject{PAYLOAD_TOO_LARGE} (spec/12 [ADM-45]). The refusals of
+// spec/12 [ADM-110] (the app's suspension, a frozen keyspace) come first; then a successor that does not exist, is
+// deleted or is seeding gets its existence answer before any other state refusal (spec/12 [ADM-32]).
+message ArchiveKeyspaceRequest { string keyspace_id = 1; repeated SuccessorRule successors = 2; string reason = 3; }
+message ArchiveKeyspaceResponse {}
+// A repeated delete of a deleted keyspace completes what the first did not finish and changes nothing else (spec/12
+// [ADM-10], [ADM-37]). The call answers OK at the tombstone's commit, and the steps after it retry on their own
+// (spec/12 [ADM-36]). What the deletion ends, keeps and counts, and how its audit entry is written, are spec/12 [ADM-37],
+// [ADM-4] and [ADM-101].
+message DeleteKeyspaceRequest { string keyspace_id = 1; string reason = 2; }
+message DeleteKeyspaceResponse {}
+
+message SplitRule { string prefix = 1; string new_keyspace_id = 2; }
+// rules: at least one, and a successor map within the caps of spec/12 [ADM-45]: at most 1,000 rules and 256 KiB, else
+// InvalidArgument with Reject{PAYLOAD_TOO_LARGE}. The successors count toward the app's keyspaces_per_app, and a split
+// that would pass it is refused whole with ResourceExhausted and Reject{QUOTA_EXCEEDED} (spec/12 [ADM-41]).
+message SplitKeyspaceRequest { string keyspace_id = 1; repeated SplitRule rules = 2; string reason = 3; }
+// A repeated split with the same rules returns the same split_seq and changes nothing (spec/12 [ADM-10]); the successor
+// map is in the order of the request's rules (spec/12 [ADM-45]). Until a
+// successor is seeded, calls that name it get Retry{KEYSPACE_SEEDING} (spec/12 [ADM-104]).
+message SplitKeyspaceResponse { uint64 split_seq = 1; }
+
+// from_seq 0 = the first retained record; to_seq 0 = the head when the export starts. A from_seq at or below the
+// prune floor starts the export at floor + 1 with the prune-floor checkpoint (spec/06 [LOG-52], [LOG-58]); the
+// archive's manifest.json says where it started (spec/12 [ADM-50], [ADM-106]). An export whose start is above the head
+// is refused first, whatever its from_seq and to_seq, with InvalidArgument and Reject{INVALID_ENVELOPE}, except that a
+// frozen keyspace gets FailedPrecondition and Reject{HISTORY_DIVERGED}; a non-zero to_seq below the start that
+// spec/12 [ADM-50] gives is refused with InvalidArgument and Reject{INVALID_ENVELOPE}. The
+// head of a frozen keyspace's export is the last record of its log that lies in its timeline. The export of a deleted
+// keyspace (or of a frozen one whose ledger removed records that its timeline lacks) with no verified checkpoint
+// below its first kept record is unanchored: it starts at that record, with no checkpoint (spec/12 [ADM-50],
+// [ADM-106]).
+message ExportKeyspaceRequest { string keyspace_id = 1; uint64 from_seq = 2; uint64 to_seq = 3; string reason = 4; }
+// One chunk of one archive file; each chunk is at most 16 MiB in the codec of the call (spec/12 [ADM-53]).
+message ExportKeyspaceResponse { string path = 1; bytes data = 2; bool last = 3; }
+
+// The archive's checkpoint (spec/12 §12.6, spec/06 [LOG-51]): the file checkpoints/{seq}/header holds one
+// CheckpointHeader; checkpoints/{seq}/entries holds CheckpointEntry messages and checkpoints/{seq}/prefix_versions
+// PrefixVersion messages, each preceded by its length as a varint, in the canonical encoding of spec/07 [MUT-45]
+// (spec/12 [ADM-105]).
+message CheckpointHeader {
+  string keyspace_id = 1;
+  uint32 log_epoch = 2;                    // the epoch of the record at `seq`; for a split successor's base checkpoint at S, the
+                                           // source's epoch at S, which is the successor's base_epoch (spec/12 [ADM-105])
+  uint64 seq = 3;                          // the checkpoint's seq C
+  uint32 format_version = 4;               // 1 in v2.0; any other value is a failed archive (spec/12 [ADM-105], spec/06 §6.8)
+  uint32 manifest_version = 5;             // the manifest version in force at C (spec/04 §4.7)
+  bytes state_hash = 6;                    // the keyspace state hash at C (spec/05 [STATE-41])
+  bytes metadata_hash = 7;                 // the metadata hash at C (spec/05 [STATE-84])
+}
+// One key of the checkpoint, in key byte order: a present key (a key in the redacted state included, spec/05
+// [STATE-82]), or a key or entity tombstone the checkpoint holds (entry.deleted; an entity tombstone when the key is a
+// marker key, except that every staged tombstone has entry.staged set, spec/05 [STATE-45]).
+message CheckpointEntry {
+  KeyEntry entry = 1;
+  uint64 override_seq = 2;                 // the key's override seq; 0 = none (spec/05 [STATE-60])
+  uint64 reset_seq = 3;                    // the key's reset seq; 0 = none (spec/05 [STATE-85])
+}
+// One non-zero prefix version of the checkpoint, in prefix byte order (spec/05 [STATE-51]).
+message PrefixVersion {
+  string prefix = 1;                       // a key prefix (spec/03 §3.3.1)
+  uint64 version = 2;
+}
+
+// Admin view of a keyspace (spec/12 [ADM-99]). Requires admin on the keyspace; changes nothing; carries no reason.
+message GetKeyspaceStatusRequest { string keyspace_id = 1; }
+message GetKeyspaceStatusResponse {
+  KeyspaceLifecycle lifecycle = 1;
+  bool frozen = 2;                         // frozen (spec/13 §13.5): until it reopens, by ReopenKeyspace in B and D or on
+                                           // its own in A and C, or, after a lost range or split, until a restore or
+                                           // its deletion (spec/13 [PLC-44], spec/12 [ADM-35]); never, once its epoch
+                                           // advance before a deletion has been made (spec/12 [ADM-10], spec/13 [PLC-82])
+  repeated SuccessorRule successors = 3;   // the whole successor map: a split's rules or an archive's successors, in the order
+                                           // of spec/12 [ADM-45]
+  uint32 log_epoch = 4;                    // the current epoch
+  uint64 head_seq = 5;
+  uint32 manifest_version = 6;             // the effective version (spec/04 §4.7)
+  uint32 open_items = 7;                   // open items that hold the lifecycle (spec/11 §11.6)
+  bool legal_hold = 8;
+  string retention_class = 9;              // the class in force: the override, else the kind's
+  uint64 prune_floor = 10;                 // 0, or the seq of the prune-floor checkpoint (spec/06 [LOG-58])
+  uint64 tombstone_floor = 11;             // the floor_seq of the latest TOMBSTONES_DISCARDED record; for a split successor with
+                                           // none of its own, the floor inherited from its source; 0 = neither (spec/12 [ADM-99])
+  uint32 target_version = 12;              // the target (spec/04 §4.7): differs from manifest_version while activation is
+                                           // pending or spec/04 [MAN-93] keeps the keyspace at its effective version
+}
+
+// After the DeleteApp run, hold false is served for a deleted keyspace whose hold still keeps records (spec/12 [ADM-22]).
+// A call whose LIFECYCLE record meets a keyspace that a tombstone deleted meanwhile answers NotFound with
+// Reject{KEYSPACE_DELETED}, and the hold is dropped (spec/12 [ADM-58]).
+message SetLegalHoldRequest { string keyspace_id = 1; bool hold = 2; string reason = 3; }
+message SetLegalHoldResponse {}
+message SetKeyspaceRetentionRequest { string keyspace_id = 1; string retention_class = 2; string reason = 3; }
+message SetKeyspaceRetentionResponse {}
+// A keyspace that is not frozen: succeeds and changes nothing (spec/12 [ADM-10], [ADM-92]).
+message ReopenKeyspaceRequest { string keyspace_id = 1; string reason = 2; }
+message ReopenKeyspaceResponse {}
+
+// Never revokes tokens of the admin issuer: a compromised admin issuer is handled by key rotation and the
+// break-glass procedure (spec/12 §12.9, spec/16 [SEC-44]). Exactly one of subject and keyspace_pattern, not empty:
+// otherwise InvalidArgument with Reject{INVALID_ENVELOPE}, and nothing changes (spec/12 [ADM-87]).
+message RevokeAccessRequest {
+  oneof target {
+    string subject = 1;                    // a sub: matches a principal whose own sub, or any sub of its actor_chain, equals
+                                           // it, from any user issuer of the app (spec/10 [AUTH-51]); no U+0000
+                                           // (spec/12 [ADM-87])
+    string keyspace_pattern = 2;           // an id pattern (spec/03 §3.7)
+  }
+  // Tokens issued before this are refused (default: the revocation's recording time, spec/10 [AUTH-53]). An earlier
+  // time is allowed (spec/10 [AUTH-52]); the checks of ownerships against the revocation still count from its recording
+  // time (spec/11 [COORD-94]). At most 24 h after the server time of the call's processing: otherwise InvalidArgument
+  // with Reject{INVALID_ENVELOPE}.
+  google.protobuf.Timestamp not_before = 3;
+  string reason = 4;
+}
+message RevokeAccessResponse { uint32 sessions_closed = 1; }   // sessions of the matched principals closed by this call on
+                                                               // the node that served it (spec/12 [ADM-88]); 0 for a
+                                                               // keyspace_pattern
+
+message RedactRequest {
+  string keyspace_id = 1;                  // may name a deleted keyspace that still holds retained data (spec/12 [ADM-36], [ADM-37]);
+                                           // a deleted one that holds none gets KEYSPACE_DELETED
+  repeated string keys = 2;                // every value these keys ever had, their former paths' values up to their
+                                           // conversions included, in the copies that spec/12 [ADM-62] and [ADM-65] name.
+                                           // At least one key, none twice, none that is not a key (spec/03 §3.3.1) and none
+                                           // reserved: otherwise InvalidArgument with Reject{INVALID_ENVELOPE}, and nothing
+                                           // changes (spec/12 [ADM-62])
+  string reason = 3;
+  // Which blobs the erasure deletes when other actions name them too (spec/12 [ADM-103]). A blob that an action of a
+  // refused key names, or that a record keeps from an erasure, is kept under both: a record under a legal hold, or a
+  // record of the blob's uploader, other than a redaction's closing DECISION, under a retention floor (spec/12
+  // [ADM-58]).
+  enum SharedBlobs {
+    SHARED_BLOBS_UNSPECIFIED = 0;          // = SHARED_BLOBS_KEEP_SHARED. A number, or in JSON a name, that the server does not
+                                           // define is refused with InvalidArgument and Reject{INVALID_ENVELOPE} before
+                                           // anything is recorded, never read as 0 (spec/15 [COMPAT-44], [COMPAT-47])
+    SHARED_BLOBS_KEEP_SHARED = 1;          // delete a blob only when no action that names it keeps a change that is not
+                                           // erased; list every blob kept so in kept_blobs
+    SHARED_BLOBS_DELETE_SHARED = 2;        // delete every blob that an action changing an erased key named, applied or
+                                           // not, whatever other actions name it
+  }
+  SharedBlobs shared_blobs = 4;
+}
+// The last REDACTED record of the redaction in the named keyspace is (log_epoch, redaction_seq) (spec/06 [LOG-44]).
+// A part that finds nothing left to erase appends nothing and follows a record, as spec/12 [ADM-66] defines it; a
+// resend of a ledger entry answers from the entry, lists included, after it has given the keyspaces that its call was
+// skipped in a part, where the resend's caller holds redact there (spec/12 [ADM-10], [ADM-66], [ADM-70]). The lists of a
+// resend name only keyspaces, keys and blobs of keyspaces on which its caller holds redact; its totals count the whole
+// entry (spec/12 [ADM-70]). Each list holds
+// the first of its entries in increasing byte order, as many as keep its JSON array within 1 MiB, and its total counts
+// them all, so that the response stays within 16 MiB (spec/02 [ARC-59]).
+message RedactResponse {
+  uint64 redaction_seq = 1;                // 0 when nothing was appended and no key was redacted before, and 0 for a
+                                           // Redact that a frozen keyspace deferred (spec/13 [PLC-47]), or whose part in
+                                           // the named keyspace that keyspace's deletion ended, or that the call gave a
+                                           // deleted keyspace that still holds retained data (spec/12 [ADM-37])
+  repeated string refused_keys = 2;        // keys refused under a legal hold or floor, each "<keyspace_id> <key>" with one
+                                           // space, once per refusing keyspace, in increasing byte order (spec/12 [ADM-62],
+                                           // [ADM-63])
+  repeated string refused_keyspaces = 3;   // keyspaces of the reach skipped because no grant of the caller's redact at the
+                                           // call matches them (spec/12 [ADM-62]), in
+                                           // increasing byte order: the first ones, as many as fit in 1 MiB of JSON array;
+                                           // for a resend, none, since a keyspace that the entry still records as skipped is
+                                           // one on which the caller holds no redact; the total counts them all (spec/12
+                                           // [ADM-70])
+  repeated string deleted_blobs = 4;       // each "<keyspace_id>/<blob_id>", in increasing byte order: the first of the blobs
+                                           // the erasure deleted, as many as fit in 1 MiB of JSON array (spec/12 [ADM-103])
+  uint32 log_epoch = 5;                    // the epoch of redaction_seq; 0 when redaction_seq is 0
+  uint64 deleted_blobs_total = 6;          // how many blobs the erasure deleted, those that deleted_blobs leaves out included
+  uint64 refused_keyspaces_total = 7;      // how many keyspaces of the reach were skipped, those that refused_keyspaces
+                                           // leaves out included (spec/12 [ADM-62])
+  uint64 refused_keys_total = 8;           // how many (keyspace, key) refusals there were, those that refused_keys leaves out
+                                           // included
+  repeated string kept_blobs = 9;          // each "<keyspace_id>/<blob_id>", in increasing byte order: the first of the blobs
+                                           // that an action changing an erased key named and that the erasure kept, as many
+                                           // as fit in 1 MiB of JSON array (spec/12 [ADM-103])
+  uint64 kept_blobs_total = 10;            // how many blobs the erasure kept so, those that kept_blobs leaves out included
+}
+
+// The erasure ledger's redactions of one keyspace, for checking an archive before an import (spec/12 §12.7.5).
+// Requires redact on the keyspace; audited.
+message ListRedactionsRequest {
+  string keyspace_id = 1;
+  string page_token = 2;                   // a next_page_token, bound to its keyspace as spec/12 [ADM-93] says of a listing
+  uint32 page_size = 3;                    // 0 = 100; a larger value counts as 1,000; a page also stops before 16 MiB
+                                           // (spec/12 [ADM-98])
+  string reason = 4;
+}
+// A reader ignores an entry that has neither key nor blob_id, which a later revision may add (spec/12 [ADM-98]).
+message RedactionEntry {
+  string key = 1;                          // an erased key; empty in the entry of a deleted or withheld blob
+  uint64 redaction_seq = 2;                // with log_epoch, the REDACTED record that the redaction's part in the keyspace
+                                           // names or follows, or a deleted blob's BLOB_DELETED record there; 0 while
+                                           // deferred, for a part that the keyspace's deletion ended or that a redaction
+                                           // gave the deleted keyspace, or when there is none (spec/12 [ADM-37], [ADM-70],
+                                           // [ADM-98])
+  google.protobuf.Timestamp at = 3;        // server time of the redaction, or of the blob's deletion
+  uint32 log_epoch = 4;                    // the epoch of redaction_seq; after a re-application, of the new record
+                                           // (spec/12 [ADM-70]); 0 while deferred
+  string blob_id = 5;                      // a blob that the erasure ledger records as deleted, or that a part deferred by a
+                                           // frozen keyspace withholds (redaction_seq 0), which an import leaves out; key
+                                           // is then empty (spec/12 [ADM-54], [ADM-98], [ADM-103])
+}
+message ListRedactionsResponse {
+  repeated RedactionEntry entries = 1;
+  string next_page_token = 2;
+}
+
+// One audit entry (spec/12 §12.1.2). Entries never contain values or owner contacts, except the members of spec/12
+// Table 12.3 that spec/12 [ADM-94] names, such as an escrow exception's amount (spec/12 [ADM-94]).
+message AuditEntry {
+  string audit_id = 1;                       // a version-4 UUID, unique in the deployment (spec/12 [ADM-4])
+  google.protobuf.Timestamp at = 2;          // the server time at which the entry is written (spec/12 [ADM-4])
+  Principal principal = 3;                 // the caller; unset for the deployment operator and for an entry that
+                                             // records an event rather than a call (spec/12 [ADM-4])
+  bool by_operator = 4;                      // the caller was the deployment operator
+  string call = 5;                           // a name of spec/12 Table 12.2, e.g. "AdminService.Redact", "Mutate/abpc.Override"
+  string app_id = 6;
+  string keyspace_id = 7;                    // if the call named one
+  string reason = 8;
+  bytes request_digest = 9;                  // SHA-256 of the canonical request with every value field, every owner
+                                             // contact's address, RedactRequest.keys, split and archive prefixes and the
+                                             // key of each OVERRIDE change whose key matches a personal template cleared
+                                             // (spec/12 [ADM-94]); of the Mutation, for an override;
+                                             // empty for an event with no request and for a request refused before it can be
+                                             // encoded; break-glass: of the canonical change (spec/16 [SEC-44])
+  string outcome = 10;                       // "OK", or the RPC status, the code and any A.9 reason (spec/12 [ADM-101]),
+                                             // e.g. "FailedPrecondition/ADMIN_REFUSED/LIFECYCLE_HOLD"
+  uint32 log_epoch = 11;                     // with record_seq: the record the call or event appended, as spec/12 [ADM-4]
+  uint64 record_seq = 12;                    // names it per call; both 0 when it names none
+  repeated string approvers = 13;            // break-glass: the operator's people who approved the change; at most 10, each at
+                                             // most 256 octets with no U+0000 (spec/16 [SEC-44])
+  string request_ref = 14;                   // break-glass: the reference of the request the entry belongs to; at most 256
+                                             // octets with no U+0000 (spec/16 [SEC-44])
+  map<string, string> details = 15;          // further facts of the entry, never values or personal key paths, except the
+                                             // members of spec/12 Table 12.3 that spec/12 [ADM-94] names;
+                                             // the keys of spec/12 [ADM-101], e.g. "orphaned_sagas", the JSON list of an
+                                             // epoch advance (spec/12 [ADM-4]); a reader ignores a key it does not know.
+                                             // A notice carries its entries in their proto3 JSON mapping, and its notice
+                                             // id is the audit_id of the first of them (spec/12 [ADM-107]).
+}
+
+// The filters and pages are those of spec/12 [ADM-93].
+message ListAuditEntriesRequest {
+  string app_id = 1;
+  google.protobuf.Timestamp from_time = 2;   // inclusive; unset = the oldest kept entry
+  google.protobuf.Timestamp to_time = 3;     // exclusive; unset = the time the call is processed, for the later pages of a
+                                             // listing the time at which its first call was processed
+  repeated string calls = 4;                 // filter by `call`; empty = all; at most 100 entries (a repeated name counts each time), 101 or more fail with
+                                             // InvalidArgument and Reject{INVALID_ENVELOPE} (spec/12 [ADM-93])
+  string keyspace_pattern = 5;               // an id pattern (spec/03 §3.7); empty = every entry, app-level ones included
+  string subject = 6;                        // filter by principal sub; empty = all
+  string page_token = 7;                     // a next_page_token: it fixes app_id and the filters of the listing's first
+                                             // call; a request whose app_id or filters differ fails with InvalidArgument and
+                                             // Reject{INVALID_ENVELOPE}; past its validity the call may fail with
+                                             // FailedPrecondition and no detail (spec/12 [ADM-93])
+  uint32 page_size = 8;                      // 0 = 100; a larger value counts as 1,000; a page also stops before 16 MiB
+  string reason = 9;                         // why the caller lists the audit trail
+}
+
+message ListAuditEntriesResponse {
+  repeated AuditEntry entries = 1;           // ordered by `at`, then `audit_id`
+  string next_page_token = 2;
+}
