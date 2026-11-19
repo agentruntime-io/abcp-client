@@ -9,14 +9,15 @@
 // below (`KNOWN_LIBRARY_DIFFERENCES`: since draft 14 yrs only, stock Yjs agrees), and a difference anywhere else fails the run.
 
 import { existsSync, readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import * as Y from "yjs";
 import { fromHex, toHex } from "../src/rules/bytes.js";
 import { Doc, integrated, parseUpdate, validateBase, type RootType, type Roots } from "../src/rules/crdt/index.js";
 import { keyStatePreimage, keyStateHash, StateValue, type KeyValueState } from "../src/rules/hashes/index.js";
 import { mergeUpdates } from "./helpers/yjs-merge.js";
-import { loadVectors, type Vector } from "./helpers/vectors.js";
+import { HAVE_VECTORS, loadVectors, type Vector } from "./helpers/vectors.js";
+import { CRDT_TESTDATA_DIR } from "./helpers/server-dir.js";
+import { describeNeeds } from "./helpers/describe-needs.js";
 
 const all = loadVectors("crdt.json");
 const ofKind = (k: string): Vector[] => all.filter((v) => v.kind === k);
@@ -151,8 +152,8 @@ const dsEntries = (doc: Doc): [number, [number, number][]][] =>
   doc.deleteSet().map((c) => [c.client, c.ranges.map((r): [number, number] => [r.clock, r.len])]);
 
 // the bases that Yjs JS built for the vectors that give `base_from` and no bytes, which the server's tests keep
-const libraryBasesPath = fileURLToPath(new URL("../../server/internal/crdt/testdata/library-bases.json", import.meta.url));
-const libraryBases: Record<string, { base_from: string; hex: string }> = existsSync(libraryBasesPath)
+const libraryBasesPath = CRDT_TESTDATA_DIR === undefined ? undefined : CRDT_TESTDATA_DIR + "/library-bases.json";
+const libraryBases: Record<string, { base_from: string; hex: string }> = libraryBasesPath !== undefined && existsSync(libraryBasesPath)
   ? (JSON.parse(readFileSync(libraryBasesPath, "utf8")) as { bases: Record<string, { base_from: string; hex: string }> }).bases
   : {};
 
@@ -177,7 +178,7 @@ function builtBase(id: string, hexBase: string | undefined, from: string | undef
   throw new Error(`no base: base_from ${from}`);
 }
 
-describe("05 [STATE-71], [STATE-76], [STATE-41] CRDT fold (crdt-fold vectors)", () => {
+describeNeeds(HAVE_VECTORS, "05 [STATE-71], [STATE-76], [STATE-41] CRDT fold (crdt-fold vectors)", () => {
   for (const v of ofKind("crdt-fold")) {
     vit(v.id)(`${v.id}: ${v.title}`, () => {
       const doc = new Doc();
@@ -205,7 +206,7 @@ describe("05 [STATE-71], [STATE-76], [STATE-41] CRDT fold (crdt-fold vectors)", 
   }
 });
 
-describe("05 [STATE-74] document length (crdt-doclen vectors, expect.document_length)", () => {
+describeNeeds(HAVE_VECTORS, "05 [STATE-74] document length (crdt-doclen vectors, expect.document_length)", () => {
   const withLength = ofKind("crdt-fold").filter((v) => v.expect?.document_length !== undefined);
   it("the vectors that state it are crdt-doclen-001 to -005, and every one is a crdt-fold vector that the loop above checks", () => {
     expect(withLength.map((v) => v.id)).toEqual(["crdt-doclen-001", "crdt-doclen-002", "crdt-doclen-003", "crdt-doclen-004", "crdt-doclen-005"]);
@@ -239,7 +240,7 @@ describe("05 [STATE-74] document length (crdt-doclen vectors, expect.document_le
   });
 });
 
-describe("05 [STATE-74] base validity (crdt-base vectors)", () => {
+describeNeeds(HAVE_VECTORS, "05 [STATE-74] base validity (crdt-base vectors)", () => {
   for (const v of ofKind("crdt-base")) {
     vit(v.id)(`${v.id}: ${v.title}`, () => {
       const roots = toRoots(v.crdt_roots);
@@ -275,7 +276,7 @@ describe("05 [STATE-74] base validity (crdt-base vectors)", () => {
   }
 });
 
-describe("06 [LOG-40] rename of a CRDT key (crdt-rename vectors)", () => {
+describeNeeds(HAVE_VECTORS, "06 [LOG-40] rename of a CRDT key (crdt-rename vectors)", () => {
   for (const v of ofKind("crdt-rename")) {
     vit(v.id)(`${v.id}: ${v.title.slice(0, 100)}`, () => {
       const roots = toRoots(v.crdt_roots);
@@ -307,7 +308,7 @@ describe("06 [LOG-40] rename of a CRDT key (crdt-rename vectors)", () => {
   }
 });
 
-describe("17 [CONF-9], Q33: no vector hides a difference between the documents of a library and the spec", () => {
+describeNeeds(HAVE_VECTORS, "17 [CONF-9], Q33: no vector hides a difference between the documents of a library and the spec", () => {
   // at draft 14 the text follows Yjs (Y9, Z3, Q33): the vectors list yrs differences only, and 76 give a document
   it("the vectors with a document are all checked, and the known library differences are exactly those that the vectors list", () => {
     const withContent = all.filter((v) => v.expect?.content !== undefined && v.expect.content !== null);

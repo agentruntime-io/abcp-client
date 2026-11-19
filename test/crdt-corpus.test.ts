@@ -10,13 +10,16 @@
 // the model and `content` for the rules here; any other difference fails.
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { expect, it } from "vitest";
 import { fromHex, toHex } from "../src/rules/bytes.js";
 import { Doc, validateBase, type RootType, type Roots } from "../src/rules/crdt/index.js";
+import { CRDT_TESTDATA_DIR } from "./helpers/server-dir.js";
+import { describeNeeds } from "./helpers/describe-needs.js";
 
-const dir = fileURLToPath(new URL("../../server/internal/crdt/testdata/", import.meta.url));
-const files = existsSync(dir) ? readdirSync(dir).filter((f) => /^model-corpus.*\.json$/.test(f)) : [];
+// `$ABPC_SERVER_DIR/server/internal/crdt/testdata/`; without a server checkout the suites below are skipped
+const HAVE_CORPORA = CRDT_TESTDATA_DIR !== undefined;
+const dir = CRDT_TESTDATA_DIR === undefined ? "" : CRDT_TESTDATA_DIR + "/";
+const files = HAVE_CORPORA && existsSync(dir) ? readdirSync(dir).filter((f) => /^model-corpus.*\.json$/.test(f)) : [];
 
 interface Corpus {
   roots: Record<string, string>;
@@ -28,7 +31,7 @@ interface Corpus {
   }[];
 }
 
-describe("the model corpora of server/internal/crdt/testdata", () => {
+describeNeeds(HAVE_CORPORA, "the model corpora of server/internal/crdt/testdata", () => {
   it("are there", () => {
     expect(files.length).toBeGreaterThanOrEqual(2);
   });
@@ -73,7 +76,7 @@ interface DocLenCorpus {
   histories: { roots: Record<string, string>; updates: string[]; lengths: number[] }[];
 }
 
-describe("05 [STATE-74] document length: histories measured on a real Yjs store (server/internal/crdt/testdata/yjs-doclen.json)", () => {
+describeNeeds(HAVE_CORPORA, "05 [STATE-74] document length: histories measured on a real Yjs store (server/internal/crdt/testdata/yjs-doclen.json)", () => {
   const path = dir + "yjs-doclen.json";
   const rootsOf = (h: { roots: Record<string, string> }): Roots => new Map(Object.entries(h.roots) as [string, RootType][]);
   const load = (): DocLenCorpus => JSON.parse(readFileSync(path, "utf8")) as DocLenCorpus;

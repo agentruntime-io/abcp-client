@@ -1,8 +1,9 @@
 // Loading the conformance vectors (conformance/vectors/*.json, spec 17 [CONF-9]) and the compact forms of their README.
 
 import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import * as path from "node:path";
 import { fromHex } from "../../src/rules/bytes.js";
+import { VECTORS_DIR } from "./server-dir.js";
 
 export interface Vector {
   id: string;
@@ -15,11 +16,13 @@ export interface Vector {
   [key: string]: any;
 }
 
-const dir = fileURLToPath(new URL("../../../conformance/vectors/", import.meta.url));
+/** True when the vectors are there (`$ABPC_SERVER_DIR/conformance/vectors`); the suites that run them are skipped otherwise. */
+export const HAVE_VECTORS = VECTORS_DIR !== undefined;
 
-/** Reads the `vectors` array of one vector file. */
+/** Reads the `vectors` array of one vector file; empty when there is no abpc-server checkout (see `HAVE_VECTORS`). */
 export function loadVectors(file: string): Vector[] {
-  const data = JSON.parse(readFileSync(dir + file, "utf8")) as { vectors: Vector[] };
+  if (VECTORS_DIR === undefined) return [];
+  const data = JSON.parse(readFileSync(path.join(VECTORS_DIR, file), "utf8")) as { vectors: Vector[] };
   return data.vectors;
 }
 

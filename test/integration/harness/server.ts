@@ -17,16 +17,18 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { IssuerServer } from "./issuer.js";
+import { GO_SERVER_SRC, SKIP_NEEDS_SERVER } from "../../helpers/server-dir.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 export const CLIENT_DIR = path.resolve(here, "../../..");
-export const SERVER_DIR = path.resolve(CLIENT_DIR, "../server");
+// The Go server source: `$ABPC_SERVER_DIR/server` (an abpc-server checkout); without one the integration suites are skipped.
+export const SERVER_DIR = GO_SERVER_SRC ?? "";
 export const TMP_DIR = path.join(CLIENT_DIR, ".tmp");
 const BINARY = path.join(TMP_DIR, os.platform() === "win32" ? "abpc-server.exe" : "abpc-server");
 const LOCK = path.join(TMP_DIR, "build.lock");
 
 function hasGo(): boolean {
-  if (process.env["ABPC_SKIP_INTEGRATION"] === "1") return false;
+  if (process.env["ABPC_SKIP_INTEGRATION"] === "1" || GO_SERVER_SRC === undefined) return false;
   try {
     return spawnSync("go", ["version"], { encoding: "utf8" }).status === 0 && fs.existsSync(path.join(SERVER_DIR, "cmd", "abpc-server"));
   } catch {
@@ -35,7 +37,7 @@ function hasGo(): boolean {
 }
 
 export const goAvailable = hasGo();
-export const SKIP_REASON = "integration tests against the Go server are skipped: no Go toolchain was found on the PATH (or ABPC_SKIP_INTEGRATION=1)";
+export const SKIP_REASON = `integration tests against the Go server are skipped: ${SKIP_NEEDS_SERVER}; they also need a Go toolchain on the PATH, and ABPC_SKIP_INTEGRATION must not be 1`;
 
 /** Makes `client/.tmp/`, with a .gitignore that ignores everything in it. */
 export function ensureTmp(): void {

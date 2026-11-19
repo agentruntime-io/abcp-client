@@ -23,7 +23,8 @@ import {
   type MetaEntry,
 } from "../src/rules/hashes/index.js";
 import { canonicalDocument, manifestHash } from "../src/rules/jsonv1/index.js";
-import { loadVectors, utf8 } from "./helpers/vectors.js";
+import { HAVE_VECTORS, loadVectors, utf8 } from "./helpers/vectors.js";
+import { describeNeeds } from "./helpers/describe-needs.js";
 
 const all = loadVectors("hashes.json");
 
@@ -47,7 +48,7 @@ describe("pure SHA-256 and HMAC-SHA-256 (the default hash provider)", () => {
 
 const STATES: Record<string, KeyValueState> = { value: StateValue, null: StateNull, redacted: StateRedacted };
 
-describe("05 [STATE-41] per-key and keyspace state hashes (state-hash vectors)", () => {
+describeNeeds(HAVE_VECTORS, "05 [STATE-41] per-key and keyspace state hashes (state-hash vectors)", () => {
   for (const v of all.filter((x) => x.kind === "state-hash")) {
     it(`${v.id}: ${v.title}`, () => {
       const keys: KeyState[] = (v.keys as { key: string; rule: string; state: string; encoding: string; content?: string; version: number }[]).map(
@@ -83,7 +84,7 @@ const KINDS: Record<string, EntryKindValue> = {
   staged_tombstone: EntryKind.StagedTombstone,
 };
 
-describe("05 [STATE-84] metadata hash (metadata-hash vectors)", () => {
+describeNeeds(HAVE_VECTORS, "05 [STATE-84] metadata hash (metadata-hash vectors)", () => {
   for (const v of all.filter((x) => x.kind === "metadata-hash")) {
     it(`${v.id}: ${v.title}`, () => {
       const entries: MetaEntry[] = (
@@ -113,7 +114,7 @@ describe("05 [STATE-84] metadata hash (metadata-hash vectors)", () => {
   }
 });
 
-describe("04 [MAN-4] manifest hash (manifest-hash vectors)", () => {
+describeNeeds(HAVE_VECTORS, "04 [MAN-4] manifest hash (manifest-hash vectors)", () => {
   for (const v of all.filter((x) => x.kind === "manifest-hash")) {
     it(`${v.id}: ${v.title.slice(0, 80)}`, () => {
       const doc = utf8(v.document as string);

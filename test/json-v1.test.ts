@@ -18,11 +18,12 @@ import {
   type Range,
 } from "../src/rules/jsonv1/index.js";
 import { keyStateHash, keyStatePreimage, StateValue, type KeyValueState } from "../src/rules/hashes/index.js";
-import { loadVectors, utf8 } from "./helpers/vectors.js";
+import { HAVE_VECTORS, loadVectors, utf8 } from "./helpers/vectors.js";
+import { describeNeeds } from "./helpers/describe-needs.js";
 
 const all = loadVectors("json-v1.json");
 
-describe("05 [STATE-7] json/v1 values (json-v1 vectors)", () => {
+describeNeeds(HAVE_VECTORS, "05 [STATE-7] json/v1 values (json-v1 vectors)", () => {
   for (const v of all.filter((x) => x.kind === "json-v1")) {
     it(`${v.id}: ${v.title}`, () => {
       const bytes = fromHex(v.value as string);
@@ -53,7 +54,7 @@ describe("05 [STATE-7] json/v1 values (json-v1 vectors)", () => {
   }
 });
 
-describe("05 [STATE-26] to [STATE-28] counters (json-counter vectors)", () => {
+describeNeeds(HAVE_VECTORS, "05 [STATE-26] to [STATE-28] counters (json-counter vectors)", () => {
   for (const v of all.filter((x) => x.kind === "json-counter")) {
     it(`${v.id}: ${v.title}`, () => {
       const range: Range = { min: BigInt(v.range[0]), max: BigInt(v.range[1]) };

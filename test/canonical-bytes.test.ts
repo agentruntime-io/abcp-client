@@ -23,7 +23,8 @@ import {
 import { MutationSchema } from "../src/gen/abpc/v2/sync_pb.js";
 import { KeyChangeSchema, RecordSchema, type Record as RecordMessage } from "../src/gen/abpc/v2/types_pb.js";
 import { extendMessage, fromVectorJson, messageDesc, type FieldAddition } from "./helpers/proto.js";
-import { loadVectors, utf8, type Vector } from "./helpers/vectors.js";
+import { HAVE_VECTORS, loadVectors, utf8, type Vector } from "./helpers/vectors.js";
+import { describeNeeds } from "./helpers/describe-needs.js";
 
 const all = loadVectors("canonical-bytes.json");
 const ofKind = (k: string): Vector[] => all.filter((v) => v.kind === k);
@@ -35,7 +36,7 @@ function verdict(err: unknown): string {
   return err.invalidEnvelope ? "INVALID_ENVELOPE" : "InvalidArgument";
 }
 
-describe("07 [MUT-45] canonical encoding (proto-canonical vectors)", () => {
+describeNeeds(HAVE_VECTORS, "07 [MUT-45] canonical encoding (proto-canonical vectors)", () => {
   for (const v of ofKind("proto-canonical")) {
     it(`${v.id}: ${v.title}`, () => {
       const desc = messageDesc(v.type as string);
@@ -47,7 +48,7 @@ describe("07 [MUT-45] canonical encoding (proto-canonical vectors)", () => {
 
 const expectedHash = new Map(ofKind("content-hash").map((v) => [v.id, v.expect.content_hash as string | undefined]));
 
-describe("07 [MUT-45] content hash and the refusals of 02 [ARC-61] (content-hash vectors)", () => {
+describeNeeds(HAVE_VECTORS, "07 [MUT-45] content hash and the refusals of 02 [ARC-61] (content-hash vectors)", () => {
   for (const v of ofKind("content-hash")) {
     it(`${v.id}: ${v.title.slice(0, 100)}`, () => {
       // the type that the receiver holds: this version's, or, at an upgraded server, one that knows more fields
@@ -83,7 +84,7 @@ describe("07 [MUT-45] content hash and the refusals of 02 [ARC-61] (content-hash
   }
 });
 
-describe("06 [LOG-71] value digests, E, C, W and record_hash (record-hash vectors)", () => {
+describeNeeds(HAVE_VECTORS, "06 [LOG-71] value digests, E, C, W and record_hash (record-hash vectors)", () => {
   for (const v of ofKind("record-hash")) {
     it(`${v.id}: ${v.title.slice(0, 100)}`, () => {
       const rec = fromVectorJson(RecordSchema, v.record) as RecordMessage;
@@ -117,7 +118,7 @@ const PENDING = new Map<string, string>([]);
 // Since round 18 (12 [ADM-94], m9) the digest also clears `RedactRequest.keys` and the `key` of every OVERRIDE change whose key
 // matches a template that is `personal` in the manifest version in force; a vector lists those keys in `personal_keys` (the
 // manifest is not carried), and `same_digest_as` names the vector whose digest it must equal.
-describe("12 [ADM-94] request digest (request-digest vectors)", () => {
+describeNeeds(HAVE_VECTORS, "12 [ADM-94] request digest (request-digest vectors)", () => {
   const digests = new Map<string, string>();
   for (const v of ofKind("request-digest")) {
     (PENDING.has(v.id) ? it.skip : it)(`${v.id}: ${v.title.slice(0, 100)}`, () => {
@@ -214,7 +215,7 @@ describe("12 [ADM-94] (J7) the split and archive prefixes of a request digest, b
   });
 });
 
-describe("07 [MUT-45] and 02 [ARC-61] beyond the vectors", () => {
+describeNeeds(HAVE_VECTORS, "07 [MUT-45] and 02 [ARC-61] beyond the vectors", () => {
   it("my decoder and protobuf-es's fromBinary give the same canonical bytes on well-formed messages", () => {
     for (const v of ofKind("record-hash")) {
       // record-hash-005 carries field 21 (blob_refs) with the wire type of a varint, which fromBinary reads as a string

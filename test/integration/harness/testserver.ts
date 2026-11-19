@@ -28,14 +28,15 @@ import { createNodeTransport, type NodeTransport } from "../../../src/net/node.j
 import { TestControlService, type GetDeploymentResponse, type MintTokenRequest } from "../../gen/abpctest/v1/control_pb.js";
 import type { Grant } from "./issuer.js";
 import { APP, ensureTmp, goAvailable, MANIFEST, SERVER_DIR, TMP_DIR } from "./server.js";
+import { SKIP_NEEDS_SERVER } from "../../helpers/server-dir.js";
 
 /** The control API of the test profile as a client. */
 export type Control = Client<typeof TestControlService>;
 
 /** Whether the test binary can be built here: a Go toolchain, and the source of the binary (a checkout that has none skips the suites that need it). */
-export const testServerAvailable = goAvailable && fs.existsSync(path.join(SERVER_DIR, "cmd", "abpc-testserver"));
+export const testServerAvailable = goAvailable && SERVER_DIR !== "" && fs.existsSync(path.join(SERVER_DIR, "cmd", "abpc-testserver"));
 export const TESTSERVER_SKIP_REASON =
-  "integration tests against the test binary are skipped: no Go toolchain was found on the PATH, no cmd/abpc-testserver in the checkout, or ABPC_SKIP_INTEGRATION=1";
+  `integration tests against the test binary are skipped: ${SKIP_NEEDS_SERVER}; they also need a Go toolchain, cmd/abpc-testserver in the checkout, and ABPC_SKIP_INTEGRATION not 1`;
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 

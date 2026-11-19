@@ -15,7 +15,8 @@ import { applyRecord, ReplicaState, StateValue } from "../src/rules/fold/index.j
 import { RecordSchema, type Record as RecordMessage } from "../src/gen/abpc/v2/types_pb.js";
 import { fromVectorJson } from "./helpers/proto.js";
 import { vectorRules } from "./helpers/rules.js";
-import { loadVectors, type Vector } from "./helpers/vectors.js";
+import { HAVE_VECTORS, loadVectors, type Vector } from "./helpers/vectors.js";
+import { describeNeeds } from "./helpers/describe-needs.js";
 
 const all = loadVectors("fold.json");
 
@@ -35,7 +36,7 @@ function contiguous(v: Vector): boolean {
 
 const folds = all.filter((v) => v.kind === "fold");
 
-describe("17 [CONF-9] input mapping on fold.json: per-key state hashes of the fold of the served records", () => {
+describeNeeds(HAVE_VECTORS, "17 [CONF-9] input mapping on fold.json: per-key state hashes of the fold of the served records", () => {
   it("192 vectors are run on a client engine, as the README counts them at rc.2", () => {
     expect(folds.filter(contiguous).length).toBe(192);
   });
