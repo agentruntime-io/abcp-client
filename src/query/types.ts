@@ -94,7 +94,7 @@ export interface MovedRowValue {
   /** The `to` pointer of the moved key: the entity in the other keyspace; undefined when the moved key holds none a reader can read. */
   readonly to: EntityRef | undefined;
   readonly sagaId: string | undefined;
-  /** The run key `abpc.saga.v1/run/{saga_id}`, which a client that shows this pointer follows (14 [CLI-14]); undefined without a saga id. */
+  /** The run key `abcp.saga.v1/run/{saga_id}`, which a client that shows this pointer follows (14 [CLI-14]); undefined without a saga id. */
   readonly runKey: string | undefined;
   /** What the run key says, when the copy holds it (it is in the interest): `failed` is the move to show as failed, with both sides kept as they are, instead of the pointer. */
   readonly run: { status: string; cause: string | undefined } | undefined;
@@ -182,7 +182,7 @@ export interface QueryResult {
   /** Whether what the query asks lies in the interest. A result over a `partial` or `none` coverage says nothing of the keys outside it. */
   coverage: Coverage;
   /**
-   * Whether the moved keys of what the query asks (`abpc.saga.v1/moved/…`) lie in the interest, so that a moved or staged entity is recognised
+   * Whether the moved keys of what the query asks (`abcp.saga.v1/moved/…`) lie in the interest, so that a moved or staged entity is recognised
    * (14 [CLI-14]); where they do not, such an entity is shown as any other.
    */
   movesTracked: boolean;

@@ -16,5 +16,5 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
       # The heavy tests (conformance vectors, CRDT corpora, the integration run against the Go server) need an
-      # abpc-server checkout (ABPC_SERVER_DIR) and skip here.
+      # abcp-server checkout (ABCP_SERVER_DIR) and skip here.
       - run: npm test

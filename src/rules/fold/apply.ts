@@ -16,7 +16,7 @@ import {
   RecordKind,
   type KeyChange,
   type Record as RecordMessage,
-} from "../../gen/abpc/v2/types_pb.js";
+} from "../../gen/abcp/v2/types_pb.js";
 import { CrdtError, Doc, parseUpdate, type Update } from "../crdt/index.js";
 import { applyIncr, counterText, JsonV1Error, parseCounter } from "../jsonv1/index.js";
 import { compareUtf8 } from "../bytes.js";
@@ -194,9 +194,9 @@ function changeKnown(seq: bigint, i: number, c: KeyChange): void {
 function selectChanges(rec: RecordMessage): Selection {
   const changes = rec.changes;
   const all = (): number[] => changes.map((_, i) => i);
-  // the intent row: `abpc.intent/{mutation_id}`; for an INTENT or a DECISION the mutation id is the intent id (06 [LOG-22], [LOG-31])
+  // the intent row: `abcp.intent/{mutation_id}`; for an INTENT or a DECISION the mutation id is the intent id (06 [LOG-22], [LOG-31])
   const rowOnly = (): number[] => {
-    const row = `abpc.intent/${rec.mutationId}`;
+    const row = `abcp.intent/${rec.mutationId}`;
     const idx: number[] = [];
     changes.forEach((c, i) => {
       if (c.key === row) idx.push(i);

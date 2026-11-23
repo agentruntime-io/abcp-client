@@ -8,7 +8,7 @@ import * as v8 from "node:v8";
 import * as vm from "node:vm";
 import { create } from "@bufbuild/protobuf";
 import { describe, expect, it } from "vitest";
-import { ChangeKind, KeyChangeSchema, RecordKind, RecordSchema } from "../src/gen/abpc/v2/types_pb.js";
+import { ChangeKind, KeyChangeSchema, RecordKind, RecordSchema } from "../src/gen/abcp/v2/types_pb.js";
 import { Doc, MAX_NESTING, parseUpdate, validateBase, type BaseError, type Roots, type Verdict } from "../src/rules/crdt/index.js";
 import { Analysis } from "../src/rules/crdt/doc.js";
 import { applyRecord, ReplicaState } from "../src/rules/fold/index.js";

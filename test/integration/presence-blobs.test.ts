@@ -1,11 +1,11 @@
-// C6: presence (09 §9.8) and blobs (09 §9.9) against the real Go server (server/cmd/abpc-server, M11b: `session/presence*.go`, `internal/blob`), through the engine and the real transport:
+// C6: presence (09 §9.8) and blobs (09 §9.9) against the real Go server (server/cmd/abcp-server, M11b: `session/presence*.go`, `internal/blob`), through the engine and the real transport:
 // a presence round trip between two clients, and a blob's upload, commit, get and delete, with an action that names it. The server's blob store serves its own signed URLs over HTTP
 // at the address that the server listens on; the engine moves the bytes with the platform's `fetch`.
 
 import { create } from "@bufbuild/protobuf";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { BlobError, fetchBlobHttp, LocalRefusal, set, type BlobHttp, type PresenceEvent } from "../../src/engine/index.js";
-import { CreateUploadRequestSchema } from "../../src/gen/abpc/v2/sync_pb.js";
+import { CreateUploadRequestSchema } from "../../src/gen/abcp/v2/sync_pb.js";
 import { createQueries } from "../../src/query/index.js";
 import { digestSha256 } from "../../src/engine/index.js";
 import { dump, Env, waitFor, type TestClient } from "./harness/env.js";

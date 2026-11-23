@@ -86,9 +86,9 @@ export function globalWebEnv(): WebEnv {
   };
 }
 
-const TAB_KEY = "abpc.tabId";
+const TAB_KEY = "abcp.tabId";
 /** The channel on which the pages of an origin say which tab ids they hold (a `BroadcastChannel` reaches the pages of its origin only). */
-const ID_CHANNEL = "abpc.tab-ids";
+const ID_CHANNEL = "abcp.tab-ids";
 const DEFAULT_CLAIM_WAIT_MS = 150;
 
 /** What the pages of an origin say to each other about tab ids. */

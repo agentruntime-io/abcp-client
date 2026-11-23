@@ -5,8 +5,8 @@
 import { describe, expect, it } from "vitest";
 import { StaticManifests } from "../src/engine/index.js";
 import { FakeServer, ManualClock, reject as mk } from "../src/fake/index.js";
-import { DropReason, type UpdateSubscriptionRequest } from "../src/gen/abpc/v2/sync_pb.js";
-import { Code } from "../src/gen/abpc/v2/types_pb.js";
+import { DropReason, type UpdateSubscriptionRequest } from "../src/gen/abcp/v2/sync_pb.js";
+import { Code } from "../src/gen/abcp/v2/types_pb.js";
 import { KS, MANIFEST, ofType, rig, tick, type Rig } from "./helpers/engine.js";
 
 const adds = (r: { server: FakeServer }, id: string): number =>

@@ -2,7 +2,7 @@
 
 import { describe, expect, it } from "vitest";
 import { cas, del, incr, jsonBytes, LocalRefusal, set, StaticManifests, type Predictor } from "../src/engine/index.js";
-import { Code, ChangeKind } from "../src/gen/abpc/v2/types_pb.js";
+import { Code, ChangeKind } from "../src/gen/abcp/v2/types_pb.js";
 import { reject as mk } from "../src/fake/index.js";
 import { goOffline, goOnline, kc, kcCas, KS, ofType, rejectResult, rig, text, types } from "./helpers/engine.js";
 

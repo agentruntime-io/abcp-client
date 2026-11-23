@@ -16,7 +16,7 @@ import { Doc, validateBase, type RootType, type Roots } from "../src/rules/crdt/
 import { CRDT_TESTDATA_DIR } from "./helpers/server-dir.js";
 import { describeNeeds } from "./helpers/describe-needs.js";
 
-// `$ABPC_SERVER_DIR/server/internal/crdt/testdata/`; without a server checkout the suites below are skipped
+// `$ABCP_SERVER_DIR/server/internal/crdt/testdata/`; without a server checkout the suites below are skipped
 const HAVE_CORPORA = CRDT_TESTDATA_DIR !== undefined;
 const dir = CRDT_TESTDATA_DIR === undefined ? "" : CRDT_TESTDATA_DIR + "/";
 const files = HAVE_CORPORA && existsSync(dir) ? readdirSync(dir).filter((f) => /^model-corpus.*\.json$/.test(f)) : [];

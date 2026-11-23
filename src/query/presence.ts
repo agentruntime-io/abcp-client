@@ -11,7 +11,7 @@
 //
 // What it does not do: a presence frame is no part of the log (09 [READ-81]), so a view never changes a cursor, a query result or a key; it asks nothing of the replica.
 
-import type { Principal } from "../gen/abpc/v2/types_pb.js";
+import type { Principal } from "../gen/abcp/v2/types_pb.js";
 import type { JoinOptions, PresenceEntryRaw, PresenceEvent } from "../engine/presence.js";
 import { decodeJson } from "./json.js";
 import type { QueryJson } from "./types.js";

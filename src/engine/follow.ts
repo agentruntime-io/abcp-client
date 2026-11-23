@@ -1,7 +1,7 @@
 // What the engine keeps for each keyspace it follows (14 [CLI-1]): the confirmed state, its cursor and epoch, the keyspace's
 // kind, lifecycle and manifest version, the lane state of the client instance (14 [CLI-27], [CLI-78]) and the CRDT documents.
 
-import { KeyspaceLifecycle, type SuccessorRule } from "../gen/abpc/v2/types_pb.js";
+import { KeyspaceLifecycle, type SuccessorRule } from "../gen/abcp/v2/types_pb.js";
 import { ReplicaState } from "../rules/fold/index.js";
 import type { Random } from "./clock.js";
 import { CrdtStore } from "./crdt-view.js";

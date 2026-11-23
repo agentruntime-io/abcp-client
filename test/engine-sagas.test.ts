@@ -1,5 +1,5 @@
 // V19 MUST-5, 14 [CLI-14] "Following sagas": a client that shows a pointer of a moved entity, or that started a saga, follows the saga's run key
-// `abpc.saga.v1/run/{saga_id}` in its home keyspace, through its interest or by loading the key, and emits `saga-ended` when the run key's `status` says that the
+// `abcp.saga.v1/run/{saga_id}` in its home keyspace, through its interest or by loading the key, and emits `saga-ended` when the run key's `status` says that the
 // saga ended or failed (14 §14.5), with the cause that the run key records (11 §11.4.4).
 
 import { describe, expect, it } from "vitest";
@@ -8,8 +8,8 @@ import { SAGA_POLL_MS } from "../src/engine/sagas.js";
 import { kc, KS, ofType, rig, tick, type Rig } from "./helpers/engine.js";
 
 const SAGA = "5c2e9f1a-6b7d-4c3e-8a9f-0d1e2f3a4b5c";
-const RUN = `abpc.saga.v1/run/${SAGA}`;
-const moved = (marker: string, status: string, saga = SAGA): ReturnType<typeof kc> => kc(`abpc.saga.v1/moved/${marker}`, "set", { status, saga_id: saga, saga: "move", to: { keyspace_id: "ks2", key: marker } });
+const RUN = `abcp.saga.v1/run/${SAGA}`;
+const moved = (marker: string, status: string, saga = SAGA): ReturnType<typeof kc> => kc(`abcp.saga.v1/moved/${marker}`, "set", { status, saga_id: saga, saga: "move", to: { keyspace_id: "ks2", key: marker } });
 const run = (status?: string, cause?: string): ReturnType<typeof kc> => kc(RUN, "set", { saga: "move", ...(status !== undefined ? { status } : {}), ...(cause !== undefined ? { cause } : {}) });
 const open = (): ReturnType<typeof kc> => kc(`${RUN}/open`, "set", true);
 const ended = (r: Rig): { sagaId: string; status: string; cause?: string; keyspaceId: string }[] => ofType(r, "saga-ended").map((e) => ({ keyspaceId: e.keyspaceId, sagaId: e.sagaId, status: e.status, ...(e.cause !== undefined ? { cause: e.cause } : {}) }));
@@ -30,7 +30,7 @@ describe("14 [CLI-14] (V19 MUST-5): the run key of a saga that the client shows 
     expect(ended(r)).toHaveLength(1);
     // the pointer is still shown: the watch stays, with what was said; it ends when the pointer goes
     expect(r.engine.followedSagas()).toMatchObject([{ sagaId: SAGA, endedStatus: "completed", open: false }]);
-    r.server.write(KS, [kc("abpc.saga.v1/moved/issues/i1", "delete")]);
+    r.server.write(KS, [kc("abcp.saga.v1/moved/issues/i1", "delete")]);
     await r.engine.settle();
     expect(r.engine.followedSagas()).toEqual([]);
   });
@@ -70,7 +70,7 @@ describe("14 [CLI-14] (V19 MUST-5): the run key of a saga that the client shows 
     r.server.write(KS, [kc("settings/s", "set", 1), kc("issues/i1", "set", "an issue")]);
     await r.engine.settle();
     // the interest holds the moved keys and the app's own, not the run keys
-    await r.engine.setInterest(KS, ["abpc.saga.v1/moved", "settings"]);
+    await r.engine.setInterest(KS, ["abcp.saga.v1/moved", "settings"]);
     await r.engine.settle();
     r.server.write(KS, [moved("issues/i1", "moving"), run("running"), open()]);
     await r.engine.settle();
@@ -119,7 +119,7 @@ describe("14 [CLI-14] (V19 MUST-5): the run key of a saga that the client shows 
     expect(r2.engine.followedSagas()).toMatchObject([{ sagaId: SAGA, endedStatus: "completed" }]);
     // another saga, over a second entity, begins and ends after the restart
     const S2 = "11111111-2222-4333-8444-555555555555";
-    r2.server.write(KS, [moved("issues/i2", "moving", S2), kc(`abpc.saga.v1/run/${S2}`, "set", { saga: "move", status: "failed", cause: "REDACTED" })]);
+    r2.server.write(KS, [moved("issues/i2", "moving", S2), kc(`abcp.saga.v1/run/${S2}`, "set", { saga: "move", status: "failed", cause: "REDACTED" })]);
     await r2.engine.settle();
     expect(ended(r2)).toEqual([{ keyspaceId: KS, sagaId: S2, status: "failed", cause: "REDACTED" }]);
   });

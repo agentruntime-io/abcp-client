@@ -7,7 +7,7 @@
 // `undefined`, `NaN` and `Infinity` among them, a lone surrogate, nesting over 32, a bigint) is refused here, with a typed local
 // error, before anything is stored or shown.
 
-import { ChangeKind } from "../gen/abpc/v2/types_pb.js";
+import { ChangeKind } from "../gen/abcp/v2/types_pb.js";
 import { canonical, JsonV1Error, validate, MAX_DEPTH, type JsonValue } from "../rules/jsonv1/index.js";
 import { LocalRefusal } from "./errors.js";
 import type { ChangeInput } from "./types.js";

@@ -166,7 +166,7 @@ function encodeList(w: ByteWriter, fd: DescField & { fieldKind: "list" }, list: 
  *
  * SPEC-QUESTION: 07 [MUT-45] "map entries in increasing order of their keys' bytes (UTF-8 for string keys)". For a key that
  * is no string, "bytes" is read as the key's encoding on the wire, as both vector models and the Go server do, and not as
- * its big-endian value. Every map of abpc/v2 has string keys, so no vector decides it.
+ * its big-endian value. Every map of abcp/v2 has string keys, so no vector decides it.
  */
 function encodeMap(w: ByteWriter, fd: DescField & { fieldKind: "map" }, map: ReflectMap, view: EncodeView | undefined, depth: number): void {
   if (map.size === 0) return;

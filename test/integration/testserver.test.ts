@@ -1,5 +1,5 @@
 // S1-P5: the client's harness for the test binary of the CONF-6 test profile (harness/testserver.ts), driven end to end against a deployment of three nodes on the
-// in-memory stores (server/cmd/abpc-testserver). The cases are one for each family of hooks that 17 [CONF-6] asks the harness for, and the engine of the
+// in-memory stores (server/cmd/abcp-testserver). The cases are one for each family of hooks that 17 [CONF-6] asks the harness for, and the engine of the
 // client is the system that uses them:
 //  - the injectable clock: the one time source of 10 [AUTH-66] (SetClock, AdvanceClock) dates the records and judges the tokens, and an offset for one node's local clock
 //    (SetNodeOffset) moves nothing that the source dates;
@@ -15,10 +15,10 @@ import { Code, ConnectError, createClient } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-node";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { RpcError, set } from "../../src/engine/index.js";
-import { GetManifestRequestSchema, SubscribeRequestSchema } from "../../src/gen/abpc/v2/sync_pb.js";
-import { KeyspaceCursorSchema, type Record as AbpcRecord } from "../../src/gen/abpc/v2/types_pb.js";
+import { GetManifestRequestSchema, SubscribeRequestSchema } from "../../src/gen/abcp/v2/sync_pb.js";
+import { KeyspaceCursorSchema, type Record as AbcpRecord } from "../../src/gen/abcp/v2/types_pb.js";
 import { createNodeTransport } from "../../src/net/node.js";
-import { StopMode, TestControlService } from "../gen/abpctest/v1/control_pb.js";
+import { StopMode, TestControlService } from "../gen/abcptest/v1/control_pb.js";
 import { waitFor } from "./harness/env.js";
 import { nodeOf, startTestServer, testServerAvailable, TESTSERVER_SKIP_REASON, type ServerClient, type TestServer, type TokenOptions } from "./harness/testserver.js";
 
@@ -78,9 +78,9 @@ describe.skipIf(!testServerAvailable)("the engine against the test binary (three
     return w.mutationId;
   };
   /** The records of a keyspace, read from its start on a node by a session of its own, until `n` of them have arrived. */
-  const records = async (c: ServerClient, ks: string, n: number): Promise<AbpcRecord[]> => {
+  const records = async (c: ServerClient, ks: string, n: number): Promise<AbcpRecord[]> => {
     const ac = new AbortController();
-    const out: AbpcRecord[] = [];
+    const out: AbcpRecord[] = [];
     try {
       const req = create(SubscribeRequestSchema, { clientId: crypto.randomUUID(), keyspaces: [create(KeyspaceCursorSchema, { keyspaceId: ks })] });
       for await (const f of c.net.transport.subscribe(req, { signal: ac.signal })) {

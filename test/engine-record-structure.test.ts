@@ -12,7 +12,7 @@ import { create } from "@bufbuild/protobuf";
 import { describe, expect, it } from "vitest";
 import { jsonBytes, StaticManifests, type StaticManifestSpec } from "../src/engine/index.js";
 import type { FakeServer } from "../src/fake/index.js";
-import { CasExpectSchema, ChangeKind, KeyChangeSchema, RecordKind, SystemKind, type KeyChange } from "../src/gen/abpc/v2/types_pb.js";
+import { CasExpectSchema, ChangeKind, KeyChangeSchema, RecordKind, SystemKind, type KeyChange } from "../src/gen/abcp/v2/types_pb.js";
 import { fromHex } from "../src/rules/bytes.js";
 import { parseSchema } from "../src/rules/jsonv1/index.js";
 import { goOffline, goOnline, kc, KS, MANIFEST, ofType, rig, tick, type Rig } from "./helpers/engine.js";
@@ -60,20 +60,20 @@ const cases: Case[] = [
   { name: "03 [ID-1]: a segment with a space", bad: ops(sets("settings/a b", "1")), good: ops(sets("settings/a-b", "1")) },
   { name: "03 [ID-1]: an empty segment", bad: ops(sets("settings//a", "1")) },
   // a reserved key matches no template of the manifest, so that no template lookup judges its segments: the syntax of the key does
-  { name: "03 [ID-1]: a segment of 65 octets in a reserved key", bad: ops(sets(`abpc.saga.v1/run/${seg(65)}`, "{}")), good: ops(sets(`abpc.saga.v1/run/${seg(64)}`, "{}")) },
-  { name: "03 [ID-1]: a segment with a space in a reserved key", bad: ops(sets("abpc.saga.v1/run/a b", "{}")) },
-  { name: "03 [ID-2]: a segment `..` in a reserved key", bad: ops(sets("abpc.lease.v1/claim/..", "{}")), good: ops(sets("abpc.lease.v1/claim/42", "{}")) },
+  { name: "03 [ID-1]: a segment of 65 octets in a reserved key", bad: ops(sets(`abcp.saga.v1/run/${seg(65)}`, "{}")), good: ops(sets(`abcp.saga.v1/run/${seg(64)}`, "{}")) },
+  { name: "03 [ID-1]: a segment with a space in a reserved key", bad: ops(sets("abcp.saga.v1/run/a b", "{}")) },
+  { name: "03 [ID-2]: a segment `..` in a reserved key", bad: ops(sets("abcp.lease.v1/claim/..", "{}")), good: ops(sets("abcp.lease.v1/claim/42", "{}")) },
   { name: "03 [ID-13]: a key of 17 segments", bad: ops(sets(Array.from({ length: 17 }, () => "a").join("/"), "1")) },
   { name: "03 [ID-13]: a key of over 512 octets", bad: ops(sets(Array.from({ length: 9 }, () => seg(64)).join("/"), "1")) },
   { name: "03 [ID-13]: no key", bad: ops(sets("", "1")) },
   // -- the reserved namespace (03 [ID-47]); the run key of a saga is one that 03 §3.8 defines --
-  { name: "03 [ID-47]: a reserved key that nothing defines", bad: ops(sets("abpc.nothing/x", "1")), good: ops(sets("abpc.saga.v1/run/s1", "{}")) },
-  { name: "03 [ID-47]: the first segment `abpc`", bad: ops(sets("abpc/x", "1")) },
-  { name: "03 [ID-47]: an escrow key with a class that is no class", bad: ops(sets("abpc.escrow.v1/Till/b1", "{}")), good: ops(sets("abpc.escrow.v1/till/b1", "{}")) },
-  { name: "03 [ID-47]: an escrow exception key whose seq is 0", bad: ops(sets("abpc.escrow.v1/till/b1/exception/0", "{}")), good: ops(sets("abpc.escrow.v1/till/b1/exception/7", "{}")) },
-  { name: "03 [ID-47]: a saga target key whose number has a leading zero", bad: ops(sets("abpc.saga.v1/run/s1/target/07", "{}")), good: ops(sets("abpc.saga.v1/run/s1/target/7", "{}")) },
-  { name: "03 [ID-47]: a saga step key whose step is no step name", bad: ops(sets("abpc.saga.v1/run/s1/step/Charge", "{}")), good: ops(sets("abpc.saga.v1/run/s1/step/copy.0", "{}")) },
-  { name: "03 [ID-47]: an intent row with another shape", bad: ops(sets("abpc.intent/a/b", "{}")), good: ops(sets("abpc.intent/a", "{}")) },
+  { name: "03 [ID-47]: a reserved key that nothing defines", bad: ops(sets("abcp.nothing/x", "1")), good: ops(sets("abcp.saga.v1/run/s1", "{}")) },
+  { name: "03 [ID-47]: the first segment `abcp`", bad: ops(sets("abcp/x", "1")) },
+  { name: "03 [ID-47]: an escrow key with a class that is no class", bad: ops(sets("abcp.escrow.v1/Till/b1", "{}")), good: ops(sets("abcp.escrow.v1/till/b1", "{}")) },
+  { name: "03 [ID-47]: an escrow exception key whose seq is 0", bad: ops(sets("abcp.escrow.v1/till/b1/exception/0", "{}")), good: ops(sets("abcp.escrow.v1/till/b1/exception/7", "{}")) },
+  { name: "03 [ID-47]: a saga target key whose number has a leading zero", bad: ops(sets("abcp.saga.v1/run/s1/target/07", "{}")), good: ops(sets("abcp.saga.v1/run/s1/target/7", "{}")) },
+  { name: "03 [ID-47]: a saga step key whose step is no step name", bad: ops(sets("abcp.saga.v1/run/s1/step/Charge", "{}")), good: ops(sets("abcp.saga.v1/run/s1/step/copy.0", "{}")) },
+  { name: "03 [ID-47]: an intent row with another shape", bad: ops(sets("abcp.intent/a/b", "{}")), good: ops(sets("abcp.intent/a", "{}")) },
   // -- the envelope (07 §7.3, 05 [STATE-20], [STATE-24], 03 [ID-23]) --
   { name: "07 Table 7-2 item 1: an OP record with no change", bad: ops() },
   { name: "05 [STATE-20]: a SET that sets no encoding", bad: ops(raw({ key: "settings/a", kind: ChangeKind.SET, value: J("1") })), good: ops(sets("settings/a", "1")) },
@@ -158,7 +158,7 @@ describe.each(["live", "resume"] as const)("16 [SEC-3]: a record that breaks a s
 });
 
 describe.each(["live", "resume"] as const)("16 [SEC-3], 03 [ID-19], 06 [LOG-44]: the server-written SET of a run key in a REDACTED record breaks none of the rules, delivered %s", (mode) => {
-  const RUN = "abpc.saga.v1/run/saga-1";
+  const RUN = "abcp.saga.v1/run/saga-1";
   const redacted = (run: KeyChange): Init => ({
     kind: RecordKind.SYSTEM,
     system: { kind: SystemKind.REDACTED, mustUnderstand: true, body: jsonBytes({ redaction_id: "r1", keys: [], min_seq: 0 }) },
@@ -192,7 +192,7 @@ describe("16 [SEC-3]: what the check leaves to 14 [CLI-5], and to the app's limi
 
   it("an INTENT's requested changes are not applied, and their template and value are not judged: a requested change that breaks its template's schema leaves the keyspace going", async () => {
     const r = await rig({ manifests: new StaticManifests(SPEC) });
-    r.server.appendRaw(KS, { kind: RecordKind.INTENT, changes: [sets("limits/a", "11"), sets("abpc.intent/other-1", '{"status":"PENDING"}')] });
+    r.server.appendRaw(KS, { kind: RecordKind.INTENT, changes: [sets("limits/a", "11"), sets("abcp.intent/other-1", '{"status":"PENDING"}')] });
     await r.engine.settle();
     expect(ofType(r, "protocol-error")).toEqual([]);
     expect(r.engine.status().holds).toEqual([]);
@@ -208,7 +208,7 @@ describe("16 [SEC-3]: what the check leaves to 14 [CLI-5], and to the app's limi
 describe.each(["live", "resume"] as const)("16 [SEC-3]: the requested changes of an INTENT are judged by their key and their envelope, delivered %s", (mode) => {
   const intent = (...changes: KeyChange[]): Init => ({ kind: RecordKind.INTENT, changes });
   const bad: [string, Init][] = [
-    ["a segment `..`", intent(sets("settings/..", "1"), sets("abpc.intent/other-1", '{"status":"PENDING"}'))],
+    ["a segment `..`", intent(sets("settings/..", "1"), sets("abcp.intent/other-1", '{"status":"PENDING"}'))],
 
     ["a DELETE that sets a value", intent(raw({ key: "settings/a", kind: ChangeKind.DELETE, value: J("1") }))],
     ["a SET that sets no encoding", intent(raw({ key: "settings/a", kind: ChangeKind.SET, value: J("1") }))],
@@ -222,9 +222,9 @@ describe.each(["live", "resume"] as const)("16 [SEC-3]: the requested changes of
       expect(r.engine.cursor(KS)?.seq).toBe(1n);
     });
   }
-  // SPEC-QUESTION (16 [SEC-3] with 03 [ID-47]): the reserved namespace of a requested change is not judged, as the vector fold-moved-002 has it (an INTENT whose requested change names `abpc.saga.v1/saga/s1`)
+  // SPEC-QUESTION (16 [SEC-3] with 03 [ID-47]): the reserved namespace of a requested change is not judged, as the vector fold-moved-002 has it (an INTENT whose requested change names `abcp.saga.v1/saga/s1`)
   it("requested changes that are well formed, one with a reserved key that 03 §3.8 does not define and one with a value that breaks its template's schema: the record is applied, with no hold", async () => {
-    const r = await deliver(mode, intent(sets("settings/a", "1"), sets("limits/a", "11"), sets("abpc.saga.v1/saga/s1", "{}"), casAbsent("notes/n1", "1"), del("settings/b")));
+    const r = await deliver(mode, intent(sets("settings/a", "1"), sets("limits/a", "11"), sets("abcp.saga.v1/saga/s1", "{}"), casAbsent("notes/n1", "1"), del("settings/b")));
     expect(r.engine.cursor(KS)?.seq).toBe(2n);
     expect(ofType(r, "protocol-error")).toEqual([]);
     expect(r.engine.status().holds).toEqual([]);

@@ -15,7 +15,7 @@ import { KS, MANIFEST } from "./helpers/engine.js";
 
 let dir: string;
 beforeEach(() => {
-  dir = mkdtempSync(path.join(tmpdir(), "abpc-platform-"));
+  dir = mkdtempSync(path.join(tmpdir(), "abcp-platform-"));
 });
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
@@ -59,7 +59,7 @@ describe("the JSON form of stored data", () => {
   });
 
   it("never reads what a server wrote as a tag: a map that has a key named like one comes back as it was", () => {
-    const hostile = { details: { $big: "not a number", $u8: 5, $obj: { $big: "1" }, $num: "NaN", ok: "fine" }, only: { $big: "7" }, $typeName: "abpc.v2.Reject" };
+    const hostile = { details: { $big: "not a number", $u8: 5, $obj: { $big: "1" }, $num: "NaN", ok: "fine" }, only: { $big: "7" }, $typeName: "abcp.v2.Reject" };
     expect(unpack(JSON.parse(JSON.stringify(pack(hostile))))).toEqual(hostile);
     expect(parse(stringify({ $obj: { $obj: 5 } }))).toEqual({ $obj: { $obj: 5 } });
   });
@@ -214,7 +214,7 @@ describe("two engines of one process on one NodeDevice", () => {
       manifests,
       clock,
       random: new SeededRandom(seed),
-      origin: "https://abpc.test",
+      origin: "https://abcp.test",
       tab,
     });
     await engine.addKeyspace(KS);

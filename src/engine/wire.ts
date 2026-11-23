@@ -75,7 +75,7 @@ import {
   type SubscribeResponse,
   type UpdateSubscriptionRequest,
   type UpdateSubscriptionResponse,
-} from "../gen/abpc/v2/sync_pb.js";
+} from "../gen/abcp/v2/sync_pb.js";
 import { CanonError, checkTimestamps, encode, unmarshal } from "../rules/canon/index.js";
 import { checkCounts, pageBound, type DecodeLimits } from "./counts.js";
 import { ProtocolViolation } from "./errors.js";
@@ -130,13 +130,13 @@ export class BytesTransport implements Transport {
   mutate(req: MutateRequest, o?: CallOptions): Promise<MutateResponse> {
     // 07 [MUT-4], [MUT-7]: one result for each mutation, and one watermark at most for each
     const n = req.mutations.length;
-    return this.unary("Mutate", MutateRequestSchema, MutateResponseSchema, req, o, { "abpc.v2.MutateResponse.results": n, "abpc.v2.MutateResponse.watermarks": n });
+    return this.unary("Mutate", MutateRequestSchema, MutateResponseSchema, req, o, { "abcp.v2.MutateResponse.results": n, "abcp.v2.MutateResponse.watermarks": n });
   }
   getMutationResult(req: GetMutationResultRequest, o?: CallOptions): Promise<GetMutationResultResponse> {
     return this.unary("GetMutationResult", GetMutationResultRequestSchema, GetMutationResultResponseSchema, req, o);
   }
   getMutationResults(req: GetMutationResultsRequest, o?: CallOptions): Promise<GetMutationResultsResponse> {
-    return this.unary("GetMutationResults", GetMutationResultsRequestSchema, GetMutationResultsResponseSchema, req, o, { "abpc.v2.GetMutationResultsResponse.results": req.mutationIds.length });
+    return this.unary("GetMutationResults", GetMutationResultsRequestSchema, GetMutationResultsResponseSchema, req, o, { "abcp.v2.GetMutationResultsResponse.results": req.mutationIds.length });
   }
   cancelIntent(req: CancelIntentRequest, o?: CallOptions): Promise<CancelIntentResponse> {
     return this.unary("CancelIntent", CancelIntentRequestSchema, CancelIntentResponseSchema, req, o);
@@ -146,11 +146,11 @@ export class BytesTransport implements Transport {
   }
   loadState(req: LoadStateRequest, o?: CallOptions): Promise<LoadStateResponse> {
     // 09 [READ-10]: `page_size` is an upper bound on the entries of a page
-    return this.unary("LoadState", LoadStateRequestSchema, LoadStateResponseSchema, req, o, { "abpc.v2.LoadStateResponse.entries": pageBound(req.pageSize) });
+    return this.unary("LoadState", LoadStateRequestSchema, LoadStateResponseSchema, req, o, { "abcp.v2.LoadStateResponse.entries": pageBound(req.pageSize) });
   }
   updateSubscription(req: UpdateSubscriptionRequest, o?: CallOptions): Promise<UpdateSubscriptionResponse> {
     // 09 [READ-62]: `rejected` is bounded by the request's entries
-    return this.unary("UpdateSubscription", UpdateSubscriptionRequestSchema, UpdateSubscriptionResponseSchema, req, o, { "abpc.v2.UpdateSubscriptionResponse.rejected": req.add.length + req.setInterest.length });
+    return this.unary("UpdateSubscription", UpdateSubscriptionRequestSchema, UpdateSubscriptionResponseSchema, req, o, { "abcp.v2.UpdateSubscriptionResponse.rejected": req.add.length + req.setInterest.length });
   }
   refreshSession(req: RefreshSessionRequest, o?: CallOptions): Promise<RefreshSessionResponse> {
     return this.unary("RefreshSession", RefreshSessionRequestSchema, RefreshSessionResponseSchema, req, o);

@@ -29,8 +29,8 @@ import {
   JoinPresenceResponseSchema,
   LeavePresenceResponseSchema,
   PublishPresenceResponseSchema,
-} from "../src/gen/abpc/v2/sync_pb.js";
-import { KeyEntrySchema, RecordSchema, RejectSchema } from "../src/gen/abpc/v2/types_pb.js";
+} from "../src/gen/abcp/v2/sync_pb.js";
+import { KeyEntrySchema, RecordSchema, RejectSchema } from "../src/gen/abcp/v2/types_pb.js";
 import { encode } from "../src/rules/canon/index.js";
 import type { RawCaller } from "../src/engine/index.js";
 

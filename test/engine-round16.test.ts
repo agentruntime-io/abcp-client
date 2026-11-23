@@ -5,7 +5,7 @@
 
 import { describe, expect, it } from "vitest";
 import { set } from "../src/engine/index.js";
-import { Code, RetryReason } from "../src/gen/abpc/v2/types_pb.js";
+import { Code, RetryReason } from "../src/gen/abcp/v2/types_pb.js";
 import { reject as mk, rejectWith } from "../src/fake/index.js";
 import { goOffline, goOnline, KS, mutateRequests, ofType, rejectResult, retryResult, rig, tick, types, type Rig } from "./helpers/engine.js";
 
@@ -14,7 +14,7 @@ const approve = (key: string): { keyspaceId: string; opType: string; changes: Re
 const held = (r: Rig): { state: string; scope: string; lane?: string; code: string }[] =>
   r.events.filter((e) => e.type === "held").map((e) => e as unknown as { state: string; scope: string; lane?: string; code: string });
 
-describe("14 [CLI-50], Table 14.1, A.7, A.11: a `Mutate` call that fails as a whole with a status and no ABPC detail", () => {
+describe("14 [CLI-50], Table 14.1, A.7, A.11: a `Mutate` call that fails as a whole with a status and no ABCP detail", () => {
   it("holds each lane that the request carried, under the code PROTOCOL_ERROR, and emits one `protocol-error` with the RPC status and the lanes of the request", async () => {
     const r = await rig();
     await goOffline(r);

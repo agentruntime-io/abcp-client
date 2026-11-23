@@ -5,8 +5,8 @@
 // byte for byte (07 [MUT-106]).
 
 import { create } from "@bufbuild/protobuf";
-import { MutationSchema, type Mutation } from "../gen/abpc/v2/sync_pb.js";
-import { ChangeKind } from "../gen/abpc/v2/types_pb.js";
+import { MutationSchema, type Mutation } from "../gen/abcp/v2/sync_pb.js";
+import { ChangeKind } from "../gen/abcp/v2/types_pb.js";
 import { CanonError, encode, unmarshal } from "../rules/canon/index.js";
 import type { OutboxEntry } from "./storage.js";
 
@@ -92,7 +92,7 @@ export function dependsOn(b: DepView, a: DepView, explicit: ReadonlySet<string>,
     }
   }
   // 2. a precondition on a key A writes, on a prefix of a key A writes, or after A's mutation id; 3. on A's intent row
-  const intentRow = `abpc.intent/${a.mutationId}`;
+  const intentRow = `abcp.intent/${a.mutationId}`;
   for (const p of b.mutation.preconditions) {
     if (p.target.case === "key") {
       if (a.keys.includes(p.target.value) || p.target.value === intentRow) return true;

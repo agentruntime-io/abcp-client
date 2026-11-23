@@ -39,8 +39,8 @@
 
 import { create } from "@bufbuild/protobuf";
 import { timestampMs } from "@bufbuild/protobuf/wkt";
-import { JoinPresenceRequestSchema, LeavePresenceRequestSchema, PublishPresenceRequestSchema, type PresenceEntry, type PresenceFrame } from "../gen/abpc/v2/sync_pb.js";
-import { Code, RetryReason, type Principal } from "../gen/abpc/v2/types_pb.js";
+import { JoinPresenceRequestSchema, LeavePresenceRequestSchema, PublishPresenceRequestSchema, type PresenceEntry, type PresenceFrame } from "../gen/abcp/v2/sync_pb.js";
+import { Code, RetryReason, type Principal } from "../gen/abcp/v2/types_pb.js";
 import { canonical, parse, type JsonValue } from "../rules/jsonv1/index.js";
 import { resendDelay } from "./backoff.js";
 import { codeName } from "./codes.js";

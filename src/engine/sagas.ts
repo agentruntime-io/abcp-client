@@ -1,11 +1,11 @@
 // Following sagas (14 [CLI-14], V19 MUST-5): "A client that shows such a pointer, or that started a saga, MUST follow the saga's run key,
-// `abpc.saga.v1/run/{saga_id}` in its home keyspace (the source of a move), with the `saga_id` of the `moved` key or of the Start, through its interest or by
+// `abcp.saga.v1/run/{saga_id}` in its home keyspace (the source of a move), with the `saga_id` of the `moved` key or of the Start, through its interest or by
 // loading the key, for as long as it shows the pointer or the saga's `open` key is present (11 §11.4.4). It MUST emit `saga-ended` when the run key's
 // `status` says that the saga ended or failed (§14.5)."
 //
 //  - The sagas that the engine follows are its **watches**: one for each (home keyspace, saga id). A watch starts when the confirmed state shows a moved key
-//    (`abpc.saga.v1/moved/<marker>`) that says `moving` or `moved` with a `saga_id` (a record, a load, or a restored image), and when the app's own action
-//    starts a saga (its changes SET `abpc.saga.v1/run/{saga_id}`, 11 [COORD-58]), or the app says that it did (`Engine.followSaga`).
+//    (`abcp.saga.v1/moved/<marker>`) that says `moving` or `moved` with a `saga_id` (a record, a load, or a restored image), and when the app's own action
+//    starts a saga (its changes SET `abcp.saga.v1/run/{saga_id}`, 11 [COORD-58]), or the app says that it did (`Engine.followSaga`).
 //  - The run key is read from the confirmed state when the keyspace's interest covers it (a record that changes it is the observation), and otherwise
 //    **by loading the key**: a `LoadState` of the key's prefix, made when the watch starts and again every `SAGA_POLL_MS` on the engine's clock while the
 //    session is live, until the saga has ended and nothing else keeps the watch (a failed run stays open until it is resolved).
@@ -14,14 +14,14 @@
 //    is stored with the watch, so that a restart does not say it again.
 //  - A watch ends when the saga has ended, its `open` key is absent, and no pointer of it is shown.
 
-import type { LoadStateResponse } from "../gen/abpc/v2/sync_pb.js";
+import type { LoadStateResponse } from "../gen/abcp/v2/sync_pb.js";
 import { InterestLayer } from "./interest.js";
 import type { Follow } from "./follow.js";
 import { covers } from "./replica-store.js";
 import type { StorageOp } from "./storage.js";
 
-export const MOVED_PREFIX = "abpc.saga.v1/moved/";
-export const RUN_PREFIX = "abpc.saga.v1/run/";
+export const MOVED_PREFIX = "abcp.saga.v1/moved/";
+export const RUN_PREFIX = "abcp.saga.v1/run/";
 /** How often a run key that the interest does not cover is loaded while its saga is not over, on the engine's clock. */
 export const SAGA_POLL_MS = 30_000;
 
@@ -74,7 +74,7 @@ export abstract class SagaLayer extends InterestLayer {
 
   /**
    * The app started a saga (11 [COORD-58]) by a Start that this engine did not author (one that the engine authored is followed by itself): the run key
-   * `abpc.saga.v1/run/{sagaId}` of the keyspace is followed (14 [CLI-14]).
+   * `abcp.saga.v1/run/{sagaId}` of the keyspace is followed (14 [CLI-14]).
    */
   followSaga(keyspaceId: string, sagaId: string): void {
     this.post(() => {

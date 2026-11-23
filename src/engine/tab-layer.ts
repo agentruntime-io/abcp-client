@@ -37,7 +37,7 @@
 // when one is announced, and, when its own tab is promoted, runs it itself; a `submit` that carries an id that the outbox, the journal or a
 // store already holds is answered with it, authored once. `NO_FLUSHER` is for an engine that is stopping, and for one with no tab host.
 
-import { KeyspaceLifecycle } from "../gen/abpc/v2/types_pb.js";
+import { KeyspaceLifecycle } from "../gen/abcp/v2/types_pb.js";
 import { BoundedSet } from "./bounded.js";
 import { BlobError, type BlobErrorCode, type BlobWait } from "./blob-store.js";
 import { LocalRefusal, type LocalRefusalCode, type StorageCause } from "./errors.js";

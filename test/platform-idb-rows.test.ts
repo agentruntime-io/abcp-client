@@ -7,7 +7,7 @@
 import { create } from "@bufbuild/protobuf";
 import { describe, expect, it } from "vitest";
 import { set, type DeadLetterEntry, type ExportEntry, type OutboxEntry, type ReplicaHead } from "../src/engine/index.js";
-import { Code, KeyEntrySchema, RecordSchema } from "../src/gen/abpc/v2/types_pb.js";
+import { Code, KeyEntrySchema, RecordSchema } from "../src/gen/abcp/v2/types_pb.js";
 import { reject as mk } from "../src/fake/index.js";
 import { IndexedDbStorage } from "../src/platform/idb-storage.js";
 import { FakeIDBFactory, FakeKeyRange } from "./helpers/fake-idb.js";

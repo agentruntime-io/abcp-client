@@ -43,7 +43,7 @@ const extension = (id: string, critical: boolean, value: Uint8Array): Uint8Array
 /** A self-signed certificate of an ECDSA P-256 key for 127.0.0.1 and `localhost`, which can be a trust root (a CA) for itself. */
 export function selfSignedCertificate(): { certPem: string; keyPem: string } {
   const { publicKey, privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "P-256" });
-  const name = seq(set(seq(oid("2.5.4.3"), utf8("abpc-test-issuer"))));
+  const name = seq(set(seq(oid("2.5.4.3"), utf8("abcp-test-issuer"))));
   const sigAlg = seq(oid("1.2.840.10045.4.3.2")); // ecdsa-with-SHA256
   const now = Date.now();
   const tbs = seq(
@@ -126,7 +126,7 @@ export class TestIssuer {
       sub: o.sub,
       iat: now,
       exp: now + (o.lifetimeS ?? 600),
-      abpc: { grants: (o.grants ?? [{ ks: "acme/**", actions: ["read", "write:*", "keyspace:create"] }]).map((g) => ({ ks: g.ks, actions: g.actions })) },
+      abcp: { grants: (o.grants ?? [{ ks: "acme/**", actions: ["read", "write:*", "keyspace:create"] }]).map((g) => ({ ks: g.ks, actions: g.actions })) },
       ...(o.deviceId !== undefined ? { device_id: o.deviceId } : {}),
       ...(o.claims ?? {}),
     };

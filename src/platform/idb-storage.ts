@@ -8,7 +8,7 @@
 //   replicaEntries  `<keyspace>\0<n, 10 digits>` -> a KeyEntry of the load's pages, in the order they were served
 //   replicaTail     `<keyspace>\0<seq, 20 digits>` -> a record applied since, in seq order
 //
-// The registry database `abpc:registry` lists the partitions, for `list` (`indexedDB.databases()` is not in every browser).
+// The registry database `abcp:registry` lists the partitions, for `list` (`indexedDB.databases()` is not in every browser).
 //
 // Another tab writes to the same database (the tab that is the flusher changes with the handover, 14 [CLI-61]), so nothing that this storage knows of it
 // is trusted past the call that read it (V19 MUST-2): a commit reads the headers of the replicas that it touches, and the keys of the rows that it
@@ -19,7 +19,7 @@
 // A connection yields to a request to delete or upgrade the database (`versionchange`): it closes, so that the sign-out of another tab is not kept
 // waiting for it (V19 SHOULD-8); a storage whose connection was closed so refuses every call with a StorageError.
 //
-// The registry database and the partitions' are named `abpc:...`; the provider also names and deletes the database of each partition's staged blobs, `abpc-blobs:...` (`idb-blob-stash.ts`): a
+// The registry database and the partitions' are named `abcp:...`; the provider also names and deletes the database of each partition's staged blobs, `abcp-blobs:...` (`idb-blob-stash.ts`): a
 // `destroy` deletes both, and the failure of either is reported (V19 SHOULD-8, 14 [CLI-65]).
 //
 // Untested against a real IndexedDB (Node has none): `test/platform-idb.test.ts` runs it against a small in-memory double of the API subset that it uses.
@@ -61,7 +61,7 @@ import {
   type KeyRangeFactory,
   type StorageManagerLike,
 } from "./idb.js";
-import type { KeyEntry, Record as RecordMessage } from "../gen/abpc/v2/types_pb.js";
+import type { KeyEntry, Record as RecordMessage } from "../gen/abcp/v2/types_pb.js";
 
 // The part of the IndexedDB API that is used, and the calls that open and delete a database, are in `idb.ts`, shared with the stash of the blobs (`idb-blob-stash.ts`); the types are
 // re-exported from here, where they always were.
@@ -79,7 +79,7 @@ export type {
 
 const STORES = ["entries", "deadLetters", "journal", "exports", "rejections", "drafts", "meta", "replicas", "replicaEntries", "replicaTail"] as const;
 type StoreId = (typeof STORES)[number];
-const REGISTRY = "abpc:registry";
+const REGISTRY = "abcp:registry";
 
 const pad = (n: bigint | number, width: number): string => n.toString().padStart(width, "0");
 const rowKey = (keyspace: string, n: string): string => `${keyspace}\u0000${n}`;
@@ -648,16 +648,16 @@ export class IndexedDbStorageProvider implements StorageProvider {
   }
 
   private nameOf(key: PartitionKey): string {
-    return `abpc:${partitionId(key)}`;
+    return `abcp:${partitionId(key)}`;
   }
 
   /** The database of the partition's staged blobs: a prefix of its own, so that no partition's name is another database's. */
   private blobsNameOf(key: PartitionKey): string {
-    return `abpc-blobs:${partitionId(key)}`;
+    return `abcp-blobs:${partitionId(key)}`;
   }
 
   /**
-   * The stash of the bytes that the partition's actions name (09 [READ-94], 14 [CLI-44]): in the database `abpc-blobs:<partition>`, which the first call that needs it creates. The tabs of
+   * The stash of the bytes that the partition's actions name (09 [READ-94], 14 [CLI-44]): in the database `abcp-blobs:<partition>`, which the first call that needs it creates. The tabs of
    * the partition share it, and `destroy` deletes it with the partition (14 [CLI-65]).
    */
   blobStash(key: PartitionKey): BlobStash {

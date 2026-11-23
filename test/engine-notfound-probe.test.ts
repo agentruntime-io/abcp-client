@@ -4,7 +4,7 @@
 
 import { describe, expect, it } from "vitest";
 import { set } from "../src/engine/index.js";
-import { Code } from "../src/gen/abpc/v2/types_pb.js";
+import { Code } from "../src/gen/abcp/v2/types_pb.js";
 import { reject as mk } from "../src/fake/index.js";
 import { kc, KS, mutateRequests, ofType, rejectResult, rig, tick, types } from "./helpers/engine.js";
 

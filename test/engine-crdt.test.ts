@@ -5,7 +5,7 @@ import { create } from "@bufbuild/protobuf";
 import * as Y from "yjs";
 import { crdtUpdate, type EngineEvent } from "../src/engine/index.js";
 import { snapToCodePoint } from "../src/engine/crdt-view.js";
-import { ChangeKind, KeyChangeSchema, StaleCause, Code } from "../src/gen/abpc/v2/types_pb.js";
+import { ChangeKind, KeyChangeSchema, StaleCause, Code } from "../src/gen/abcp/v2/types_pb.js";
 import { reject as mk } from "../src/fake/index.js";
 import { goOffline, goOnline, KS, ofType, rejectResult, rig, tick, types, type Rig } from "./helpers/engine.js";
 

@@ -1,5 +1,5 @@
 // C5: the transport on its own against the Go server: the manifest as the server serves it (GetManifest, 04 §4.7), and the failures of A.7 as the server sends
-// them with their one ABPC detail (02 [ARC-57]), over each client (connect-node over HTTP/1.1 and HTTP/2, and fetch).
+// them with their one ABCP detail (02 [ARC-57]), over each client (connect-node over HTTP/1.1 and HTTP/2, and fetch).
 
 import { create } from "@bufbuild/protobuf";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -10,9 +10,9 @@ import {
   LoadStateRequestSchema,
   RefreshSessionRequestSchema,
   SubscribeRequestSchema,
-} from "../../src/gen/abpc/v2/sync_pb.js";
-import { KeyspaceCursorSchema } from "../../src/gen/abpc/v2/types_pb.js";
-import { Code } from "../../src/gen/abpc/v2/types_pb.js";
+} from "../../src/gen/abcp/v2/sync_pb.js";
+import { KeyspaceCursorSchema } from "../../src/gen/abcp/v2/types_pb.js";
+import { Code } from "../../src/gen/abcp/v2/types_pb.js";
 import { ConnectManifests, createWebTransport, TokenStore } from "../../src/net/index.js";
 import { createNodeTransport } from "../../src/net/node.js";
 import type { Transport } from "../../src/engine/index.js";

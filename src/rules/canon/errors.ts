@@ -71,5 +71,5 @@ export function malformed(detail: string, path = ""): CanonError {
   return new CanonError("malformed", path, detail);
 }
 
-/** Bounds the nesting of messages that the checks, the decoder and the encoder follow (02 [ARC-46]). No message of ABPC nests half as deep. */
+/** Bounds the nesting of messages that the checks, the decoder and the encoder follow (02 [ARC-46]). No message of ABCP nests half as deep. */
 export const MAX_DEPTH = 100;

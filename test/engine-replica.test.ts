@@ -4,8 +4,8 @@
 import { describe, expect, it } from "vitest";
 import { create } from "@bufbuild/protobuf";
 import { MemoryStorage, set } from "../src/engine/index.js";
-import { HeartbeatFrameSchema, HeartbeatFrame_CursorSchema, RecordsFrameSchema, SubscribeResponseSchema } from "../src/gen/abpc/v2/sync_pb.js";
-import { ChangeKind, KeyChangeSchema, RecordKind, SystemKind } from "../src/gen/abpc/v2/types_pb.js";
+import { HeartbeatFrameSchema, HeartbeatFrame_CursorSchema, RecordsFrameSchema, SubscribeResponseSchema } from "../src/gen/abcp/v2/sync_pb.js";
+import { ChangeKind, KeyChangeSchema, RecordKind, SystemKind } from "../src/gen/abcp/v2/types_pb.js";
 import { goOffline, goOnline, kc, KS, ofType, rig, sentIds, tick, text, types, type Rig } from "./helpers/engine.js";
 
 const cursorOf = (r: Rig): bigint => r.engine.cursor(KS)?.seq ?? -1n;

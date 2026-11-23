@@ -1,11 +1,11 @@
-// The Go server as a process: built once from `server/cmd/abpc-server` into `client/.tmp/` (which keeps its own .gitignore, so that the
+// The Go server as a process: built once from `server/cmd/abcp-server` into `client/.tmp/` (which keeps its own .gitignore, so that the
 // repository's is not touched), started on a loopback port in development mode with a configuration written for the test, killed at the end.
 // The binary is deleted by the global teardown (`../global-setup.ts`).
 //
 // Without a Go toolchain the integration tests are skipped with a message (`goAvailable`, `SKIP_REASON`).
 //
-// On PostgreSQL (M7b): with ABPC_INTEGRATION_PG=1 and ABPC_PG_DSN (the DSN that scripts/pgtest.sh prints: the throwaway cluster, on its own port)
-// each server that a test starts gets two databases of its own, made for it and dropped when it is killed: the commit database and ABPC's own
+// On PostgreSQL (M7b): with ABCP_INTEGRATION_PG=1 and ABCP_PG_DSN (the DSN that scripts/pgtest.sh prints: the throwaway cluster, on its own port)
+// each server that a test starts gets two databases of its own, made for it and dropped when it is killed: the commit database and ABCP's own
 // store (`--commit-dsn` and `--own-dsn`, given through the environment). A restart of the server is then a server on two new, empty databases, as
 // it is on the in-memory store: `restart.test.ts` asserts that a client survives the loss of a store, which a restart on the same databases would
 // not make. The harness refuses a DSN that names no host or no port and the owner's port 5432: it talks to the throwaway cluster only.
@@ -21,23 +21,23 @@ import { GO_SERVER_SRC, SKIP_NEEDS_SERVER } from "../../helpers/server-dir.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 export const CLIENT_DIR = path.resolve(here, "../../..");
-// The Go server source: `$ABPC_SERVER_DIR/server` (an abpc-server checkout); without one the integration suites are skipped.
+// The Go server source: `$ABCP_SERVER_DIR/server` (an abcp-server checkout); without one the integration suites are skipped.
 export const SERVER_DIR = GO_SERVER_SRC ?? "";
 export const TMP_DIR = path.join(CLIENT_DIR, ".tmp");
-const BINARY = path.join(TMP_DIR, os.platform() === "win32" ? "abpc-server.exe" : "abpc-server");
+const BINARY = path.join(TMP_DIR, os.platform() === "win32" ? "abcp-server.exe" : "abcp-server");
 const LOCK = path.join(TMP_DIR, "build.lock");
 
 function hasGo(): boolean {
-  if (process.env["ABPC_SKIP_INTEGRATION"] === "1" || GO_SERVER_SRC === undefined) return false;
+  if (process.env["ABCP_SKIP_INTEGRATION"] === "1" || GO_SERVER_SRC === undefined) return false;
   try {
-    return spawnSync("go", ["version"], { encoding: "utf8" }).status === 0 && fs.existsSync(path.join(SERVER_DIR, "cmd", "abpc-server"));
+    return spawnSync("go", ["version"], { encoding: "utf8" }).status === 0 && fs.existsSync(path.join(SERVER_DIR, "cmd", "abcp-server"));
   } catch {
     return false;
   }
 }
 
 export const goAvailable = hasGo();
-export const SKIP_REASON = `integration tests against the Go server are skipped: ${SKIP_NEEDS_SERVER}; they also need a Go toolchain on the PATH, and ABPC_SKIP_INTEGRATION must not be 1`;
+export const SKIP_REASON = `integration tests against the Go server are skipped: ${SKIP_NEEDS_SERVER}; they also need a Go toolchain on the PATH, and ABCP_SKIP_INTEGRATION must not be 1`;
 
 /** Makes `client/.tmp/`, with a .gitignore that ignores everything in it. */
 export function ensureTmp(): void {
@@ -50,8 +50,8 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 
 // ---- the PostgreSQL store ---------------------------------------------------------------------------------------
 
-/** Whether the servers of this run use the PostgreSQL store (ABPC_INTEGRATION_PG=1). */
-export const usesPostgres = process.env["ABPC_INTEGRATION_PG"] === "1";
+/** Whether the servers of this run use the PostgreSQL store (ABCP_INTEGRATION_PG=1). */
+export const usesPostgres = process.env["ABCP_INTEGRATION_PG"] === "1";
 
 interface PgTarget {
   host: string;
@@ -60,27 +60,27 @@ interface PgTarget {
   password: string;
 }
 
-/** The throwaway cluster of ABPC_PG_DSN: an explicit host and port, and never the owner's port 5432. */
+/** The throwaway cluster of ABCP_PG_DSN: an explicit host and port, and never the owner's port 5432. */
 function pgTarget(): PgTarget {
-  const raw = process.env["ABPC_PG_DSN"];
-  if (raw === undefined || raw.trim() === "") throw new Error("ABPC_INTEGRATION_PG=1 needs ABPC_PG_DSN: run scripts/pgtest.sh start and export the DSN it prints");
+  const raw = process.env["ABCP_PG_DSN"];
+  if (raw === undefined || raw.trim() === "") throw new Error("ABCP_INTEGRATION_PG=1 needs ABCP_PG_DSN: run scripts/pgtest.sh start and export the DSN it prints");
   let u: URL;
   try {
     u = new URL(raw);
   } catch {
-    throw new Error("ABPC_PG_DSN is not a postgres:// URL");
+    throw new Error("ABCP_PG_DSN is not a postgres:// URL");
   }
-  if (u.protocol !== "postgres:" && u.protocol !== "postgresql:") throw new Error("ABPC_PG_DSN is not a postgres:// URL");
-  if (u.hostname === "" || u.port === "") throw new Error("ABPC_PG_DSN names no host or no port: refusing to let the environment pick the server");
-  if (Number(u.port) === 5432) throw new Error("ABPC_PG_DSN names port 5432, the owner's server: refusing");
+  if (u.protocol !== "postgres:" && u.protocol !== "postgresql:") throw new Error("ABCP_PG_DSN is not a postgres:// URL");
+  if (u.hostname === "" || u.port === "") throw new Error("ABCP_PG_DSN names no host or no port: refusing to let the environment pick the server");
+  if (Number(u.port) === 5432) throw new Error("ABCP_PG_DSN names port 5432, the owner's server: refusing");
   for (const k of ["host", "port", "hostaddr", "service"]) {
-    if (u.searchParams.has(k)) throw new Error(`ABPC_PG_DSN has a "${k}" parameter: refusing`);
+    if (u.searchParams.has(k)) throw new Error(`ABCP_PG_DSN has a "${k}" parameter: refusing`);
   }
   return { host: u.hostname, port: u.port, user: decodeURIComponent(u.username) || "postgres", password: decodeURIComponent(u.password) };
 }
 
 function psqlBinary(): string {
-  const dir = process.env["ABPC_PGTEST_BIN"] ?? (os.platform() === "win32" ? "C:\\Program Files\\PostgreSQL\\18\\bin" : "/usr/lib/postgresql/18/bin");
+  const dir = process.env["ABCP_PGTEST_BIN"] ?? (os.platform() === "win32" ? "C:\\Program Files\\PostgreSQL\\18\\bin" : "/usr/lib/postgresql/18/bin");
   return path.join(dir, os.platform() === "win32" ? "psql.exe" : "psql");
 }
 
@@ -107,16 +107,16 @@ interface PgDatabases {
   drop(): void;
 }
 
-/** Makes the commit database and ABPC's own store of one server, empty. */
+/** Makes the commit database and ABCP's own store of one server, empty. */
 function makeDatabases(): PgDatabases {
   const t = pgTarget();
-  const id = `abpc_it_${process.pid}_${++dbCounter}_${Math.random().toString(36).slice(2, 8)}`;
+  const id = `abcp_it_${process.pid}_${++dbCounter}_${Math.random().toString(36).slice(2, 8)}`;
   const names = [`${id}_c`, `${id}_o`] as const;
   for (const n of names) pgExec(`CREATE DATABASE ${n}`);
   const auth = encodeURIComponent(t.user) + (t.password !== "" ? `:${encodeURIComponent(t.password)}` : "");
   const dsn = (db: string): string => `postgres://${auth}@${t.host}:${t.port}/${db}?sslmode=disable`;
   return {
-    env: { ABPC_COMMIT_DSN: dsn(names[0]), ABPC_OWN_DSN: dsn(names[1]) },
+    env: { ABCP_COMMIT_DSN: dsn(names[0]), ABCP_OWN_DSN: dsn(names[1]) },
     drop: () => {
       for (const n of names) {
         try {
@@ -133,7 +133,7 @@ function makeDatabases(): PgDatabases {
 export let builtFrom: "worktree" | "head" | undefined;
 
 function goBuild(cwd: string): { ok: boolean; output: string } {
-  const r = spawnSync("go", ["build", "-o", BINARY, "./cmd/abpc-server"], { cwd, encoding: "utf8", timeout: 5 * 60_000 });
+  const r = spawnSync("go", ["build", "-o", BINARY, "./cmd/abcp-server"], { cwd, encoding: "utf8", timeout: 5 * 60_000 });
   return { ok: r.status === 0, output: `${r.stdout}
 ${r.stderr}` };
 }
@@ -167,7 +167,7 @@ const BUILD_PATIENCE_MS = 8 * 60_000;
  * The path of the server binary, built on the first call of the run: the test files run in parallel, so the build is under a lock that the
  * others wait on. The working tree is built. When it does not build at the moment (another builder is in the middle of an edit of the server),
  * the build is tried again every 20 s for up to 8 minutes, and then fails with the compiler's words: the server is never edited from here, and
- * the committed tree is built only when ABPC_SERVER_SOURCE=head asks for it.
+ * the committed tree is built only when ABCP_SERVER_SOURCE=head asks for it.
  */
 export async function serverBinary(): Promise<string> {
   ensureTmp();
@@ -189,7 +189,7 @@ export async function serverBinary(): Promise<string> {
     if (mine) {
       try {
         if (!fs.existsSync(BINARY)) {
-          if (process.env["ABPC_SERVER_SOURCE"] === "head") {
+          if (process.env["ABCP_SERVER_SOURCE"] === "head") {
             const r = buildFromHead();
             if (!r.ok) throw new Error(`go build of the server (git HEAD) failed:
 ${r.output}`);
@@ -349,7 +349,7 @@ export async function startServer(o: ServerOptions): Promise<ServerProcess> {
       pg?.drop();
       throw new Error(`the server exited (${exited}) before it listened:\n${log}`);
     }
-    if (log.includes("abpc-server listening")) break;
+    if (log.includes("abcp-server listening")) break;
     if (Date.now() > deadline) {
       child.kill();
       await Promise.race([new Promise<void>((r) => child.once("exit", () => r())), sleep(5000)]);

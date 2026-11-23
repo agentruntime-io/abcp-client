@@ -5,7 +5,7 @@
 
 import { describe, expect, it } from "vitest";
 import { LocalRefusal, cas, jsonBytes, set } from "../src/engine/index.js";
-import { RecordKind, SystemKind } from "../src/gen/abpc/v2/types_pb.js";
+import { RecordKind, SystemKind } from "../src/gen/abcp/v2/types_pb.js";
 import { parse, validate } from "../src/rules/jsonv1/index.js";
 import { kc, KS, ofType, rig, text } from "./helpers/engine.js";
 

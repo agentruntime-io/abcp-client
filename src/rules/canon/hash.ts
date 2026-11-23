@@ -8,7 +8,7 @@ import type { DescField, DescMessage, Message } from "@bufbuild/protobuf";
 import type { ReflectMessage } from "@bufbuild/protobuf/reflect";
 import { ByteWriter, concat } from "../bytes.js";
 import { hmacSha256, sha256 } from "../crypto.js";
-import { MutationSchema } from "../../gen/abpc/v2/sync_pb.js";
+import { MutationSchema } from "../../gen/abcp/v2/sync_pb.js";
 import {
   ChangeKind,
   KeyChangeSchema,
@@ -17,17 +17,17 @@ import {
   type KeyChange,
   type KeyEntry,
   type Record as RecordMessage,
-} from "../../gen/abpc/v2/types_pb.js";
+} from "../../gen/abcp/v2/types_pb.js";
 import { type EncodeView, encode } from "./encode.js";
 
-const MUTATION = "abpc.v2.Mutation";
-const KEY_CHANGE = "abpc.v2.KeyChange";
-const RECORD = "abpc.v2.Record";
-const OWNER_CONTACT = "abpc.v2.OwnerContact";
-const REDACT_REQUEST = "abpc.v2.RedactRequest";
+const MUTATION = "abcp.v2.Mutation";
+const KEY_CHANGE = "abcp.v2.KeyChange";
+const RECORD = "abcp.v2.Record";
+const OWNER_CONTACT = "abcp.v2.OwnerContact";
+const REDACT_REQUEST = "abcp.v2.RedactRequest";
 /** A rule of a `SplitKeyspaceRequest` and a successor of an `ArchiveKeyspaceRequest` (the one request that holds a SuccessorRule): 12 [ADM-94] clears their `prefix`. */
-const SPLIT_RULE = "abpc.v2.SplitRule";
-const SUCCESSOR_RULE = "abpc.v2.SuccessorRule";
+const SPLIT_RULE = "abcp.v2.SplitRule";
+const SUCCESSOR_RULE = "abcp.v2.SuccessorRule";
 /** ChangeKind `OVERRIDE` (types.proto), compared by number so that a dynamic type works too. */
 const OVERRIDE_KIND = ChangeKind.OVERRIDE;
 
@@ -59,7 +59,7 @@ export function contentHashInput(m: Message, schema: DescMessage = MutationSchem
 /**
  * The content hash of an action (07 [MUT-45]): HMAC-SHA-256, under the app's content-hash key, of `contentHashInput`. The
  * hash of a message that arrived in the JSON codec is the hash of the same message that arrived in the binary codec, since
- * both are taken on the canonical binary form (02 [ARC-61]). `key` is the per-app key that only ABPC holds, distinct from
+ * both are taken on the canonical binary form (02 [ARC-61]). `key` is the per-app key that only ABCP holds, distinct from
  * the record MAC key (06 [LOG-73]); an empty key is refused with a RangeError.
  */
 export function contentHash(m: Message, key: Uint8Array, schema: DescMessage = MutationSchema): Uint8Array {
@@ -255,7 +255,7 @@ const requestView = requestViewFor();
  * (07 [MUT-45]). An entry that has no request, and one of a request that was refused before it could be decoded (02
  * [ARC-61]), carries an empty digest, which this function is not for.
  *
- * For the audit entry of a `Mutate/abpc.Override`, m is the override's Mutation and `personal` says whether a key matches a
+ * For the audit entry of a `Mutate/abcp.Override`, m is the override's Mutation and `personal` says whether a key matches a
  * template that is `personal` in the manifest version in force for the keyspace at the commit, the version under which 07
  * Table 7-2 item 3 judges the override and that the override's record carries as `manifest_version` (06 [LOG-8]; the
  * keyspace's effective version); the key of each `OVERRIDE` change for which it holds is cleared with the value fields,

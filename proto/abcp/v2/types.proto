@@ -1,4 +1,4 @@
-// ABPC v2.0 — shared types. Normative together with the spec chapters (spec/README.md).
+// ABCP v2.0 — shared types. Normative together with the spec chapters (spec/README.md).
 // Field numbers are frozen at v2.0; later additions follow spec/15-compatibility.md.
 // Every enum's 0 value means "unknown" to a reader; spec/15 marks each enum closed or open, with the reaction to a
 // value a reader does not know. Hashes cover unknown fields as received (spec/07 [MUT-45]).
@@ -7,7 +7,7 @@
 // the range that spec/02 [ARC-61] gives, so that both codecs carry every message.
 syntax = "proto3";
 
-package abpc.v2;
+package abcp.v2;
 
 import "google/protobuf/timestamp.proto";
 
@@ -41,7 +41,7 @@ enum ChangeKind {
   CHANGE_KIND_INCR = 3;         // counter templates only
   CHANGE_KIND_CAS = 4;          // cas templates: set if `expected` matches (cas templates accept CAS, DELETE, OVERRIDE)
   CHANGE_KIND_CRDT_UPDATE = 5;  // crdt templates only; opaque update in `update`
-  CHANGE_KIND_OVERRIDE = 6;     // admin-issuer principals with override:<template>, op type abpc.Override (spec/12 §12.8);
+  CHANGE_KIND_OVERRIDE = 6;     // admin-issuer principals with override:<template>, op type abcp.Override (spec/12 §12.8);
                     // a CRDT override carries `update` (a normal CRDT transaction)
 }
 
@@ -330,7 +330,7 @@ message Provenance {
   string gate_host = 2;
   string gate_build = 3;
   Principal gate_principal = 4;   // the principal that decided, or unset, in each case as spec/06 [LOG-34] says; for a
-                                  // policy host, the identity that ABPC verified (spec/08 [GATE-30])
+                                  // policy host, the identity that ABCP verified (spec/08 [GATE-30])
 }
 
 message Decision {
@@ -397,7 +397,7 @@ message Record {
   repeated string required_features = 10;       // the record's required features, each once, in increasing byte order,
                                                 // as spec/06 [LOG-9] gives them
   // OP: the action's changes. INTENT: the requested changes (not applied) plus the pending-row change;
-  // only the abpc.intent/{id} change is applied. DECISION COMMITTED: the requested changes, then the gate's
+  // only the abcp.intent/{id} change is applied. DECISION COMMITTED: the requested changes, then the gate's
   // effects, then the intent-row update, all applied; with log_intent false, no intent-row update. DECISION
   // REJECTED: only the intent-row update, applied; with log_intent false, the requested changes, for audit,
   // not applied (spec/06 [LOG-32]). SYSTEM: the changes it applies (spec/06).
@@ -476,7 +476,7 @@ message KeyspaceCursor {
 }
 
 message ServerInfo {
-  string protocol_name = 1;          // "abpc.v2" (spec/15 [COMPAT-1])
+  string protocol_name = 1;          // "abcp.v2" (spec/15 [COMPAT-1])
   string revision = 2;               // at most 256 octets, no U+0000, as host.proto DescribeResponse.build
   repeated string features = 3;
   string build = 4;                  // at most 256 octets, no U+0000, as host.proto DescribeResponse.build (spec/06 [LOG-34])

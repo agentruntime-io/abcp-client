@@ -4,8 +4,8 @@
 import { create } from "@bufbuild/protobuf";
 import { StaticManifests, type EngineEvent, type PresenceEvent, type StaticManifestSpec } from "../../src/engine/index.js";
 import { FakeServer, ManualClock } from "../../src/fake/index.js";
-import { PresenceFrameSchema, PresenceEntrySchema, SubscribeResponseSchema, type PublishPresenceRequest } from "../../src/gen/abpc/v2/sync_pb.js";
-import { PrincipalSchema } from "../../src/gen/abpc/v2/types_pb.js";
+import { PresenceFrameSchema, PresenceEntrySchema, SubscribeResponseSchema, type PublishPresenceRequest } from "../../src/gen/abcp/v2/sync_pb.js";
+import { PrincipalSchema } from "../../src/gen/abcp/v2/types_pb.js";
 import { timestampFromMs } from "@bufbuild/protobuf/wkt";
 import { jsonBytes } from "../../src/engine/index.js";
 import { parse } from "../../src/rules/jsonv1/index.js";

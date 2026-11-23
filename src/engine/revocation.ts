@@ -34,8 +34,8 @@
 // the restore would apply it twice; (2) is asked about, with the new token that a revoked subject resumes with, and ends as [CLI-7] and [CLI-83] say;
 // until then it stays in the outbox, never sent.
 
-import type { GetMutationResultResponse } from "../gen/abpc/v2/sync_pb.js";
-import { Code, DecisionStatus, ErrorClass } from "../gen/abpc/v2/types_pb.js";
+import type { GetMutationResultResponse } from "../gen/abcp/v2/sync_pb.js";
+import { Code, DecisionStatus, ErrorClass } from "../gen/abcp/v2/types_pb.js";
 import { resendDelay } from "./backoff.js";
 import { makeReject } from "./endings.js";
 import { RpcError } from "./errors.js";
@@ -301,7 +301,7 @@ export abstract class RevocationLayer extends SagaLayer {
       (async () => {
         let resp: GetMutationResultResponse;
         try {
-          resp = await this.transport.getMutationResult({ $typeName: "abpc.v2.GetMutationResultRequest", keyspaceId: e.keyspaceId, mutationId: e.mutationId });
+          resp = await this.transport.getMutationResult({ $typeName: "abcp.v2.GetMutationResultRequest", keyspaceId: e.keyspaceId, mutationId: e.mutationId });
         } catch (err) {
           this.noteRevoked(err);
           await this.run(() => {
@@ -487,7 +487,7 @@ export abstract class RevocationLayer extends SagaLayer {
   private async sendRefreshSession(): Promise<void> {
     let resp;
     try {
-      resp = await this.transport.refreshSession({ $typeName: "abpc.v2.RefreshSessionRequest", sessionId: this.sessionId() });
+      resp = await this.transport.refreshSession({ $typeName: "abcp.v2.RefreshSessionRequest", sessionId: this.sessionId() });
     } catch (e) {
       if (this.noteRevoked(e)) return;
       if (e instanceof RpcError && e.status === "Unauthenticated") {

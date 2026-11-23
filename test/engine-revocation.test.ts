@@ -3,7 +3,7 @@
 
 import { describe, expect, it } from "vitest";
 import { LocalRefusal, set, type ExportRecord } from "../src/engine/index.js";
-import { Code, RetryReason } from "../src/gen/abpc/v2/types_pb.js";
+import { Code, RetryReason } from "../src/gen/abcp/v2/types_pb.js";
 import { reject as mk, type FakeTransport } from "../src/fake/index.js";
 import { kc, KS, mutateRequests, ofType, rejectResult, retryResult, rig, sentIds, tick, types, type Rig } from "./helpers/engine.js";
 import { settleAll, tabsRig, typesOf } from "./helpers/tabs.js";

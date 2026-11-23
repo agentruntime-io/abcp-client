@@ -43,7 +43,7 @@ import type {
   SubscribeResponse,
   UpdateSubscriptionRequest,
   UpdateSubscriptionResponse,
-} from "../gen/abpc/v2/sync_pb.js";
+} from "../gen/abcp/v2/sync_pb.js";
 
 export interface CallOptions {
   /** Aborts the call (and ends a `Subscribe` stream). */

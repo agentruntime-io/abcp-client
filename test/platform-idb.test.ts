@@ -5,7 +5,7 @@
 import { create } from "@bufbuild/protobuf";
 import { describe, expect, it } from "vitest";
 import { StoreFull, type DeadLetterEntry, type OutboxEntry, type ReplicaHead } from "../src/engine/index.js";
-import { KeyEntrySchema, RecordSchema } from "../src/gen/abpc/v2/types_pb.js";
+import { KeyEntrySchema, RecordSchema } from "../src/gen/abcp/v2/types_pb.js";
 import { IndexedDbStorage, IndexedDbStorageProvider } from "../src/platform/idb-storage.js";
 import { FakeIDBFactory, FakeKeyRange } from "./helpers/fake-idb.js";
 
@@ -132,7 +132,7 @@ describe("V19 SHOULD-8: a sign-out is not kept waiting by another tab that holds
     const a = (await tabA.open(key)) as IndexedDbStorage;
     const b = (await tabB.open(key)) as IndexedDbStorage;
     await a.commit([{ op: "putEntry", entry: entry("a") }]);
-    const name = [...f.dbs.keys()].find((k) => k !== "abpc:registry") as string;
+    const name = [...f.dbs.keys()].find((k) => k !== "abcp:registry") as string;
     await tabA.destroy(key); // resolves: B yielded
     expect(f.dbs.has(name)).toBe(false);
     expect(await tabA.list("o", "a")).toEqual([]);
@@ -149,7 +149,7 @@ describe("V19 SHOULD-8: a sign-out is not kept waiting by another tab that holds
     const f = new FakeIDBFactory();
     const tabA = new IndexedDbStorageProvider(f, {}, undefined, { blockedWaitMs: 20 });
     await tabA.open(key);
-    const name = [...f.dbs.keys()].find((k) => k !== "abpc:registry") as string;
+    const name = [...f.dbs.keys()].find((k) => k !== "abcp:registry") as string;
     const stubborn = f.open(name);
     const conn = await new Promise<{ close(): void; onversionchange?: unknown }>((resolve) => {
       stubborn.onsuccess = (): void => resolve(stubborn.result);

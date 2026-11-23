@@ -3,7 +3,7 @@
 import { describe, expect, it } from "vitest";
 import { LocalRefusal, MemoryStorage, set, type EngineEvent } from "../src/engine/index.js";
 import { decodeContent, encodeContent } from "../src/engine/entry.js";
-import { Code, RetryReason } from "../src/gen/abpc/v2/types_pb.js";
+import { Code, RetryReason } from "../src/gen/abcp/v2/types_pb.js";
 import { reject as mk } from "../src/fake/index.js";
 import { goOffline, goOnline, kc, KS, mutateRequests, ofType, rejectResult, retryResult, rig, tick, types } from "./helpers/engine.js";
 

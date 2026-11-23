@@ -25,8 +25,8 @@ import {
   type DeleteBlobRequest,
   type GetBlobRequest,
   type GetBlobResponse,
-} from "../gen/abpc/v2/sync_pb.js";
-import { Code, ErrorClass, RejectSchema, RetryReason, RetrySchema, type Reject, type Retry } from "../gen/abpc/v2/types_pb.js";
+} from "../gen/abcp/v2/sync_pb.js";
+import { Code, ErrorClass, RejectSchema, RetryReason, RetrySchema, type Reject, type Retry } from "../gen/abcp/v2/types_pb.js";
 import type { BlobHttp } from "../engine/blob-store.js";
 import type { Clock } from "../engine/clock.js";
 import { DEFAULT_CLASS } from "../engine/codes.js";

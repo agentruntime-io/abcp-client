@@ -4,7 +4,7 @@
 
 import { describe, expect, it } from "vitest";
 import { MemoryStorage, set, StorageError, type ExportRecord } from "../src/engine/index.js";
-import { RetryReason } from "../src/gen/abpc/v2/types_pb.js";
+import { RetryReason } from "../src/gen/abcp/v2/types_pb.js";
 import type { FakeTransport } from "../src/fake/index.js";
 import { kc, KS, mutateRequests, ofType, retryResult, rig, tick, types, type Rig } from "./helpers/engine.js";
 

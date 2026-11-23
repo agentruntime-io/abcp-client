@@ -2,9 +2,9 @@
 
 import { create } from "@bufbuild/protobuf";
 import { timestampFromMs } from "@bufbuild/protobuf/wkt";
-import { CasExpectSchema, ChangeKind, KeyChangeSchema, PreconditionSchema, type KeyChange, type Precondition } from "../gen/abpc/v2/types_pb.js";
-import { Lane } from "../gen/abpc/v2/types_pb.js";
-import { MutationSchema, type Mutation } from "../gen/abpc/v2/sync_pb.js";
+import { CasExpectSchema, ChangeKind, KeyChangeSchema, PreconditionSchema, type KeyChange, type Precondition } from "../gen/abcp/v2/types_pb.js";
+import { Lane } from "../gen/abcp/v2/types_pb.js";
+import { MutationSchema, type Mutation } from "../gen/abcp/v2/sync_pb.js";
 import { isReservedKey, type Rule } from "../rules/fold/index.js";
 import { isBlobId } from "./blob-store.js";
 import { checkJsonV1Bytes } from "./changes.js";
@@ -98,19 +98,19 @@ function precondition(p: PreconditionInput, facts: ConfirmedFacts): Precondition
   return create(PreconditionSchema, { ...(target !== undefined ? { target } : {}), check, logEpoch: facts.loaded ? facts.logEpoch : 0 });
 }
 
-/** The one feature of v2.0's registry (15 Table 15.1): the `abpc.escrow.v1` module. */
+/** The one feature of v2.0's registry (15 Table 15.1): the `abcp.escrow.v1` module. */
 const ESCROW_FEATURE = "escrow.v1";
 
 /**
  * The features that an action of the op type depends on, which `Mutation.required_features` lists (15 [COMPAT-8]): `escrow.v1` for an op type of the
- * escrow module (`abpc.escrow.v1.Grant`, `.Return`), which writes the module's templates, and for a spend op type, which is an op type of an escrow class
+ * escrow module (`abcp.escrow.v1.Grant`, `.Return`), which writes the module's templates, and for a spend op type, which is an op type of an escrow class
  * (15 [COMPAT-34], 11 [COORD-84]); a server refuses a write to a feature-gated template whose feature the mutation does not list with `UPGRADE_REQUIRED`
  * (07 Table 7-4 sub-step 6, 15 [COMPAT-10]). A manifest that declares such an op type requires the feature (15 [COMPAT-12]), so the id is in the
  * manifest's required set (07 Table 7-3 item 8). v2.0 has no advisory field (15 [COMPAT-19]), whose feature would go in `supported_features` alone, which
  * the engine sends on every request; an op type of another module, or of the app, depends on no feature.
  */
 export function requiredFeaturesOf(op: OpTypeInfo): string[] {
-  return op.spend || op.name.startsWith("abpc.escrow.v1.") ? [ESCROW_FEATURE] : [];
+  return op.spend || op.name.startsWith("abcp.escrow.v1.") ? [ESCROW_FEATURE] : [];
 }
 
 /**

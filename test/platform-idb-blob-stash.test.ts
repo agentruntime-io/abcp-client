@@ -17,7 +17,7 @@ async function blob(id: string, n: number, ks = "ks1", seed = 7): Promise<Staged
   return { keyspaceId: ks, blobId: id, bytes, sha256: await digestSha256(bytes), size: n, contentType: "text/plain", stagedAtMs: 12345 };
 }
 const rowsOf = (f: FakeIDBFactory, db: string, store: string): string[] => [...(f.dbs.get(db)?.stores.get(store)?.keys() ?? [])].map((k) => k.replace("\u0000", "\\0"));
-const blobDbs = (f: FakeIDBFactory): string[] => [...f.dbs.keys()].filter((k) => k.startsWith("abpc-blobs:"));
+const blobDbs = (f: FakeIDBFactory): string[] => [...f.dbs.keys()].filter((k) => k.startsWith("abcp-blobs:"));
 
 describe("09 [READ-94]: IndexedDbBlobStash keeps the bytes of the blobs that actions name, in IndexedDB", () => {
   it("put, get, has, list and delete; another instance on the database (a reload) reads the same", async () => {
@@ -162,7 +162,7 @@ describe("V19 SHOULD-8, 14 [CLI-65]: the stash yields to another tab's deletion 
     });
     conn.onversionchange = null; // never closes
     await expect(tabA.destroy(KEY)).rejects.toThrow(/keeps the database .* open/);
-    expect(f.dbs.has("abpc:" + [KEY.origin, KEY.appId, KEY.partition].join("\u0000"))).toBe(false); // the partition's own database went: the blobs' failure did not stop it
+    expect(f.dbs.has("abcp:" + [KEY.origin, KEY.appId, KEY.partition].join("\u0000"))).toBe(false); // the partition's own database went: the blobs' failure did not stop it
     conn.close(); // the other tab goes away: the deletion that the browser kept pending goes through
     await new Promise((r) => setTimeout(r, 0));
     expect(blobDbs(f)).toEqual([]);

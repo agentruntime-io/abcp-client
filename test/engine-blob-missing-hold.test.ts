@@ -10,8 +10,8 @@ import { create } from "@bufbuild/protobuf";
 import { describe, expect, it } from "vitest";
 import { digestSha256, set } from "../src/engine/index.js";
 import { reject as mk } from "../src/fake/index.js";
-import { CommitBlobRequestSchema, CreateUploadRequestSchema } from "../src/gen/abpc/v2/sync_pb.js";
-import { Code } from "../src/gen/abpc/v2/types_pb.js";
+import { CommitBlobRequestSchema, CreateUploadRequestSchema } from "../src/gen/abcp/v2/sync_pb.js";
+import { Code } from "../src/gen/abcp/v2/types_pb.js";
 import { KS, ofType, rejectResult, type Rig } from "./helpers/engine.js";
 import { brig, bytesOf, until } from "./helpers/presence.js";
 

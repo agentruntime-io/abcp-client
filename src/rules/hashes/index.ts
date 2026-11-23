@@ -51,7 +51,7 @@ export function keyStateHash(k: KeyState): Uint8Array {
 }
 
 /**
- * The keyspace state hash (05 [STATE-41]): SHA-256 over the per-key state hashes of all present keys, reserved `abpc.*`
+ * The keyspace state hash (05 [STATE-41]): SHA-256 over the per-key state hashes of all present keys, reserved `abcp.*`
  * keys included, concatenated in ascending byte order of the keys; for a keyspace with no present key, the SHA-256 of the
  * empty string. `keys` may come in any order and is not changed; each key must occur once.
  */

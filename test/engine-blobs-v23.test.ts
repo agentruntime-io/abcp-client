@@ -109,7 +109,7 @@ describe("V23 SHOULD-3, 09 [READ-94], 14 [CLI-44], [CLI-45]: a staged entry whos
 describe("V23 SHOULD-4, 09 [READ-94]: the file stash flushes its directory after the rename, as the outbox's storage does", () => {
   let dir: string;
   beforeEach(() => {
-    dir = mkdtempSync(path.join(tmpdir(), "abpc-stash-"));
+    dir = mkdtempSync(path.join(tmpdir(), "abcp-stash-"));
     syncs.length = 0;
   });
   afterEach(() => {

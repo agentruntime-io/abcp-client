@@ -6,9 +6,9 @@ import { create } from "@bufbuild/protobuf";
 import { describe, expect, it } from "vitest";
 import * as Y from "yjs";
 import { StaticManifests } from "../src/engine/index.js";
-import { ChangeKind, KeyChangeSchema } from "../src/gen/abpc/v2/types_pb.js";
+import { ChangeKind, KeyChangeSchema } from "../src/gen/abcp/v2/types_pb.js";
 import { reject as mk } from "../src/fake/index.js";
-import { Code } from "../src/gen/abpc/v2/types_pb.js";
+import { Code } from "../src/gen/abcp/v2/types_pb.js";
 import { KS, MANIFEST, rejectResult, rig, types, type Rig } from "./helpers/engine.js";
 
 const KEY = "docs/d1";

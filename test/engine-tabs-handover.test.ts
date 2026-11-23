@@ -7,12 +7,12 @@
 import { describe, expect, it } from "vitest";
 import { LocalRefusal, set, type Engine, type EngineEvent, type MemoryStorage } from "../src/engine/index.js";
 import { COMMAND_TIMEOUT_MS, HANDOVER_PROBE_MS } from "../src/engine/index.js";
-import type { MutateRequestSchema } from "../src/gen/abpc/v2/sync_pb.js";
+import type { MutateRequestSchema } from "../src/gen/abcp/v2/sync_pb.js";
 import type { create } from "@bufbuild/protobuf";
 import { KS } from "./helpers/engine.js";
 import { ORIGIN, settleAll, tabsRig, typesOf, type TabsRig } from "./helpers/tabs.js";
 
-const LOCK = `abpc.flusher\u0000${ORIGIN}\u0000app\u0000https://issuer.test|ana`;
+const LOCK = `abcp.flusher\u0000${ORIGIN}\u0000app\u0000https://issuer.test|ana`;
 const setA = (key = "settings/a", v: unknown = 1): { keyspaceId: string; opType: string; changes: ReturnType<typeof set>[] } => ({ keyspaceId: KS, opType: "Set", changes: [set(key, v)] });
 const mutates = (r: TabsRig): ReturnType<typeof create<typeof MutateRequestSchema>>[] => r.server.calls.filter((c) => c.method === "mutate").map((c) => c.request as never);
 const sendersOf = (r: TabsRig, id: string): string[] => mutates(r).flatMap((q) => q.mutations.filter((m) => m.mutationId === id).map((m) => m.clientId));

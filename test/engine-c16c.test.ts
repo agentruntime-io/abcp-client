@@ -7,8 +7,8 @@
 import { create } from "@bufbuild/protobuf";
 import { describe, expect, it } from "vitest";
 import { set, StaticManifests, type StaticManifestSpec } from "../src/engine/index.js";
-import { ChangeKind, KeyChangeSchema } from "../src/gen/abpc/v2/types_pb.js";
-import { SubscribeRequestSchema } from "../src/gen/abpc/v2/sync_pb.js";
+import { ChangeKind, KeyChangeSchema } from "../src/gen/abcp/v2/types_pb.js";
+import { SubscribeRequestSchema } from "../src/gen/abcp/v2/sync_pb.js";
 import { encodeMessage } from "../src/engine/wire.js";
 import { KS, MANIFEST, kc, mutateRequests, ofType, rig, tick, type Rig } from "./helpers/engine.js";
 
@@ -51,17 +51,17 @@ describe("02 [ARC-63]: a `Mutation` over 2,000 changes is refused by a server be
 });
 
 describe("15 [COMPAT-8], [COMPAT-34], 07 Table 7-4 sub-step 6: a mutation lists `required_features` for the feature that its op type depends on", () => {
-  const spec: StaticManifestSpec = { ...MANIFEST, opTypes: { ...MANIFEST.opTypes, "abpc.escrow.v1.Grant": { lane: "GATED" }, "abpc.lease.v1.Acquire": { lane: "GATED" } } };
+  const spec: StaticManifestSpec = { ...MANIFEST, opTypes: { ...MANIFEST.opTypes, "abcp.escrow.v1.Grant": { lane: "GATED" }, "abcp.lease.v1.Acquire": { lane: "GATED" } } };
   const featuresOf = (r: Rig): Record<string, string[]> => Object.fromEntries(mutateRequests(r).flatMap((q) => q.mutations.map((m) => [m.opType, [...m.requiredFeatures]] as const)));
 
   it("an op type of the escrow module, and a spend op type, list `escrow.v1`; any other op type lists none", async () => {
     const r = await rig({ manifests: new StaticManifests(spec) });
     await r.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/a", 1)] });
     await r.engine.submit({ keyspaceId: KS, opType: "Pay", changes: [set("settings/p", 1)] });
-    await r.engine.submit({ keyspaceId: KS, opType: "abpc.escrow.v1.Grant", changes: [set("settings/g", 1)] });
-    await r.engine.submit({ keyspaceId: KS, opType: "abpc.lease.v1.Acquire", changes: [set("settings/l", 1)] });
+    await r.engine.submit({ keyspaceId: KS, opType: "abcp.escrow.v1.Grant", changes: [set("settings/g", 1)] });
+    await r.engine.submit({ keyspaceId: KS, opType: "abcp.lease.v1.Acquire", changes: [set("settings/l", 1)] });
     await r.engine.settle();
-    expect(featuresOf(r)).toEqual({ Set: [], Pay: ["escrow.v1"], "abpc.escrow.v1.Grant": ["escrow.v1"], "abpc.lease.v1.Acquire": [] });
+    expect(featuresOf(r)).toEqual({ Set: [], Pay: ["escrow.v1"], "abcp.escrow.v1.Grant": ["escrow.v1"], "abcp.lease.v1.Acquire": [] });
   });
 
   it("the feature is also in the request's `supported_features`, which the same request carries (07 Table 7-3 item 3)", async () => {

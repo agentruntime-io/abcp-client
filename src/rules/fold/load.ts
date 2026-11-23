@@ -1,7 +1,7 @@
 // Installing the entries of a load (09 [READ-9], [READ-13], [READ-18]) into the confirmed state: a key with its value, a key in
 // the redacted state, or a tombstone. A load is the other source of confirmed state besides records (14 [CLI-2]).
 
-import type { KeyEntry } from "../../gen/abpc/v2/types_pb.js";
+import type { KeyEntry } from "../../gen/abcp/v2/types_pb.js";
 import { CrdtError, Doc, parseUpdate } from "../crdt/index.js";
 import { COUNTER_ENCODING, REDACTED_ENCODING } from "../hashes/index.js";
 import { refuse } from "./errors.js";

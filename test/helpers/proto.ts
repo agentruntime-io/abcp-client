@@ -22,14 +22,14 @@ import {
   type FileDescriptorProto,
 } from "@bufbuild/protobuf/wkt";
 import { reflect, type ReflectList, type ReflectMap, type ReflectMessage } from "@bufbuild/protobuf/reflect";
-import { file_abpc_v2_admin } from "../../src/gen/abpc/v2/admin_pb.js";
-import { file_abpc_v2_host } from "../../src/gen/abpc/v2/host_pb.js";
-import { file_abpc_v2_sync } from "../../src/gen/abpc/v2/sync_pb.js";
-import { file_abpc_v2_types } from "../../src/gen/abpc/v2/types_pb.js";
+import { file_abcp_v2_admin } from "../../src/gen/abcp/v2/admin_pb.js";
+import { file_abcp_v2_host } from "../../src/gen/abcp/v2/host_pb.js";
+import { file_abcp_v2_sync } from "../../src/gen/abcp/v2/sync_pb.js";
+import { file_abcp_v2_types } from "../../src/gen/abcp/v2/types_pb.js";
 import { fromHex } from "../../src/rules/bytes.js";
 import { expandBytes } from "./vectors.js";
 
-export const registry: Registry = createRegistry(file_abpc_v2_types, file_abpc_v2_sync, file_abpc_v2_admin, file_abpc_v2_host);
+export const registry: Registry = createRegistry(file_abcp_v2_types, file_abcp_v2_sync, file_abcp_v2_admin, file_abcp_v2_host);
 
 export function messageDesc(name: string, reg: Registry = registry): DescMessage {
   const d = reg.getMessage(name);

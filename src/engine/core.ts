@@ -8,8 +8,8 @@
 // hook of the app that is awaited outside the queue may call the API.
 
 import { create } from "@bufbuild/protobuf";
-import { type AppLimits, type KeyChange, KeyChangeSchema } from "../gen/abpc/v2/types_pb.js";
-import type { Mutation } from "../gen/abpc/v2/sync_pb.js";
+import { type AppLimits, type KeyChange, KeyChangeSchema } from "../gen/abcp/v2/types_pb.js";
+import type { Mutation } from "../gen/abcp/v2/sync_pb.js";
 import { VersionTopology, DEFAULT_FEATURES } from "../rules/fold/index.js";
 import { BoundedSet, pushBounded } from "./bounded.js";
 import { DEFAULT_BLOB_CACHE_BYTES, DEFAULT_MAX_DOWNLOAD_BYTES, DEFAULT_MAX_STAGED_BYTES, DEFAULT_TRANSFER_TIMEOUT, fetchBlobHttp, MemoryBlobStash, type BlobHttp, type BlobStash } from "./blob-store.js";
@@ -52,7 +52,7 @@ import type {
   Predictor,
   TokenProvider,
 } from "./types.js";
-import { ChangeKind } from "../gen/abpc/v2/types_pb.js";
+import { ChangeKind } from "../gen/abcp/v2/types_pb.js";
 
 const INTERNAL_ERRORS_KEPT = 100;
 /** How many of its own client ids an engine remembers: an engine mints one at each start, handover and fork, which are rare. */

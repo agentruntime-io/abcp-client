@@ -1,9 +1,9 @@
-// The scriptable fake server of 17 [CONF-4]: an in-memory ABPC v2 server that the client suites run against. It keeps keyspaces
+// The scriptable fake server of 17 [CONF-4]: an in-memory ABCP v2 server that the client suites run against. It keeps keyspaces
 // as the fold of C1 defines them (it reuses `rules/fold` for its own state), appends OP, INTENT, DECISION and SYSTEM records,
 // binds mutation ids and lane slots as 07 §7.4 and §7.6 say, answers results, streams records and heartbeats, and lets a test
 //
 //  - drop, reorder, duplicate and delay frames, pause delivery, and disconnect a session;
-//  - inject any `Reject` of any code and class, any `Retry`, and any RPC status, on any call, with or without an ABPC detail;
+//  - inject any `Reject` of any code and class, any `Retry`, and any RPC status, on any call, with or without an ABCP detail;
 //  - lose a response after the action was applied (an unknown outcome);
 //  - decide a GATED intent later, restore a keyspace (an epoch advance that voids bindings and ends intents, 07 [MUT-104]),
 //    freeze, archive, split and delete a keyspace, suspend the app, and close a session with any reason.
@@ -118,7 +118,7 @@ import {
   type UpdateSubscriptionRequest,
   type UpdateSubscriptionResponse,
   CloseReason as CloseReasonEnum,
-} from "../gen/abpc/v2/sync_pb.js";
+} from "../gen/abcp/v2/sync_pb.js";
 import {
   AppLimitsSchema,
   ChangeKind,
@@ -154,7 +154,7 @@ import {
   type Reject,
   type Retry,
   type SuccessorRule,
-} from "../gen/abpc/v2/types_pb.js";
+} from "../gen/abcp/v2/types_pb.js";
 import { checkWellFormed } from "../rules/crdt/index.js";
 import { applyRecord, installEntry, ReplicaState, StateNull, StateRedacted, StateValue, VersionTopology, isReservedKey, type Rule } from "../rules/fold/index.js";
 import { compareUtf8, toHex } from "../rules/bytes.js";
@@ -199,7 +199,7 @@ export type Method =
 
 /** What an injection does to a call (17 [CONF-4]). */
 export type Behavior =
-  /** The call fails with this status, and the ABPC detail if one is given, before the server does anything. */
+  /** The call fails with this status, and the ABCP detail if one is given, before the server does anything. */
   | { kind: "status"; status: RpcStatus; reject?: Reject; retry?: Retry; message?: string }
   /** The server handles the call, and the response is lost: the call fails with `status` (default Unavailable). The effect stays. */
   | { kind: "lose"; status?: RpcStatus }
@@ -814,7 +814,7 @@ export class FakeServer {
     const p = k.pending.get(intentId);
     const b = k.bindings.get(intentId);
     if (p === undefined || b === undefined) throw new Error(`no pending intent ${intentId}`);
-    const row = `abpc.intent/${intentId}`;
+    const row = `abcp.intent/${intentId}`;
     const rowChange = create(KeyChangeSchema, { key: row, kind: ChangeKind.SET, value: new TextEncoder().encode(JSON.stringify({ status: d.status })), encoding: "json/v1" });
     const requested = p.mutation.changes;
     const committed = d.status === "COMMITTED";
@@ -873,7 +873,7 @@ export class FakeServer {
     // 07 [MUT-104], 08 [GATE-93]: the intents that survived end with a REJECTED decision STALE{EPOCH}, in the new epoch
     for (const s of survivingIntents) {
       const reject = mkReject(Code.STALE, { stale: { cause: StaleCause.EPOCH } });
-      const row = create(KeyChangeSchema, { key: `abpc.intent/${s.id}`, kind: ChangeKind.SET, value: new TextEncoder().encode(JSON.stringify({ status: "REJECTED" })), encoding: "json/v1" });
+      const row = create(KeyChangeSchema, { key: `abcp.intent/${s.id}`, kind: ChangeKind.SET, value: new TextEncoder().encode(JSON.stringify({ status: "REJECTED" })), encoding: "json/v1" });
       const rec = this.record(k, RecordKind.DECISION, { principal: this.principal("gate"), mutationId: s.id, opType: s.mutation.opType, changes: s.logged ? [row] : [...s.mutation.changes], decision: create(DecisionSchema, { intentId: s.id, status: DecisionStatus.REJECTED, reject }) });
       this.commit(k, rec);
       k.bindings.set(s.id, {
@@ -931,7 +931,7 @@ export class FakeServer {
    *    so is each `previous` entry of it; and the earlier changes that set a run key whose start document the redaction blanks (12 [ADM-65]);
    *  - one `REDACTED` record is appended (06 [LOG-44]): its `keys` are the erased keys that held a value in the timeline (present, tombstoned, or changed with a value in a record), its
    *    `erased_keys` the others, its `min_seq` the first record that held a value of one, its `refused_keys` the refused ones; its changes are the `DELETE`s of the keys that were present and the
-   *    server-written `SET` of each run key (`abpc.saga.v1/run/{id}`) whose start document holds a change of an erased key, with that change blanked (`{"key", "kind", "seenVersion", "redacted": true}`);
+   *    server-written `SET` of each run key (`abcp.saga.v1/run/{id}`) whose start document holds a change of an erased key, with that change blanked (`{"key", "kind", "seenVersion", "redacted": true}`);
    *  - the ledger lists each erased key with the record's seq, for the load that answers a resume check (09 [READ-100]); a CRDT key's document is discarded (05 [STATE-78]).
    *
    * Not modelled: the closing of pending intents that request an erased key (12 [ADM-64]), the blobs (12 [ADM-103]; `blobs.deleteBlob` and `BLOB_DELETED` records are a test's own), the reach through
@@ -958,7 +958,7 @@ export class FakeServer {
     const runSets: KeyChange[] = [];
     for (const key of k.state.keyNames()) {
       const row = k.state.key(key);
-      if (row === undefined || row.state !== StateValue || !/^abpc\.saga\.v1\/run\/[^/]+$/.test(key)) continue;
+      if (row === undefined || row.state !== StateValue || !/^abcp\.saga\.v1\/run\/[^/]+$/.test(key)) continue;
       const next = blankStartDocument(row.value, erasedSet);
       if (next !== undefined) runSets.push(create(KeyChangeSchema, { key, kind: ChangeKind.SET, value: next, encoding: "json/v1", seenVersion: row.version }));
     }
@@ -1028,7 +1028,7 @@ export class FakeServer {
 
   /**
    * The open items of a keyspace (11 [COORD-95]), as the counts that 11 [COORD-97] gives: the PENDING intents, logged or not, and the
-   * present keys of the hold templates (`abpc.saga.v1/run/{id}/open`, `abpc.escrow.v1/{class}/{id}/open`). The fake models no key
+   * present keys of the hold templates (`abcp.saga.v1/run/{id}/open`, `abcp.escrow.v1/{class}/{id}/open`). The fake models no key
    * ownership (`owned_keys` is 0) and no staged move copies.
    */
   openItems(id: string): { pendingIntents: number; ownedKeys: number; holdKeys: number } {
@@ -1036,8 +1036,8 @@ export class FakeServer {
     let holdKeys = 0;
     for (const key of k.state.keyNames()) {
       const parts = key.split("/");
-      const saga = parts.length === 4 && parts[0] === "abpc.saga.v1" && parts[1] === "run" && parts[3] === "open";
-      const escrow = parts.length === 4 && parts[0] === "abpc.escrow.v1" && parts[3] === "open";
+      const saga = parts.length === 4 && parts[0] === "abcp.saga.v1" && parts[1] === "run" && parts[3] === "open";
+      const escrow = parts.length === 4 && parts[0] === "abcp.escrow.v1" && parts[3] === "open";
       if (saga || escrow) holdKeys++;
     }
     return { pendingIntents: k.pending.size, ownedKeys: 0, holdKeys };
@@ -1492,7 +1492,7 @@ export class FakeServer {
     void subject;
     const interest = cur?.interestPrefixes ?? [];
     if (interest.length > Number(this.limits.maxInterestPrefixes)) throw new RpcError("ResourceExhausted", "too many interest prefixes", { reject: mkReject(Code.QUOTA_EXCEEDED, { details: { quota: "max_interest_prefixes" } }) });
-    const base = { logEpoch: k.epoch, headSeq: k.head, manifestVersion: k.manifestVersion, limits: this.limits, kind: k.kind, lifecycle: k.lifecycle, successors: k.successors, serverInfo: create(ServerInfoSchema, { protocolName: "abpc.v2", revision: "2.0", features: [], build: "fake" }) };
+    const base = { logEpoch: k.epoch, headSeq: k.head, manifestVersion: k.manifestVersion, limits: this.limits, kind: k.kind, lifecycle: k.lifecycle, successors: k.successors, serverInfo: create(ServerInfoSchema, { protocolName: "abcp.v2", revision: "2.0", features: [], build: "fake" }) };
     const wms = req.clientId !== "" ? this.laneWatermarks(k, req.clientId) : [];
     // a page of a load in progress
     if (req.pageToken !== "") {
@@ -1572,7 +1572,7 @@ export class FakeServer {
     this.presence.carry(session); // 09 [READ-74]: the later session of a client instance carries its presence
     this.sessions.add(session);
     const hb = this.heartbeatMs > 0 ? this.heartbeatMs : 15_000;
-    session.push(this.control({ case: "subscribed", value: create(ControlFrame_SubscribedSchema, { sessionId: session.id, limits: this.limits, serverInfo: create(ServerInfoSchema, { protocolName: "abpc.v2" }), heartbeatIntervalMs: hb }) }));
+    session.push(this.control({ case: "subscribed", value: create(ControlFrame_SubscribedSchema, { sessionId: session.id, limits: this.limits, serverInfo: create(ServerInfoSchema, { protocolName: "abcp.v2" }), heartbeatIntervalMs: hb }) }));
     for (const c of req.keyspaces) this.addFollow(session, c);
     try {
       for (;;) {
@@ -2132,7 +2132,7 @@ export class FakeServer {
     let intentSeq = 0n;
     if (logIntent) {
       // 06 §6.5: a PENDING row holds `status`, `op_type` and `deadline`, in canonical order
-      const row = create(KeyChangeSchema, { key: `abpc.intent/${m.mutationId}`, kind: ChangeKind.SET, value: new TextEncoder().encode(JSON.stringify({ deadline: new Date(this.clock.now() + this.decisionDeadlineMs).toISOString(), op_type: m.opType, status: "PENDING" })), encoding: "json/v1" });
+      const row = create(KeyChangeSchema, { key: `abcp.intent/${m.mutationId}`, kind: ChangeKind.SET, value: new TextEncoder().encode(JSON.stringify({ deadline: new Date(this.clock.now() + this.decisionDeadlineMs).toISOString(), op_type: m.opType, status: "PENDING" })), encoding: "json/v1" });
       const rec = this.record(k, RecordKind.INTENT, { principal, mutationId: m.mutationId, opType: m.opType, changes: [...m.changes, row], authoredAt: m.authoredAt });
       this.commit(k, rec);
       intentSeq = rec.seq;

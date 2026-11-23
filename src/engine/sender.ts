@@ -13,8 +13,8 @@
 //    `BLOB_PENDING` or `BLOB_MISSING`; it waits for its upload as it waits for a dependency, and unrelated actions go on ([CLI-33]).
 
 import { create } from "@bufbuild/protobuf";
-import { MutateRequestSchema, type MutateResponse, type MutationResult, type Mutation } from "../gen/abpc/v2/sync_pb.js";
-import { ChangeKind, Code, DecisionStatus, ErrorClass, KeyspaceLifecycle, StaleCause, type Reject, type Retry } from "../gen/abpc/v2/types_pb.js";
+import { MutateRequestSchema, type MutateResponse, type MutationResult, type Mutation } from "../gen/abcp/v2/sync_pb.js";
+import { ChangeKind, Code, DecisionStatus, ErrorClass, KeyspaceLifecycle, StaleCause, type Reject, type Retry } from "../gen/abcp/v2/types_pb.js";
 import { VersionTopology } from "../rules/fold/index.js";
 import { buildMutation, checkAction } from "./author.js";
 import { codeName } from "./codes.js";
@@ -152,9 +152,9 @@ export abstract class SenderLayer extends ReactionLayer {
       this.nextOrdinal++;
       this.entries.set(id, entry);
       this.decoded.set(id, m);
-      // 14 [CLI-14]: a client that started a saga follows its run key; the Start SETs `abpc.saga.v1/run/{saga_id}` (11 [COORD-58])
+      // 14 [CLI-14]: a client that started a saga follows its run key; the Start SETs `abcp.saga.v1/run/{saga_id}` (11 [COORD-58])
       for (const c of m.changes) {
-        const run = /^abpc\.saga\.v1\/run\/([^/]+)$/.exec(c.key);
+        const run = /^abcp\.saga\.v1\/run\/([^/]+)$/.exec(c.key);
         if (run !== null && c.kind === ChangeKind.SET) this.followSaga(f.id, run[1] as string);
       }
       f.invalidate();
@@ -410,7 +410,7 @@ export abstract class SenderLayer extends ReactionLayer {
   }
 
   /** The call, outside the queue: its answer comes back as a task. */
-  private async sendRequest(f: Follow, batch: OutboxEntry[], req: import("../gen/abpc/v2/sync_pb.js").MutateRequest, hasSequenced: boolean, sentUnder: string): Promise<void> {
+  private async sendRequest(f: Follow, batch: OutboxEntry[], req: import("../gen/abcp/v2/sync_pb.js").MutateRequest, hasSequenced: boolean, sentUnder: string): Promise<void> {
     let resp: MutateResponse;
     try {
       resp = await this.transport.mutate(req);

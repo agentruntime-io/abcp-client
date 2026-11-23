@@ -6,8 +6,8 @@ import { describe, expect, it } from "vitest";
 import { jsonBytes } from "../src/engine/index.js";
 import { FakeServer, ManualClock } from "../src/fake/index.js";
 import { StaticManifests } from "../src/engine/index.js";
-import { LoadStateRequestSchema } from "../src/gen/abpc/v2/sync_pb.js";
-import { ChangeKind, KeyChangeSchema, KeyEntrySchema, KeyspaceCursorSchema, RecordKind, SystemKind } from "../src/gen/abpc/v2/types_pb.js";
+import { LoadStateRequestSchema } from "../src/gen/abcp/v2/sync_pb.js";
+import { ChangeKind, KeyChangeSchema, KeyEntrySchema, KeyspaceCursorSchema, RecordKind, SystemKind } from "../src/gen/abcp/v2/types_pb.js";
 import { kc, KS, MANIFEST } from "./helpers/engine.js";
 
 function world(): { server: FakeServer; load: (afterSeq?: bigint, epoch?: number) => Promise<ReturnType<FakeServer["transport"]> extends { loadState(...a: never[]): Promise<infer R> } ? R : never> } {
@@ -72,7 +72,7 @@ describe("FakeServer.redact (06 [LOG-44], [LOG-76])", () => {
 
   it("a run key whose start document holds a change of an erased key gets a server-written SET with the change blanked (12 [ADM-65], 11 [COORD-58]); the module's members stay", () => {
     const { server } = world();
-    const RUN = "abpc.saga.v1/run/s1";
+    const RUN = "abcp.saga.v1/run/s1";
     const step = (key: string): unknown => ({ name: "s", base_seq: 0, base_log_epoch: 1, changes: [{ key, kind: "CHANGE_KIND_SET", value: "U0VDUkVU", encoding: "json/v1", seenVersion: "2" }], compensate: [{ key, kind: "CHANGE_KIND_DELETE" }] });
     server.write(KS, [create(KeyChangeSchema, { key: RUN, kind: ChangeKind.SET, encoding: "json/v1", value: jsonBytes({ saga: "S", steps: [step("settings/a"), step("settings/b")], status: "running" }) })]);
     server.redact(KS, ["settings/a"]);

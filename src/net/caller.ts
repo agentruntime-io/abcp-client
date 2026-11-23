@@ -4,9 +4,9 @@
 // The headers, the error JSON and the end-of-stream message are connect-es's own (`protocol-connect`); the framing of a stream is read here,
 // with the bound of [ARC-59] on each message.
 //
-//  - unary: `POST <endpoint>/abpc.v2.SyncService/<Method>`, `application/proto`, `connect-protocol-version: 1`, `connect-timeout-ms` for the
+//  - unary: `POST <endpoint>/abcp.v2.SyncService/<Method>`, `application/proto`, `connect-protocol-version: 1`, `connect-timeout-ms` for the
 //    call's deadline ([ARC-60]), `Authorization: Bearer <token>` ([ARC-56]). A status other than 200 carries the error as JSON, with the
-//    ABPC detail in `details` ([ARC-57]).
+//    ABCP detail in `details` ([ARC-57]).
 //  - server-streaming (`Subscribe`): `application/connect+proto`, one request message in an envelope, then envelopes of messages and an
 //    end-of-stream envelope (flag 2) that carries the status, and the detail, of a call that ended with one ([ARC-57]).
 //
@@ -29,13 +29,13 @@ export const MAX_MESSAGE_BYTES = 16 * 1024 * 1024;
 export const DEFAULT_UNARY_TIMEOUT_MS = 30_000;
 
 export interface ConnectCallerOptions {
-  /** The endpoint (02 [ARC-55]): the URL that `/abpc.v2.SyncService/<Method>` is appended to, such as `https://sync.example.com/apps/tracker`. */
+  /** The endpoint (02 [ARC-55]): the URL that `/abcp.v2.SyncService/<Method>` is appended to, such as `https://sync.example.com/apps/tracker`. */
   baseUrl: string;
   /** The HTTP client. */
   http: UniversalClientFn;
   /** The bearer token of the call that starts now (10 [AUTH-1]); read for each call, so that a token that was refreshed is used by the next one. */
   token?: () => string | undefined;
-  /** The service whose methods are called; default `abpc.v2.SyncService`. */
+  /** The service whose methods are called; default `abcp.v2.SyncService`. */
   service?: string;
   /** The deadline of a unary call that sets none; default `DEFAULT_UNARY_TIMEOUT_MS`. 0 is none. */
   unaryTimeoutMs?: number;
@@ -183,7 +183,7 @@ export class ConnectCaller implements RawCaller {
   private readonly accept: Compression[];
 
   constructor(private readonly o: ConnectCallerOptions) {
-    this.service = o.service ?? "abpc.v2.SyncService";
+    this.service = o.service ?? "abcp.v2.SyncService";
     this.baseUrl = o.baseUrl.replace(/\/+$/, "");
     this.readMax = o.readMaxBytes ?? MAX_MESSAGE_BYTES;
     this.unaryTimeout = o.unaryTimeoutMs ?? DEFAULT_UNARY_TIMEOUT_MS;

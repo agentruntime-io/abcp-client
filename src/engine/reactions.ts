@@ -5,7 +5,7 @@
 // An action is never re-authored here. It is resent unchanged, or it ends and the app is told (02 [ARC-50], [ARC-51]).
 
 import { create } from "@bufbuild/protobuf";
-import { MutationSchema } from "../gen/abpc/v2/sync_pb.js";
+import { MutationSchema } from "../gen/abcp/v2/sync_pb.js";
 import {
   ChangeKind,
   Code,
@@ -17,7 +17,7 @@ import {
   type Reject,
   type Retry,
   type SuccessorRule,
-} from "../gen/abpc/v2/types_pb.js";
+} from "../gen/abcp/v2/types_pb.js";
 import { fullJitter, HOLD_BACKOFF, resendDelay } from "./backoff.js";
 import { codeName, isKnownClass, isKnownCode, reactionOf, retryReasonName } from "./codes.js";
 import { encodeContent } from "./entry.js";
@@ -63,7 +63,7 @@ export abstract class ReactionLayer extends ReplicaLayer {
   private pumpQueued = false;
 
   protected abstract online(): boolean;
-  protected abstract applyResult(e: OutboxEntry, r: import("../gen/abpc/v2/sync_pb.js").MutationResult, source: "mutate" | "poll" | "cancel"): Promise<void>;
+  protected abstract applyResult(e: OutboxEntry, r: import("../gen/abcp/v2/sync_pb.js").MutationResult, source: "mutate" | "poll" | "cancel"): Promise<void>;
   protected abstract rebindSession(): void;
   /**
    * 09 [READ-89], 14 [CLI-44]: an action got `Retry{BLOB_PENDING}` or `Reject{BLOB_MISSING}`: the upload of the blobs that it names is completed or repeated with the
@@ -79,7 +79,7 @@ export abstract class ReactionLayer extends ReplicaLayer {
   protected abstract followSuccessors(rules: readonly SuccessorRule[]): void;
   protected abstract pumpAll(): Promise<void>;
   /** The answer of `GetMutationResult` about an action of a keyspace that a revocation stopped (14 [CLI-7], [CLI-53]); false when it is no answer. */
-  protected abstract answerRevoked(f: Follow, e: OutboxEntry, ans: import("../gen/abpc/v2/sync_pb.js").GetMutationResultResponse): Promise<boolean>;
+  protected abstract answerRevoked(f: Follow, e: OutboxEntry, ans: import("../gen/abcp/v2/sync_pb.js").GetMutationResultResponse): Promise<boolean>;
   /** The manifest version in force for the keyspace, as `LoadStateResponse.manifest_version` names it (14 Table 14.1, `UNKNOWN_OP_TYPE`). */
   protected abstract manifestVersionInForce(f: Follow): Promise<number>;
   protected abstract kick(f?: Follow): void;
@@ -265,7 +265,7 @@ export abstract class ReactionLayer extends ReplicaLayer {
       (async () => {
         let resp;
         try {
-          resp = await this.transport.getMutationResult({ $typeName: "abpc.v2.GetMutationResultRequest", keyspaceId: e.keyspaceId, mutationId: e.mutationId });
+          resp = await this.transport.getMutationResult({ $typeName: "abcp.v2.GetMutationResultRequest", keyspaceId: e.keyspaceId, mutationId: e.mutationId });
         } catch (err) {
           this.noteRevoked(err); // 14 [CLI-50]: the detail of a revoked subject, on whatever call it comes
           await this.run(() => {
@@ -477,7 +477,7 @@ export abstract class ReactionLayer extends ReplicaLayer {
 
   /**
    * A `Mutate` call that fails as a whole with `NotFound`, `AlreadyExists`, `FailedPrecondition`, or `PermissionDenied` after the one
-   * refresh of the token, and with no ABPC error detail: the "stop and report" of A.7, which 14 [CLI-50] and the row of Table 14.1 for
+   * refresh of the token, and with no ABCP error detail: the "stop and report" of A.7, which 14 [CLI-50] and the row of Table 14.1 for
    * it make a lane hold, on each lane that the request carried. The client resends the lane's head action, unchanged, with the hold
    * backoff (a resend that gets another result clears the hold), and emits `protocol-error` for the status once, when the hold starts,
    * with the RPC status and the lanes of the request; the `held` event and the sync status name the hold `PROTOCOL_ERROR` (A.11). The
@@ -512,7 +512,7 @@ export abstract class ReactionLayer extends ReplicaLayer {
     this.emit({
       type: "protocol-error",
       what: "Mutate",
-      detail: `${status} with no ABPC detail: the lanes of the request are held (A.7, 14 [CLI-50], Table 14.1)`,
+      detail: `${status} with no ABCP detail: the lanes of the request are held (A.7, 14 [CLI-50], Table 14.1)`,
       keyspaces,
       status,
       lanes: all,
@@ -944,7 +944,7 @@ export abstract class ReactionLayer extends ReplicaLayer {
   }
 
   /** Re-routes a queued action to the split successor of its keys: only `keyspace_id` changes, stored once ([CLI-22], [CLI-52]). */
-  private async reroute(e: OutboxEntry, m: import("../gen/abpc/v2/sync_pb.js").Mutation, target: string): Promise<void> {
+  private async reroute(e: OutboxEntry, m: import("../gen/abcp/v2/sync_pb.js").Mutation, target: string): Promise<void> {
     const from = e.keyspaceId;
     const moved = create(MutationSchema, { ...m, keyspaceId: target });
     const content = encodeContent(moved);
@@ -985,7 +985,7 @@ export abstract class ReactionLayer extends ReplicaLayer {
         (async () => {
           let resp;
           try {
-            resp = await this.transport.cancelIntent({ $typeName: "abpc.v2.CancelIntentRequest", keyspaceId: e.keyspaceId, intentId: mutationId });
+            resp = await this.transport.cancelIntent({ $typeName: "abcp.v2.CancelIntentRequest", keyspaceId: e.keyspaceId, intentId: mutationId });
           } catch {
             return; // PERMISSION_DENIED cancels nothing: the action keeps the outcome it has, pending or unknown (14 [CLI-81])
           }

@@ -15,7 +15,7 @@ import {
   SystemKind,
   type KeyChange,
   type Record as RecordMessage,
-} from "../src/gen/abpc/v2/types_pb.js";
+} from "../src/gen/abcp/v2/types_pb.js";
 import { fromHex, toHex, utf8Encode } from "../src/rules/bytes.js";
 import {
   type Anomaly,
@@ -115,7 +115,7 @@ function canonicalJson(v: unknown): string {
 }
 
 function system(seq: number, kind: SystemKind, body: unknown, ...changes: KeyChange[]): RecordMessage {
-  const r = record(RecordKind.SYSTEM, seq, changes, "abpc.server");
+  const r = record(RecordKind.SYSTEM, seq, changes, "abcp.server");
   r.system = create(SystemEventSchema, { kind, mustUnderstand: true, encoding: "json/v1", body: bytes(canonicalJson(body ?? {})) });
   return r;
 }
@@ -601,7 +601,7 @@ describe("05 [STATE-82] with [STATE-67] (V1 MUST-1): a blanked conversion SET ke
       expect({ state: k.state, by: k.changedBy, enc: k.encoding }).toEqual({ state: StateRedacted, by: "", enc: "redacted/v1" });
     }
     // new/c has no source key, so it takes the record's time and principal
-    expect(blanked.key("new/c").changedBy).toBe("abpc.server");
+    expect(blanked.key("new/c").changedBy).toBe("abcp.server");
 
     // The metadata hash through the blanked records is the one of the unblanked log's keys' changed_at, which is what a rewritten
     // checkpoint holds (06 [LOG-82]): fold the same log with and without the blanking and compare the entries.

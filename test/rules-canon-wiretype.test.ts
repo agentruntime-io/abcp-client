@@ -4,8 +4,8 @@
 
 import type { DescMessage } from "@bufbuild/protobuf";
 import { describe, expect, it } from "vitest";
-import { MutateRequestSchema, MutationSchema } from "../src/gen/abpc/v2/sync_pb.js";
-import { KeyChangeSchema, RecordSchema, RejectSchema } from "../src/gen/abpc/v2/types_pb.js";
+import { MutateRequestSchema, MutationSchema } from "../src/gen/abcp/v2/sync_pb.js";
+import { KeyChangeSchema, RecordSchema, RejectSchema } from "../src/gen/abcp/v2/types_pb.js";
 import {
   CanonError,
   checkEncoding,

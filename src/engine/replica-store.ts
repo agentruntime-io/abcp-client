@@ -13,8 +13,8 @@
 //    record whole and the keys outside the interest are dropped at once ("MUST NOT present keys outside its interest as current",
 //    09 [READ-26]); a deleted marker's tombstone stays, since the ancestor test of 05 [STATE-38] needs it.
 
-import { ChangeKind, KeyspaceLifecycle, type KeyEntry, type Record as RecordMessage } from "../gen/abpc/v2/types_pb.js";
-import type { LoadStateResponse } from "../gen/abpc/v2/sync_pb.js";
+import { ChangeKind, KeyspaceLifecycle, type KeyEntry, type Record as RecordMessage } from "../gen/abcp/v2/types_pb.js";
+import type { LoadStateResponse } from "../gen/abcp/v2/sync_pb.js";
 import { applyRecord, FoldError, installEntry, isReservedKey, ReplicaState, StateValue, VersionTopology, type Anomaly } from "../rules/fold/index.js";
 import { isSegment } from "../rules/fold/template.js";
 import { ErasureLayer } from "./erasure.js";
@@ -117,7 +117,7 @@ export abstract class ReplicaStoreLayer extends ErasureLayer {
     // the confirmed documents of the CRDT keys that the record changed (14 [CLI-13])
     f.crdt.apply(plan);
     f.crdt.reconcile(st, keepCrdt); // the CRDT keys that a `REDACTED` record erases and that hold a view document keep it, for the reset (14 [CLI-13], [CLI-76])
-    for (const c of rec.changes) if (c.key.startsWith("abpc.saga.v1/")) this.sagaKeyChanged(f, c.key); // the sagas that the client follows (14 [CLI-14], `sagas.ts`)
+    for (const c of rec.changes) if (c.key.startsWith("abcp.saga.v1/")) this.sagaKeyChanged(f, c.key); // the sagas that the client follows (14 [CLI-14], `sagas.ts`)
     this.blobDeletedRecord(f, rec); // 14 [CLI-76]: a `BLOB_DELETED` record drops the cached bytes of its blob
     return { plan, anomalies };
   }
@@ -131,7 +131,7 @@ export abstract class ReplicaStoreLayer extends ErasureLayer {
   }
 
   /**
-   * The app started a saga (11 [COORD-58]): its run key `abpc.saga.v1/run/{sagaId}` in the keyspace is followed (14 [CLI-14]). The engine calls it for the Start that it
+   * The app started a saga (11 [COORD-58]): its run key `abcp.saga.v1/run/{sagaId}` in the keyspace is followed (14 [CLI-14]). The engine calls it for the Start that it
    * authors; an app calls it for one that it started by other means.
    */
   followSaga(_keyspaceId: string, _sagaId: string): void {

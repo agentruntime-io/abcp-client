@@ -183,7 +183,7 @@ describe("V21 MUST-4 (Q75.2), 09 [READ-74], [READ-83], 14 [CLI-61]: a follower t
     const t1 = await r.open();
     const tab2 = r.device.newTab();
     const real = tab2.locks.tryAcquire;
-    (tab2.locks as { tryAcquire: typeof real }).tryAcquire = (name: string) => (name.startsWith("abpc.tab") ? Promise.resolve(undefined) : real(name));
+    (tab2.locks as { tryAcquire: typeof real }).tryAcquire = (name: string) => (name.startsWith("abcp.tab") ? Promise.resolve(undefined) : real(name));
     const t2 = await r.open({ tab: tab2 });
     await settleAll(t1.engine, t2.engine);
     await t2.engine.joinPresence(KS, ROOM);

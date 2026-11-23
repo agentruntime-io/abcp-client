@@ -6,8 +6,8 @@ import { create } from "@bufbuild/protobuf";
 import { describe, expect, it } from "vitest";
 import { Engine, set, StaticManifests, type EngineEvent, type ExportHook } from "../src/engine/index.js";
 import { FakeServer, ManualClock, reject as mk, SeededRandom } from "../src/fake/index.js";
-import { MutationResultSchema } from "../src/gen/abpc/v2/sync_pb.js";
-import { Code } from "../src/gen/abpc/v2/types_pb.js";
+import { MutationResultSchema } from "../src/gen/abcp/v2/sync_pb.js";
+import { Code } from "../src/gen/abcp/v2/types_pb.js";
 import { createWebHost } from "../src/platform/web.js";
 import { FakeIDBFactory, FakeKeyRange } from "./helpers/fake-idb.js";
 import { KS, MANIFEST } from "./helpers/engine.js";
@@ -15,8 +15,8 @@ import { bytesOf } from "./helpers/presence.js";
 
 const calls = (s: FakeServer, m: string): number => s.calls.filter((c) => c.method === m).length;
 const putCount = (s: FakeServer): number => s.blobs.http.filter((h) => h.method === "PUT").length;
-const blobDbs = (f: FakeIDBFactory): string[] => [...f.dbs.keys()].filter((k) => k.startsWith("abpc-blobs:"));
-const partitionDbs = (f: FakeIDBFactory): string[] => [...f.dbs.keys()].filter((k) => k.startsWith("abpc:") && k !== "abpc:registry");
+const blobDbs = (f: FakeIDBFactory): string[] => [...f.dbs.keys()].filter((k) => k.startsWith("abcp-blobs:"));
+const partitionDbs = (f: FakeIDBFactory): string[] => [...f.dbs.keys()].filter((k) => k.startsWith("abcp:") && k !== "abcp:registry");
 
 /** A page: a world of one server, one clock and one IndexedDB, in which engines are started and restarted. */
 class World {

@@ -6,7 +6,7 @@
 import { create } from "@bufbuild/protobuf";
 import { describe, expect, it } from "vitest";
 import { set } from "../src/engine/index.js";
-import { RetryReason, SuccessorRuleSchema } from "../src/gen/abpc/v2/types_pb.js";
+import { RetryReason, SuccessorRuleSchema } from "../src/gen/abcp/v2/types_pb.js";
 import { KS, retryResult, rig, tick, types, type Rig } from "./helpers/engine.js";
 
 /** An action whose resend is in flight when the process dies: what storage keeps is `lastResult.kind = "sent"`. */

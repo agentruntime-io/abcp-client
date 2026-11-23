@@ -1,5 +1,5 @@
 // C5: the Connect transport (src/net) against a scripted HTTP client: what goes out (02 [ARC-53], [ARC-55], [ARC-56], [ARC-60]), what a response and a stream
-// become (strict decoding, 02 [ARC-61]; the error and its one ABPC detail, [ARC-57]; A.7), and how a call ends (deadline, abort, a connection that breaks).
+// become (strict decoding, 02 [ARC-61]; the error and its one ABCP detail, [ARC-57]; A.7), and how a call ends (deadline, abort, a connection that breaks).
 
 import { create, type DescMessage, type Message } from "@bufbuild/protobuf";
 import { TimestampSchema } from "@bufbuild/protobuf/wkt";
@@ -13,8 +13,8 @@ import {
   SubscribeRequestSchema,
   SubscribeResponseSchema,
   type SubscribeResponse,
-} from "../src/gen/abpc/v2/sync_pb.js";
-import { Code, ErrorClass, RejectSchema, RetryReason, RetrySchema } from "../src/gen/abpc/v2/types_pb.js";
+} from "../src/gen/abcp/v2/sync_pb.js";
+import { Code, ErrorClass, RejectSchema, RetryReason, RetrySchema } from "../src/gen/abcp/v2/types_pb.js";
 import { ConnectCaller, createBytesTransport, MAX_MESSAGE_BYTES } from "../src/net/index.js";
 import { canon } from "../src/rules/index.js";
 
@@ -77,7 +77,7 @@ describe("the request (02 [ARC-53], [ARC-55], [ARC-56], [ARC-60])", () => {
     await t.getManifest(create(GetManifestRequestSchema, { version: 3 }), { timeoutMs: 1234 });
     expect(seen).toHaveLength(1);
     const r = seen[0] as UniversalClientRequest;
-    expect(r.url).toBe("https://sync.test/apps/tracker/abpc.v2.SyncService/GetManifest"); // the final `/` of the endpoint is dropped
+    expect(r.url).toBe("https://sync.test/apps/tracker/abcp.v2.SyncService/GetManifest"); // the final `/` of the endpoint is dropped
     expect(r.method).toBe("POST");
     expect(r.header.get("content-type")).toBe("application/proto");
     expect(r.header.get("connect-protocol-version")).toBe("1");
@@ -115,7 +115,7 @@ describe("the request (02 [ARC-53], [ARC-55], [ARC-56], [ARC-60])", () => {
     });
     const req = create(SubscribeRequestSchema, { clientId: "c1" });
     for await (const _ of t.subscribe(req)) void _;
-    expect(got?.url).toBe("https://sync.test/apps/tracker/abpc.v2.SyncService/Subscribe");
+    expect(got?.url).toBe("https://sync.test/apps/tracker/abcp.v2.SyncService/Subscribe");
     expect(got?.header.get("content-type")).toBe("application/connect+proto");
     expect(got?.header.get("connect-timeout-ms")).toBeNull();
     expect(Buffer.concat(sent)).toEqual(Buffer.from(frame(0, bytes(SubscribeRequestSchema, req))));
@@ -165,7 +165,7 @@ describe("strict decoding of what the server sends (02 [ARC-61], rules/canon, ne
 
 describe("a call that fails (02 [ARC-57], A.7)", () => {
   const rejectDetail = (code: Code, extra: { message?: string } = {}): { type: string; value: string } => ({
-    type: "abpc.v2.Reject",
+    type: "abcp.v2.Reject",
     value: b64(bytes(RejectSchema, create(RejectSchema, { code, errorClass: ErrorClass.DEAD_LETTER, message: extra.message ?? "", details: { cause: "SUBJECT_REVOKED" } }))),
   });
   const failing = (status: number, body: object | string, header: Record<string, string> = { "content-type": "application/json" }): UniversalClientFn =>
@@ -182,7 +182,7 @@ describe("a call that fails (02 [ARC-57], A.7)", () => {
   });
 
   it("carries a Retry with its reason and delay, takes the type URL with its prefix, and ignores a detail of another type", async () => {
-    const retry = { type: "type.googleapis.com/abpc.v2.Retry", value: b64(bytes(RetrySchema, create(RetrySchema, { reason: RetryReason.RATE_LIMITED, afterMs: 5000 }))) };
+    const retry = { type: "type.googleapis.com/abcp.v2.Retry", value: b64(bytes(RetrySchema, create(RetrySchema, { reason: RetryReason.RATE_LIMITED, afterMs: 5000 }))) };
     const other = { type: "google.rpc.ErrorInfo", value: b64(enc.encode("whatever")) };
     const t = transport(failing(429, { code: "resource_exhausted", message: "slow down", details: [other, retry] }));
     const e = (await t.getManifest(create(GetManifestRequestSchema, {})).catch((x: unknown) => x)) as RpcError;
@@ -227,7 +227,7 @@ describe("a call that fails (02 [ARC-57], A.7)", () => {
   });
 
   it("is a ProtocolViolation when the one detail is a Reject whose bytes break 02 [ARC-61]", async () => {
-    const badReject = { type: "abpc.v2.Reject", value: b64(Uint8Array.from([0x1a, 0x02, 0xff, 0xfe])) }; // Reject.message (field 3) is not UTF-8
+    const badReject = { type: "abcp.v2.Reject", value: b64(Uint8Array.from([0x1a, 0x02, 0xff, 0xfe])) }; // Reject.message (field 3) is not UTF-8
     const t = transport(failing(409, { code: "failed_precondition", message: "m", details: [badReject] }));
     await expect(t.getManifest(create(GetManifestRequestSchema, {}))).rejects.toBeInstanceOf(ProtocolViolation);
   });

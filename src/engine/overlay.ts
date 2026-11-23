@@ -16,7 +16,7 @@
 // TODO(14 [CLI-14]): the moved entities (the `moved` key of a built-in move hides the entity and shows the pointer) and the
 // saga following come with the coordination milestone; only the pending DELETE of a marker key hides a subtree here.
 
-import { ChangeKind, type KeyChange } from "../gen/abpc/v2/types_pb.js";
+import { ChangeKind, type KeyChange } from "../gen/abcp/v2/types_pb.js";
 import { counterText, parse as parseJson, parseCounter, type JsonValue } from "../rules/jsonv1/index.js";
 import { compareUtf8 } from "../rules/bytes.js";
 import { StateNull, StateRedacted, StateValue, type KeyRow, type ReplicaState, type Rule, type Template, type Topology } from "../rules/fold/index.js";

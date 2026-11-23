@@ -1,7 +1,7 @@
 // The leaf of the blob support (09 §9.9): the HTTP of the blob store, the stash of the bytes that actions name, the cache of downloaded bytes, the errors, and the
 // helpers (the blob id, the digest). It imports nothing of the engine, so that `core.ts` may read its types and defaults; the behaviour is `blobs.ts`'s.
 
-import type { Reject } from "../gen/abpc/v2/types_pb.js";
+import type { Reject } from "../gen/abcp/v2/types_pb.js";
 import { sha256 as sha256Sync } from "../rules/crypto.js";
 import type { RpcStatus } from "./errors.js";
 

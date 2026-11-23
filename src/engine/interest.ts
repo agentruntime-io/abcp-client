@@ -13,10 +13,10 @@
 //    right.
 
 import { create } from "@bufbuild/protobuf";
-import { UpdateSubscriptionRequestSchema, UpdateSubscriptionRequest_InterestSchema, type LoadStateResponse } from "../gen/abpc/v2/sync_pb.js";
+import { UpdateSubscriptionRequestSchema, UpdateSubscriptionRequest_InterestSchema, type LoadStateResponse } from "../gen/abcp/v2/sync_pb.js";
 import { FoldError } from "../rules/fold/index.js";
 import { LocalRefusal, ProtocolViolation } from "./errors.js";
-import type { KeyEntry } from "../gen/abpc/v2/types_pb.js";
+import type { KeyEntry } from "../gen/abcp/v2/types_pb.js";
 import { loadRedaction } from "./erasure.js";
 import type { Follow } from "./follow.js";
 import { HorizonLayer } from "./horizon.js";

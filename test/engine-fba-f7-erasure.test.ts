@@ -5,7 +5,7 @@
 import { describe, expect, it } from "vitest";
 import { MemoryBlobStash, MemoryStorage, set, type StorageOp } from "../src/engine/index.js";
 import { reject as mk } from "../src/fake/index.js";
-import { Code, RetryReason } from "../src/gen/abpc/v2/types_pb.js";
+import { Code, RetryReason } from "../src/gen/abcp/v2/types_pb.js";
 import { brig, bytesOf } from "./helpers/presence.js";
 import { KS, rejectResult, retryResult } from "./helpers/engine.js";
 

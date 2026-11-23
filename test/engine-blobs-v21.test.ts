@@ -9,8 +9,8 @@ import { create } from "@bufbuild/protobuf";
 import { afterEach, describe, expect, it } from "vitest";
 import { BlobError, digestSha256, Engine, LocalRefusal, MemoryBlobStash, MemoryStorage, STAGED_GRACE_MS, STAGED_SWEEP_MS, StaticManifests, set, type BlobHttp, type StagedBlob } from "../src/engine/index.js";
 import { FakeServer, ManualClock, reject as mk, SeededRandom } from "../src/fake/index.js";
-import { CreateUploadRequestSchema, MutationResultSchema } from "../src/gen/abpc/v2/sync_pb.js";
-import { Code, RetryReason } from "../src/gen/abpc/v2/types_pb.js";
+import { CreateUploadRequestSchema, MutationResultSchema } from "../src/gen/abcp/v2/sync_pb.js";
+import { Code, RetryReason } from "../src/gen/abcp/v2/types_pb.js";
 import { FileStorageProvider } from "../src/platform/file-storage.js";
 import { FileBlobStash, NodeDevice } from "../src/platform/node.js";
 import { goOffline, goOnline, KS, MANIFEST, ofType, rejectResult, retryResult } from "./helpers/engine.js";
@@ -25,7 +25,7 @@ const held = (r: { engine: { status(): { holds: unknown[] } } }): unknown[] => r
 
 const dirs: string[] = [];
 const tmp = (): string => {
-  const d = fs.mkdtempSync(path.join(os.tmpdir(), "abpc-v21-"));
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "abcp-v21-"));
   dirs.push(d);
   return d;
 };
@@ -46,7 +46,7 @@ describe("V21 MUST-1, 09 [READ-94], 14 [CLI-21]: the bytes that a durable outbox
       manifests,
       clock,
       random: new SeededRandom(seed),
-      origin: "https://abpc.test",
+      origin: "https://abcp.test",
       tab,
       blobs: { http },
     });
@@ -104,7 +104,7 @@ describe("V21 MUST-1, 09 [READ-94], 14 [CLI-21]: the bytes that a durable outbox
     // the directory provider
     const root = tmp();
     const provider = new FileStorageProvider(root);
-    const key = { origin: "https://abpc.test", appId: "app", partition: "i|ana" };
+    const key = { origin: "https://abcp.test", appId: "app", partition: "i|ana" };
     await provider.open(key);
     const stash = provider.blobStash(key);
     expect(stash.durable).toBe(true);

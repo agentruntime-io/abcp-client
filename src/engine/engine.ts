@@ -1,4 +1,4 @@
-// The client engine of ABPC v2 (14 §14.1 to §14.10): the engine model, prediction, the durable outbox, ordering and dependencies,
+// The client engine of ABCP v2 (14 §14.1 to §14.10): the engine model, prediction, the durable outbox, ordering and dependencies,
 // events, the reactions by class and cause, the offline horizon, principals, tabs and devices, revocation and quarantine, and interest
 // and storage, and (C6) presence (09 §9.8: `presence.ts`) and blobs (09 §9.9: `blobs.ts`, with `blob-store.ts`). The public API is this class; the
 // behaviour is in the layers it extends (core, endings, replica-store, replica, reactions, sender, session, presence, blobs, horizon, interest,
@@ -9,8 +9,8 @@
 
 import { create } from "@bufbuild/protobuf";
 import type * as Y from "yjs";
-import { CreateKeyspaceRequestSchema, UpdateSubscriptionRequestSchema } from "../gen/abpc/v2/sync_pb.js";
-import { ChangeKind } from "../gen/abpc/v2/types_pb.js";
+import { CreateKeyspaceRequestSchema, UpdateSubscriptionRequestSchema } from "../gen/abcp/v2/sync_pb.js";
+import { ChangeKind } from "../gen/abcp/v2/types_pb.js";
 import { CrdtKey } from "./crdt-view.js";
 import type { BlobCallOptions, BlobRef, StageOptions } from "./blob-store.js";
 import { jsonBytes } from "./changes.js";
@@ -29,7 +29,7 @@ import { TabLayer, type CommandContext } from "./tab-layer.js";
 import type { DeadLetterEntry, DraftEntry, ExportEntry, JournalEntry, OutboxEntry, RejectionRecord, UnreadableRow } from "./storage.js";
 import type { PartitionKey } from "./tabs.js";
 import type { ActionInput, ChangeInput, EngineEvent, PreconditionInput, SubmitOptions, SubmitResult, SyncStatus } from "./types.js";
-import { Code, ErrorClass } from "../gen/abpc/v2/types_pb.js";
+import { Code, ErrorClass } from "../gen/abcp/v2/types_pb.js";
 
 /** What a reader of a keyspace's copy needs to know of it, in one call (the query layer, `query/`). */
 export interface KeyspaceInfo {
@@ -677,12 +677,12 @@ export class Engine extends TabLayer {
   /**
    * The `decision_deadline` of the intent row of a pending GATED action, in ms since the epoch of server time (14 [CLI-58]: the app SHOULD show it; the
    * server keeps deciding registered intents while the device is offline, and the client learns the outcome on reconnect). The intent row is read from
-   * the confirmed state (06 §6.5), so the keyspace's interest has to include `abpc.intent` for it to be there; undefined when the engine holds no row.
+   * the confirmed state (06 §6.5), so the keyspace's interest has to include `abcp.intent` for it to be there; undefined when the engine holds no row.
    */
   intentDeadline(mutationId: string): number | undefined {
     const e = this.entries.get(mutationId);
     if (e === undefined || e.lane !== "GATED") return undefined;
-    const row = this.follows.get(e.keyspaceId)?.state.key(`abpc.intent/${mutationId}`);
+    const row = this.follows.get(e.keyspaceId)?.state.key(`abcp.intent/${mutationId}`);
     if (row === undefined || row.state !== StateValue) return undefined;
     try {
       const d = getMember(parseJson(row.value), "deadline");

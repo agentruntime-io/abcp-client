@@ -1,4 +1,4 @@
-// What a failed call becomes for the engine (02 [ARC-57], A.7): an `RpcError` with the status of the call and its one ABPC detail, a
+// What a failed call becomes for the engine (02 [ARC-57], A.7): an `RpcError` with the status of the call and its one ABCP detail, a
 // `Reject` or a `Retry`, decoded strictly (rules/canon, 02 [ARC-61]); or a `ProtocolViolation` for a detail that breaks the codec's rules.
 //
 // A failure that has no status of the server's making, a connection that was refused or cut, a deadline, an abort, is `Unavailable`,
@@ -6,7 +6,7 @@
 // is unknown, and the call is sent again with the client backoff.
 
 import { Code, ConnectError } from "@connectrpc/connect";
-import { RejectSchema, RetrySchema, type Reject, type Retry } from "../gen/abpc/v2/types_pb.js";
+import { RejectSchema, RetrySchema, type Reject, type Retry } from "../gen/abcp/v2/types_pb.js";
 import { ProtocolViolation, RpcError, type RpcStatus } from "../engine/errors.js";
 import { decodeMessage } from "../engine/wire.js";
 
@@ -35,8 +35,8 @@ export function statusOfCode(code: number): RpcStatus {
   return STATUS[code] ?? "Unknown";
 }
 
-const REJECT_TYPE = "abpc.v2.Reject";
-const RETRY_TYPE = "abpc.v2.Retry";
+const REJECT_TYPE = "abcp.v2.Reject";
+const RETRY_TYPE = "abcp.v2.Retry";
 
 /** The type name of a detail: its type URL without the prefix (02 [ARC-57]: the prefixed form is accepted too). */
 function detailType(type: string): string {
@@ -45,11 +45,11 @@ function detailType(type: string): string {
 }
 
 /**
- * The one ABPC detail of a status (02 [ARC-57]): the first `abpc.v2.Reject` or `abpc.v2.Retry`; a detail of any other type is
+ * The one ABCP detail of a status (02 [ARC-57]): the first `abcp.v2.Reject` or `abcp.v2.Retry`; a detail of any other type is
  * ignored. The message is decoded as every message of the server is (rules/canon): a `ProtocolViolation` when its bytes break
  * 02 [ARC-61].
  */
-export function abpcDetail(details: readonly { type?: string; value?: Uint8Array }[]): { reject?: Reject; retry?: Retry } {
+export function abcpDetail(details: readonly { type?: string; value?: Uint8Array }[]): { reject?: Reject; retry?: Retry } {
   for (const d of details) {
     if (typeof d.type !== "string" || !(d.value instanceof Uint8Array)) continue; // an outgoing detail never arrives
     switch (detailType(d.type)) {
@@ -83,7 +83,7 @@ export function toFailure(e: unknown, ending: Ending = { deadline: false, aborte
   if (ending.aborted) return new RpcError("Cancelled", "the call was aborted");
   if (e instanceof ConnectError) {
     try {
-      return new RpcError(statusOfCode(e.code), e.rawMessage, abpcDetail(e.details as readonly { type?: string; value?: Uint8Array }[]));
+      return new RpcError(statusOfCode(e.code), e.rawMessage, abcpDetail(e.details as readonly { type?: string; value?: Uint8Array }[]));
     } catch (v) {
       if (v instanceof ProtocolViolation) return v;
       throw v;

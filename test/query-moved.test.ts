@@ -1,6 +1,6 @@
 // The local query layer (C4): moved and staged entities, 14 [CLI-14] with 11 [COORD-73] (the moved key and its statuses), [COORD-76] (what a client shows), [COORD-104] (the
-// freeze) and [COORD-111] (a staged entity is not yet present). The moved key of an entity is `abpc.saga.v1/moved/` and its marker key; the run key of its saga is
-// `abpc.saga.v1/run/{saga_id}`.
+// freeze) and [COORD-111] (a staged entity is not yet present). The moved key of an entity is `abcp.saga.v1/moved/` and its marker key; the run key of its saga is
+// `abcp.saga.v1/run/{saga_id}`.
 
 import { describe, expect, it } from "vitest";
 import { drop, jsonOf, keysOf, KS, put, qrig, watch, type QRig } from "./helpers/query.js";
@@ -16,7 +16,7 @@ const seed = async (): Promise<QRig> => {
 };
 
 const setMoved = async (r: QRig, marker: string, value: Record<string, unknown>): Promise<void> => {
-  put(r, { [`abpc.saga.v1/moved/${marker}`]: value });
+  put(r, { [`abcp.saga.v1/moved/${marker}`]: value });
   await r.engine.settle();
 };
 
@@ -31,7 +31,7 @@ describe("an entity whose moved key says `moving` or `moved` is hidden with its 
         ["issue/2", "json", 1],
       ]);
       const pointer = list.rows[0]?.value;
-      expect(pointer).toEqual({ kind: "moved", status, to: { keyspaceId: "ks-target", key: "issue/1" }, sagaId: "s1", runKey: "abpc.saga.v1/run/s1", run: undefined, failed: false });
+      expect(pointer).toEqual({ kind: "moved", status, to: { keyspaceId: "ks-target", key: "issue/1" }, sagaId: "s1", runKey: "abcp.saga.v1/run/s1", run: undefined, failed: false });
       expect(list.rows[0]?.bindings).toEqual({ i: "1" });
       // no subtree, no row below it, in any kind of query
       expect(keysOf(r.q.run({ keyspaceId: KS, select: { prefix: "issue/1/" } }))).toEqual([]);
@@ -49,7 +49,7 @@ describe("an entity whose moved key says `moving` or `moved` is hidden with its 
   it("the moved key and the run key are plain keys, and are listed as such", async () => {
     const r = await seed();
     await setMoved(r, "issue/1", moved("moving", { to: TO, copy_seq: 7 }));
-    expect(keysOf(r.q.run({ keyspaceId: KS, select: { prefix: "abpc.saga.v1/" } }))).toEqual(["abpc.saga.v1/moved/issue/1"]);
+    expect(keysOf(r.q.run({ keyspaceId: KS, select: { prefix: "abcp.saga.v1/" } }))).toEqual(["abcp.saga.v1/moved/issue/1"]);
   });
 
   it("a filter reads no pointer: it is no json/v1 value", async () => {
@@ -105,10 +105,10 @@ describe("a failed move is shown as failed, with both sides kept as they are (14
     const r = await seed();
     await setMoved(r, "issue/1", moved("moving", { to: TO, copy_seq: 7 }));
     expect(r.q.run({ keyspaceId: KS, select: { entities: "issue/{i}" } }).rows[0]?.value).toMatchObject({ failed: false, run: undefined });
-    put(r, { "abpc.saga.v1/run/s1": { status: "running", saga: "MoveIssue" } });
+    put(r, { "abcp.saga.v1/run/s1": { status: "running", saga: "MoveIssue" } });
     await r.engine.settle();
     expect(r.q.run({ keyspaceId: KS, select: { entities: "issue/{i}" } }).rows[0]?.value).toMatchObject({ failed: false, run: { status: "running" } });
-    put(r, { "abpc.saga.v1/run/s1": { status: "failed", cause: "EPOCH" } });
+    put(r, { "abcp.saga.v1/run/s1": { status: "failed", cause: "EPOCH" } });
     await r.engine.settle();
     expect(r.q.run({ keyspaceId: KS, select: { entities: "issue/{i}" } }).rows[0]?.value).toMatchObject({ kind: "moved", status: "moving", failed: true, run: { status: "failed", cause: "EPOCH" } });
   });
@@ -133,7 +133,7 @@ describe("live queries follow the moved keys", () => {
     expect(pre.after()).toHaveLength(1);
     expect(tpl.after()).toHaveLength(1);
     // the entity is moved back (the moved key is deleted: a compensation, 11 [COORD-75]): everything is shown again
-    drop(r, "abpc.saga.v1/moved/issue/1");
+    drop(r, "abcp.saga.v1/moved/issue/1");
     await r.engine.settle();
     expect(ent.log()).toEqual(["~issue/1", "~issue/1", "~issue/1"]);
     expect(pre.log().sort()).toEqual(["+issue/1/comment/5", "+issue/1/comment/5/text", "+issue/1/title", "-issue/1/comment/5", "-issue/1/comment/5/text", "-issue/1/title"]);
@@ -150,7 +150,7 @@ describe("live queries follow the moved keys", () => {
     await setMoved(r, "issue/3", { status: "active", saga_id: "s2", saga: "MoveIssue", from: TO });
     expect(ent.log()).toEqual(["+issue/3"]);
     await setMoved(r, "issue/1", moved("moving", { to: TO, copy_seq: 1 }));
-    put(r, { "abpc.saga.v1/run/s1": { status: "failed", cause: "EPOCH" } });
+    put(r, { "abcp.saga.v1/run/s1": { status: "failed", cause: "EPOCH" } });
     await r.engine.settle();
     expect(ent.log()).toEqual(["+issue/3", "~issue/1", "~issue/1"]);
     expect(ent.after()[2]?.changed[0]?.after.value).toMatchObject({ failed: true });
@@ -176,7 +176,7 @@ describe("the interest decides whether moves can be seen (14 [CLI-14], [CLI-71])
   const withInterest = async (interest: string[]): Promise<QRig> => {
     const r = await qrig({ keyspaces: [], start: false });
     r.server.createKeyspaceNow(KS);
-    put(r, { "issue/1": {}, "issue/1/title": "one", "abpc.saga.v1/moved/issue/1": moved("moved", { to: TO, at: "2026-01-01T00:00:00Z" }) });
+    put(r, { "issue/1": {}, "issue/1/title": "one", "abcp.saga.v1/moved/issue/1": moved("moved", { to: TO, at: "2026-01-01T00:00:00Z" }) });
     await r.engine.addKeyspace(KS, { interest });
     r.engine.start();
     await r.engine.settle();
@@ -184,7 +184,7 @@ describe("the interest decides whether moves can be seen (14 [CLI-14], [CLI-71])
   };
 
   it("with the moved keys in the interest the pointer is shown and movesTracked says so; without them the entity is shown as any other, and movesTracked says it cannot know", async () => {
-    const a = await withInterest(["issue", "abpc.saga.v1"]);
+    const a = await withInterest(["issue", "abcp.saga.v1"]);
     const ra = a.q.run({ keyspaceId: KS, select: { entities: "issue/{i}" } });
     expect(ra.rows[0]?.value.kind).toBe("moved");
     expect(ra.movesTracked).toBe(true);

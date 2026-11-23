@@ -20,7 +20,7 @@
 // and of array items.
 
 import * as Y from "yjs";
-import { ChangeKind, DecisionStatus, RecordKind, type KeyEntry, type Record as RecordMessage } from "../gen/abpc/v2/types_pb.js";
+import { ChangeKind, DecisionStatus, RecordKind, type KeyEntry, type Record as RecordMessage } from "../gen/abcp/v2/types_pb.js";
 import { parseUpdate, type Roots } from "../rules/crdt/index.js";
 import { Analysis, Doc as FoldDoc, noOpForGood, unionRanges } from "../rules/crdt/doc.js";
 import { StateValue, VersionTopology, type ReplicaState, type Rules } from "../rules/fold/index.js";
@@ -29,7 +29,7 @@ import type { Random } from "./clock.js";
 import { newYjsClientId } from "./ids.js";
 
 /** The origin of every transaction that the engine itself starts on a document. */
-export const ENGINE_ORIGIN = Symbol("abpc.engine");
+export const ENGINE_ORIGIN = Symbol("abcp.engine");
 
 /** Applies an update that came from storage or the server; one that Yjs cannot read is left out, never thrown (14 [CLI-20], [CLI-29]). */
 function safeApply(doc: Y.Doc, update: Uint8Array, origin?: unknown): boolean {

@@ -1,8 +1,8 @@
 // The public types of the engine: what an app submits, what it is told (14 §14.5), the hooks it registers, and the sync status
 // it can read (14 [CLI-41]). The stored records of the durable outbox are in storage.ts.
 
-import type { ChangeKind, Reject, Stale } from "../gen/abpc/v2/types_pb.js";
-import type { KeyChange, Precondition } from "../gen/abpc/v2/types_pb.js";
+import type { ChangeKind, Reject, Stale } from "../gen/abcp/v2/types_pb.js";
+import type { KeyChange, Precondition } from "../gen/abcp/v2/types_pb.js";
 import type { LaneName } from "./manifests.js";
 import type { StorageMode } from "./storage.js";
 
@@ -305,7 +305,7 @@ export interface ProtocolErrorEvent extends Base {
   what: string;
   detail: string;
   keyspaces: string[];
-  /** For a `Mutate` call that failed as a whole with a status that has no ABPC detail and no reaction in A.7 (14 [CLI-50]): the RPC status. */
+  /** For a `Mutate` call that failed as a whole with a status that has no ABCP detail and no reaction in A.7 (14 [CLI-50]): the RPC status. */
   status?: string;
   /** For such a `Mutate` failure: the lanes of the request, which the client holds (Table 14.1). */
   lanes?: { keyspaceId: string; lane: LaneName }[];

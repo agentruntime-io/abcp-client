@@ -4,7 +4,7 @@
 
 import { create } from "@bufbuild/protobuf";
 import { describe, expect, it } from "vitest";
-import { ChangeKind, KeyChangeSchema, RecordKind, RecordSchema } from "../src/gen/abpc/v2/types_pb.js";
+import { ChangeKind, KeyChangeSchema, RecordKind, RecordSchema } from "../src/gen/abcp/v2/types_pb.js";
 import { applyRecord, inSubtree, ReplicaState, StateValue, VersionTopology, type KeyRow, type Tombstone } from "../src/rules/fold/index.js";
 import { compareUtf8 } from "../src/rules/bytes.js";
 import { VectorRules } from "./helpers/rules.js";

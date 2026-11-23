@@ -77,37 +77,37 @@ export type Bound = number | { perOctets: number };
  */
 export const BOUNDS: Readonly<Record<string, Bound>> = {
   // -- a Mutate answer: the request's own counts apply (`DecodeLimits`), these are the protocol maxima --
-  "abpc.v2.Appended.overwrote_newer": MAX_CHANGES_PER_ACTION, // 05 [STATE-62]: indexes of the action's changes
-  "abpc.v2.MutateResponse.results": MAX_MUTATIONS_PER_REQUEST, // 07 [MUT-4]
-  "abpc.v2.MutateResponse.watermarks": MAX_MUTATIONS_PER_REQUEST, // 07 [MUT-7]: a pair for each lane that the request touched
-  "abpc.v2.GetMutationResultsResponse.results": 100, // 07 [MUT-107]
+  "abcp.v2.Appended.overwrote_newer": MAX_CHANGES_PER_ACTION, // 05 [STATE-62]: indexes of the action's changes
+  "abcp.v2.MutateResponse.results": MAX_MUTATIONS_PER_REQUEST, // 07 [MUT-4]
+  "abcp.v2.MutateResponse.watermarks": MAX_MUTATIONS_PER_REQUEST, // 07 [MUT-7]: a pair for each lane that the request touched
+  "abcp.v2.GetMutationResultsResponse.results": 100, // 07 [MUT-107]
   // -- state --
-  "abpc.v2.LoadStateResponse.entries": MAX_PAGE_SIZE, // 09 [READ-10] (the request's `page_size` applies)
-  "abpc.v2.LoadStateResponse.successors": MAX_SUCCESSORS,
-  "abpc.v2.LoadStateResponse.lane_watermarks": MAX_KEYSPACES_PER_SESSION * LANES,
-  "abpc.v2.LoadStateResponse.redactions": MAX_REDACTIONS_PER_PAGE,
-  "abpc.v2.UpdateSubscriptionResponse.rejected": 2 * MAX_KEYSPACES_PER_SESSION, // 09 [READ-62]: bounded by the request's `add` and `set_interest`
-  "abpc.v2.RefreshSessionResponse.dropped_keyspace_ids": MAX_KEYSPACES_PER_SESSION,
+  "abcp.v2.LoadStateResponse.entries": MAX_PAGE_SIZE, // 09 [READ-10] (the request's `page_size` applies)
+  "abcp.v2.LoadStateResponse.successors": MAX_SUCCESSORS,
+  "abcp.v2.LoadStateResponse.lane_watermarks": MAX_KEYSPACES_PER_SESSION * LANES,
+  "abcp.v2.LoadStateResponse.redactions": MAX_REDACTIONS_PER_PAGE,
+  "abcp.v2.UpdateSubscriptionResponse.rejected": 2 * MAX_KEYSPACES_PER_SESSION, // 09 [READ-62]: bounded by the request's `add` and `set_interest`
+  "abcp.v2.RefreshSessionResponse.dropped_keyspace_ids": MAX_KEYSPACES_PER_SESSION,
   // -- the stream --
-  "abpc.v2.RecordsFrame.records": { perOctets: 32 }, // 09 [READ-101]: only the 16 MiB bound; a record holds its 32-octet chain hash (06 [LOG-71])
-  "abpc.v2.HeartbeatFrame.cursors": MAX_KEYSPACES_PER_SESSION, // 09 [READ-54]: one for each followed keyspace
-  "abpc.v2.HeartbeatFrame.lane_watermarks": MAX_KEYSPACES_PER_SESSION * LANES,
-  "abpc.v2.ControlFrame.KeyspaceDropped.successors": MAX_SUCCESSORS,
-  "abpc.v2.PresenceFrame.entries": { perOctets: 16 }, // 09 [READ-101], [READ-79]: members are capped by the app's `max_presence_members_per_topic`, whose maximum is the u32
-  "abpc.v2.PresenceFrame.left_client_ids": { perOctets: 38 }, // a client_id is a UUID, 36 characters (03 [ID-35])
+  "abcp.v2.RecordsFrame.records": { perOctets: 32 }, // 09 [READ-101]: only the 16 MiB bound; a record holds its 32-octet chain hash (06 [LOG-71])
+  "abcp.v2.HeartbeatFrame.cursors": MAX_KEYSPACES_PER_SESSION, // 09 [READ-54]: one for each followed keyspace
+  "abcp.v2.HeartbeatFrame.lane_watermarks": MAX_KEYSPACES_PER_SESSION * LANES,
+  "abcp.v2.ControlFrame.KeyspaceDropped.successors": MAX_SUCCESSORS,
+  "abcp.v2.PresenceFrame.entries": { perOctets: 16 }, // 09 [READ-101], [READ-79]: members are capped by the app's `max_presence_members_per_topic`, whose maximum is the u32
+  "abcp.v2.PresenceFrame.left_client_ids": { perOctets: 38 }, // a client_id is a UUID, 36 characters (03 [ID-35])
   // -- the blob calls (09 §9.9): the one field of an answer that holds many; the calls of 09 §9.8 answer with a timestamp or nothing --
-  "abpc.v2.CreateUploadResponse.upload_headers": MAX_UPLOAD_HEADERS,
+  "abcp.v2.CreateUploadResponse.upload_headers": MAX_UPLOAD_HEADERS,
   // -- what a message holds --
-  "abpc.v2.KeyspaceCursor.interest_prefixes": MAX_INTEREST_PREFIXES, // 04 Table 4.10a: the frame of a `KeyspaceAdded`
-  "abpc.v2.Principal.actor_chain": MAX_ACTOR_CHAIN,
-  "abpc.v2.ServerInfo.features": MAX_FEATURE_NAMES,
-  "abpc.v2.Reject.successors": MAX_SUCCESSORS,
-  "abpc.v2.Reject.details": MAX_REJECT_DETAILS,
-  "abpc.v2.Record.required_features": MAX_FEATURE_NAMES,
-  "abpc.v2.Record.changes": MAX_CHANGES_PER_RECORD,
-  "abpc.v2.Record.overwrote_newer": MAX_CHANGES_PER_RECORD,
-  "abpc.v2.Record.previous": MAX_CHANGES_PER_RECORD, // 06 [LOG-21]: aligned with `changes`
-  "abpc.v2.Record.blob_refs": MAX_BLOB_REFS,
+  "abcp.v2.KeyspaceCursor.interest_prefixes": MAX_INTEREST_PREFIXES, // 04 Table 4.10a: the frame of a `KeyspaceAdded`
+  "abcp.v2.Principal.actor_chain": MAX_ACTOR_CHAIN,
+  "abcp.v2.ServerInfo.features": MAX_FEATURE_NAMES,
+  "abcp.v2.Reject.successors": MAX_SUCCESSORS,
+  "abcp.v2.Reject.details": MAX_REJECT_DETAILS,
+  "abcp.v2.Record.required_features": MAX_FEATURE_NAMES,
+  "abcp.v2.Record.changes": MAX_CHANGES_PER_RECORD,
+  "abcp.v2.Record.overwrote_newer": MAX_CHANGES_PER_RECORD,
+  "abcp.v2.Record.previous": MAX_CHANGES_PER_RECORD, // 06 [LOG-21]: aligned with `changes`
+  "abcp.v2.Record.blob_refs": MAX_BLOB_REFS,
 };
 
 /** The counts that the call fixes: by `<message>.<field>`, each at most the bound of the table. */

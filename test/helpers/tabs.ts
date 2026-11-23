@@ -4,10 +4,10 @@
 import { Engine, StaticManifests, type EngineConfig, type EngineEvent } from "../../src/engine/index.js";
 import { MemoryDevice, MemoryTab, type MemoryTabOptions } from "../../src/engine/tabs-memory.js";
 import { FakeServer, ManualClock, SeededRandom, type FakeTransport } from "../../src/fake/index.js";
-import type { Principal } from "../../src/gen/abpc/v2/types_pb.js";
+import type { Principal } from "../../src/gen/abcp/v2/types_pb.js";
 import { KS, MANIFEST } from "./engine.js";
 
-export const ORIGIN = "https://abpc.test";
+export const ORIGIN = "https://abcp.test";
 
 export interface TabEngine {
   tab: MemoryTab;

@@ -3,7 +3,7 @@
 
 import { create } from "@bufbuild/protobuf";
 import { StaticManifests, type StaticManifestSpec } from "../../src/engine/index.js";
-import { ChangeKind, KeyChangeSchema, type KeyChange } from "../../src/gen/abpc/v2/types_pb.js";
+import { ChangeKind, KeyChangeSchema, type KeyChange } from "../../src/gen/abcp/v2/types_pb.js";
 import { createQueries, type LiveQuery, type LiveUpdate, type Queries, type Query, type QueryResult, type Row } from "../../src/query/index.js";
 import { jsonBytes } from "../../src/engine/index.js";
 import { KS, rig, type Rig, type RigOptions } from "./engine.js";

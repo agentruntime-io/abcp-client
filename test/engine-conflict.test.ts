@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { create } from "@bufbuild/protobuf";
 import * as Y from "yjs";
 import { del, set, crdtUpdate, type ConflictContext } from "../src/engine/index.js";
-import { PrincipalSchema, Code, StaleCause, StaleSchema, type Reject } from "../src/gen/abpc/v2/types_pb.js";
+import { PrincipalSchema, Code, StaleCause, StaleSchema, type Reject } from "../src/gen/abcp/v2/types_pb.js";
 import { reject as mk } from "../src/fake/index.js";
 import { goOffline, goOnline, kc, KS, ofType, rejectResult, rig, sentIds, tick, types, type Rig } from "./helpers/engine.js";
 

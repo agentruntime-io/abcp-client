@@ -24,7 +24,7 @@ export interface Ctx {
   view: KeyspaceView;
   info: KeyspaceInfo;
   index: KeyIndex;
-  /** The copy holds some moved key (`abpc.saga.v1/moved/…`), so that moved and staged entities have to be looked for (14 [CLI-14]). */
+  /** The copy holds some moved key (`abcp.saga.v1/moved/…`), so that moved and staged entities have to be looked for (14 [CLI-14]). */
   movedAny: boolean;
 }
 
@@ -99,7 +99,7 @@ function movedKeyOf(ctx: Ctx, marker: string): MovedKey | undefined {
   }
 }
 
-/** What the run key `abpc.saga.v1/run/{saga_id}` says of the move, when the copy holds it. */
+/** What the run key `abcp.saga.v1/run/{saga_id}` says of the move, when the copy holds it. */
 function runOf(ctx: Ctx, sagaId: string): { status: string; cause: string | undefined } | undefined {
   const rv = ctx.view.get(`${RUN_PREFIX}${sagaId}`);
   if (rv === undefined || rv.redacted || rv.isNull || rv.crdt || rv.encoding !== "json/v1" || !rv.decodable) return undefined;

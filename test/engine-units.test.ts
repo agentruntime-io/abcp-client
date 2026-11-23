@@ -8,8 +8,8 @@ import { DEFAULT_CLASS, isKnownCode, isRecordedReject, isKnownRetryReason, isKno
 import { dependsOn, decodeContent, encodeContent, stamped, type DepView } from "../src/engine/entry.js";
 import { isMutationId, newUuid, newYjsClientId } from "../src/engine/ids.js";
 import { MemoryStorage, StaticManifests, StoreFull, StorageError, Engine } from "../src/engine/index.js";
-import { MutationSchema } from "../src/gen/abpc/v2/sync_pb.js";
-import { ChangeKind, Code, ErrorClass, KeyChangeSchema, PreconditionSchema, RetryReason } from "../src/gen/abpc/v2/types_pb.js";
+import { MutationSchema } from "../src/gen/abcp/v2/sync_pb.js";
+import { ChangeKind, Code, ErrorClass, KeyChangeSchema, PreconditionSchema, RetryReason } from "../src/gen/abcp/v2/types_pb.js";
 import { FakeServer, ManualClock, SeededRandom } from "../src/fake/index.js";
 import { KS, MANIFEST, rig } from "./helpers/engine.js";
 
@@ -187,7 +187,7 @@ describe("14 [CLI-30] dependency rules as functions", () => {
     expect(dep(view("b", ["x"], [{ prefix: "p/" }]), view("a", ["p/q"]))).toBe(true);
     expect(dep(view("b", ["x"], [{ prefix: "p/" }]), view("a", ["z/q"]))).toBe(false);
     expect(dep(view("b", ["x"], [{ key: "k", after: "a" }]), view("a", ["y"]))).toBe(true);
-    expect(dep(view("b", ["x"], [{ key: "abpc.intent/a" }]), view("a", ["y"]))).toBe(true);
+    expect(dep(view("b", ["x"], [{ key: "abcp.intent/a" }]), view("a", ["y"]))).toBe(true);
     expect(dep(view("b", ["x"]), view("a", ["y"]), ["a"])).toBe(true);
     expect(dep(view("b", ["x"], [], "Bar"), view("a", ["y"]))).toBe(true);
     expect(dep(view("b", ["x"]), view("a", ["y"], [], "Bar"))).toBe(true);

@@ -3,8 +3,8 @@
 import { describe, expect, it } from "vitest";
 import { create } from "@bufbuild/protobuf";
 import { del, set } from "../src/engine/index.js";
-import { HeartbeatFrame_CursorSchema, HeartbeatFrameSchema, LaneWatermarkSchema, SubscribeResponseSchema } from "../src/gen/abpc/v2/sync_pb.js";
-import { Code, ErrorClass, Lane, RetryReason } from "../src/gen/abpc/v2/types_pb.js";
+import { HeartbeatFrame_CursorSchema, HeartbeatFrameSchema, LaneWatermarkSchema, SubscribeResponseSchema } from "../src/gen/abcp/v2/sync_pb.js";
+import { Code, ErrorClass, Lane, RetryReason } from "../src/gen/abcp/v2/types_pb.js";
 import { reject as mk } from "../src/fake/index.js";
 import { goOffline, goOnline, KS, mutateRequests, ofType, rejectResult, retryResult, rig, sentIds, tick, types, type Rig } from "./helpers/engine.js";
 
@@ -44,11 +44,11 @@ describe("14 [CLI-30] an action depends on an earlier action of the same keyspac
     expect(dependsOf(r, none.mutationId)).toEqual([]);
   });
 
-  it("item 3: a precondition on A's intent row `abpc.intent/{A}`", async () => {
+  it("item 3: a precondition on A's intent row `abcp.intent/{A}`", async () => {
     const r = await rig();
     await goOffline(r);
     const g = (await r.engine.submit({ keyspaceId: KS, opType: "Approve", changes: [set("settings/g", 1)] })).mutationId;
-    const b = await r.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/b", 1)], preconditions: [{ key: `abpc.intent/${g}`, exists: true }] });
+    const b = await r.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/b", 1)], preconditions: [{ key: `abcp.intent/${g}`, exists: true }] });
     expect(dependsOf(r, b.mutationId)).toEqual([g]);
   });
 

@@ -7,8 +7,8 @@ import { QueryError } from "./errors.js";
 import { compileFilter, type Compiled } from "./filter.js";
 import type { Coverage, Query } from "./types.js";
 
-export const MOVED_PREFIX = "abpc.saga.v1/moved/";
-export const RUN_PREFIX = "abpc.saga.v1/run/";
+export const MOVED_PREFIX = "abcp.saga.v1/moved/";
+export const RUN_PREFIX = "abcp.saga.v1/run/";
 
 /** Whether the key is under one of the interest prefixes (09 [READ-22]): equal to it or below it; an empty interest is the whole keyspace. */
 export function inInterest(interest: readonly string[], key: string): boolean {
@@ -249,7 +249,7 @@ export class Plan {
     return some ? "partial" : "none";
   }
 
-  /** The keys whose moved keys (`abpc.saga.v1/moved/…`) are read for this query are within the interest, so that moved and staged entities are recognised (14 [CLI-14]). */
+  /** The keys whose moved keys (`abcp.saga.v1/moved/…`) are read for this query are within the interest, so that moved and staged entities are recognised (14 [CLI-14]). */
   movesTracked(interest: readonly string[]): boolean {
     if (interest.length === 0) return true;
     if (this.kind === "keys") return this.keys.every((k) => isReservedKey(k) || inInterest(interest, `${MOVED_PREFIX}${k}`));

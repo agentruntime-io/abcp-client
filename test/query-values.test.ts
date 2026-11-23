@@ -4,7 +4,7 @@
 import { describe, expect, it } from "vitest";
 import { create } from "@bufbuild/protobuf";
 import * as Y from "yjs";
-import { ChangeKind, KeyChangeSchema } from "../src/gen/abpc/v2/types_pb.js";
+import { ChangeKind, KeyChangeSchema } from "../src/gen/abcp/v2/types_pb.js";
 import { incr, set } from "../src/engine/index.js";
 import { utf8Encode } from "../src/rules/bytes.js";
 import { jsonOf, KS, put, qrig, rawSet, type QRig } from "./helpers/query.js";

@@ -8,8 +8,8 @@ import * as Y from "yjs";
 import { describe, expect, it } from "vitest";
 import { jsonBytes, set, type EngineEvent } from "../src/engine/index.js";
 import { decodeContent, dependsOn, type DepView } from "../src/engine/entry.js";
-import { MutationSchema } from "../src/gen/abpc/v2/sync_pb.js";
-import { Code, ChangeKind, KeyChangeSchema, KeyEntrySchema, RecordKind, RetryReason, StaleCause, SystemKind, type KeyChange } from "../src/gen/abpc/v2/types_pb.js";
+import { MutationSchema } from "../src/gen/abcp/v2/sync_pb.js";
+import { Code, ChangeKind, KeyChangeSchema, KeyEntrySchema, RecordKind, RetryReason, StaleCause, SystemKind, type KeyChange } from "../src/gen/abcp/v2/types_pb.js";
 import { reject as mk } from "../src/fake/index.js";
 import { createQueries } from "../src/query/index.js";
 import { brig, bytesOf, drive } from "./helpers/presence.js";
@@ -159,7 +159,7 @@ describe("14 [CLI-76] a REDACTED record: every local copy of the values of its e
     await r.engine.settle();
     const over = (key: string, v: string): KeyChange => create(KeyChangeSchema, { key, kind: ChangeKind.OVERRIDE, value: jsonBytes(v), encoding: "json/v1" });
     const prev = (key: string, v: string): ReturnType<typeof create<typeof KeyEntrySchema>> => create(KeyEntrySchema, { key, value: jsonBytes(v), encoding: "json/v1", version: 1n, changedBy: "someone" });
-    r.server.write(KS, [over("settings/e", "NEW-E"), over("settings/s", "NEW-S")], { opType: "abpc.Override", previous: [prev("settings/e", SECRET), prev("settings/s", OTHER)] });
+    r.server.write(KS, [over("settings/e", "NEW-E"), over("settings/s", "NEW-S")], { opType: "abcp.Override", previous: [prev("settings/e", SECRET), prev("settings/s", OTHER)] });
     await r.engine.settle();
     expect(holds(r.storage.replica(KS)?.tail, SECRET)).toBe(true); // the previous entry of the key holds its value in the client's copy
     r.server.redact(KS, ["settings/e"]);
@@ -197,7 +197,7 @@ describe("14 [CLI-76] a REDACTED record: every local copy of the values of its e
 
   it("a saga's start document: the run-key SET of the record replaces the start document that a journal, a dead-letter and an export entry hold (CLI-76, 12 [ADM-65], 11 [COORD-58])", async () => {
     const r = await rig();
-    const RUN = "abpc.saga.v1/run/saga-1";
+    const RUN = "abcp.saga.v1/run/saga-1";
     const b64 = Buffer.from(JSON.stringify(SECRET)).toString("base64");
     const steps = [{ name: "s1", base_seq: 0, base_log_epoch: 1, changes: [{ key: "settings/e", kind: "CHANGE_KIND_SET", value: b64, encoding: "json/v1", seenVersion: "0" }], compensate: [] }];
     const startDoc = (): Uint8Array => jsonBytes({ saga: "S", params: { n: 1 }, steps });

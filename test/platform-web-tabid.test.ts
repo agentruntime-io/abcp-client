@@ -12,7 +12,7 @@ import { createWebHost, type WebEnv, type WebTab } from "../src/platform/web.js"
 import { FakeIDBFactory } from "./helpers/fake-idb.js";
 import { KS, MANIFEST } from "./helpers/engine.js";
 
-const TAB_KEY = "abpc.tabId";
+const TAB_KEY = "abcp.tabId";
 const BC = globalThis.BroadcastChannel as unknown as BroadcastChannelConstructor;
 
 /** The `sessionStorage` of one page: a Map that a duplicate of the tab copies. */
@@ -136,7 +136,7 @@ describe("V19 N5: the engine reads the tab id only once the host has settled it"
       manifests,
       clock,
       random: new SeededRandom(5),
-      origin: "https://abpc.test",
+      origin: "https://abcp.test",
       tab: host,
     };
     const engine = await Engine.create(config);

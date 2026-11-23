@@ -1,6 +1,6 @@
-# abpc-client
+# abcp-client
 
-The ABPC v2 client engine and its local query layer, in TypeScript, for browsers (React and others) and for Node servers.
+The ABCP v2 client engine and its local query layer, in TypeScript, for browsers (React and others) and for Node servers.
 
 The engine keeps a local replica of the keyspaces an app follows, sends the app's changes as actions, folds the records the server
 serves, and tells the app what it shows. The query layer answers live queries over that replica.
@@ -19,20 +19,20 @@ npm run build      # compiles src/ to dist/
 npm test           # the fast unit tests
 ```
 
-`npm test` runs in a few seconds. The heavy tests need a checkout of the ABPC server repo and skip without one, naming the reason
-"needs an abpc-server checkout (ABPC_SERVER_DIR); runs in the server's release checks":
+`npm test` runs in a few seconds. The heavy tests need a checkout of the ABCP server repo and skip without one, naming the reason
+"needs an abcp-server checkout (ABCP_SERVER_DIR); runs in the server's release checks":
 
 - the conformance vectors (`conformance/vectors`),
 - the CRDT test data (`server/internal/crdt/testdata`),
 - the integration tests, which build the Go server from `server/` (they also need a Go toolchain on the `PATH`).
 
-To run them, point `ABPC_SERVER_DIR` at that checkout:
+To run them, point `ABCP_SERVER_DIR` at that checkout:
 
 ```sh
-ABPC_SERVER_DIR=../abpc-server npm test
+ABCP_SERVER_DIR=../abcp-server npm test
 ```
 
-`ABPC_SKIP_INTEGRATION=1` skips only the integration tests that run the Go server.
+`ABCP_SKIP_INTEGRATION=1` skips only the integration tests that run the Go server.
 
 ## Entry points
 
@@ -48,6 +48,6 @@ After `npm run build`, apps import from `dist/`:
 
 ## The wire code
 
-`src/gen` is generated from `proto/abpc` (the ABPC v2 wire protos) with `buf` and `protoc-gen-es`. To regenerate it, run
-`npm run gen`; the output must not change unless the protos do. `test/gen/abpctest` is generated code for the test profile's control
+`src/gen` is generated from `proto/abcp` (the ABCP v2 wire protos) with `buf` and `protoc-gen-es`. To regenerate it, run
+`npm run gen`; the output must not change unless the protos do. `test/gen/abcptest` is generated code for the test profile's control
 API, used by the integration tests; it is kept as it is.

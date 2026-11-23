@@ -45,11 +45,11 @@ export interface Rules {
  */
 export const RESERVED_TEMPLATE: Template = { rule: "lww", entity: false, parent: "" };
 
-/** True when the key's first segment is `abpc` or starts with `abpc.` (03 §3.8). The key is not validated. */
+/** True when the key's first segment is `abcp` or starts with `abcp.` (03 §3.8). The key is not validated. */
 export function isReservedKey(key: string): boolean {
   const slash = key.indexOf("/");
   const first = slash < 0 ? key : key.slice(0, slash);
-  return first === "abpc" || first.startsWith("abpc.");
+  return first === "abcp" || first.startsWith("abcp.");
 }
 
 /** Tells the state how the keys of a keyspace relate (05 §5.6), which only the templates of a manifest version know. */

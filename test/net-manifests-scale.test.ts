@@ -5,7 +5,7 @@
 
 import { create } from "@bufbuild/protobuf";
 import { describe, expect, it } from "vitest";
-import { GetManifestResponseSchema, type GetManifestResponse } from "../src/gen/abpc/v2/sync_pb.js";
+import { GetManifestResponseSchema, type GetManifestResponse } from "../src/gen/abcp/v2/sync_pb.js";
 import { readManifest } from "../src/net/index.js";
 import { sha256 } from "../src/rules/crypto.js";
 import { jsonv1 } from "../src/rules/index.js";

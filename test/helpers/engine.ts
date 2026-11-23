@@ -2,7 +2,7 @@
 
 import { Engine, MemoryStorage, StaticManifests, type EngineConfig, type EngineEvent, type StaticManifestSpec } from "../../src/engine/index.js";
 import { FakeServer, ManualClock, SeededRandom } from "../../src/fake/index.js";
-import type { Principal } from "../../src/gen/abpc/v2/types_pb.js";
+import type { Principal } from "../../src/gen/abcp/v2/types_pb.js";
 
 export const KS = "ks1";
 
@@ -117,7 +117,7 @@ export const text = (b: Uint8Array | undefined): string | undefined => (b === un
 // ---------------------------------------------------------------------------------------------------------------------
 
 import { create } from "@bufbuild/protobuf";
-import { CasExpectSchema, ChangeKind, KeyChangeSchema, type KeyChange } from "../../src/gen/abpc/v2/types_pb.js";
+import { CasExpectSchema, ChangeKind, KeyChangeSchema, type KeyChange } from "../../src/gen/abcp/v2/types_pb.js";
 import { jsonBytes } from "../../src/engine/index.js";
 
 /** A KeyChange for a write that the server makes directly (`FakeServer.write`). */
@@ -149,8 +149,8 @@ export async function goOnline(r: Rig): Promise<void> {
 
 // ---------------------------------------------------------------------------------------------------------------------
 
-import { MutateRequestSchema, MutationResultSchema, type Mutation, type MutationResult } from "../../src/gen/abpc/v2/sync_pb.js";
-import { RetrySchema, type Reject, type RetryReason } from "../../src/gen/abpc/v2/types_pb.js";
+import { MutateRequestSchema, MutationResultSchema, type Mutation, type MutationResult } from "../../src/gen/abcp/v2/sync_pb.js";
+import { RetrySchema, type Reject, type RetryReason } from "../../src/gen/abcp/v2/types_pb.js";
 
 /** The `Mutate` requests that reached the server, in order. */
 export function mutateRequests(r: Rig): ReturnType<typeof create<typeof MutateRequestSchema>>[] {

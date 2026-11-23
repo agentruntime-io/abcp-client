@@ -4,8 +4,8 @@
 import { describe, expect, it } from "vitest";
 import { create, toBinary } from "@bufbuild/protobuf";
 import { del, jsonBytes, set, StaticManifests, type ConflictContext, type EngineEvent } from "../src/engine/index.js";
-import { MutateRequestSchema } from "../src/gen/abpc/v2/sync_pb.js";
-import { ChangeKind, Code, ErrorClass, RetryReason, StaleCause, SuccessorRuleSchema, type SuccessorRule } from "../src/gen/abpc/v2/types_pb.js";
+import { MutateRequestSchema } from "../src/gen/abcp/v2/sync_pb.js";
+import { ChangeKind, Code, ErrorClass, RetryReason, StaleCause, SuccessorRuleSchema, type SuccessorRule } from "../src/gen/abcp/v2/types_pb.js";
 import { LaneState } from "../src/engine/follow.js";
 import { ManualClock, reject as mk, rejectWith } from "../src/fake/index.js";
 import { goOffline, goOnline, kc, kcCas, KS, MANIFEST, mutateRequests, ofType, rejectResult, retryResult, rig, sentIds, tick, types, type Rig } from "./helpers/engine.js";
@@ -422,7 +422,7 @@ describe("14 [CLI-27]: slot use is decided by the lane's watermark, never by the
 // ---------------------------------------------------------------------------------------------------------------------
 // A.7 "stop and report" for a whole-call Mutate failure: the lane hold of 14 [CLI-50] and Table 14.1 (draft 14; was Q42.5)
 
-describe("14 [CLI-50], Table 14.1, A.7: a Mutate call that fails as a whole with a status and no ABPC detail holds each lane of the request", () => {
+describe("14 [CLI-50], Table 14.1, A.7: a Mutate call that fails as a whole with a status and no ABCP detail holds each lane of the request", () => {
   for (const status of ["NotFound", "AlreadyExists", "FailedPrecondition"] as const) {
     it(`${status} with no detail: stop and report (the lane is held and held says so), resend only with the hold backoff, clear on a result`, async () => {
       const r = await rig();

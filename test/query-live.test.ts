@@ -5,7 +5,7 @@
 import { describe, expect, it } from "vitest";
 import * as Y from "yjs";
 import { create } from "@bufbuild/protobuf";
-import { Code, ChangeKind, KeyChangeSchema } from "../src/gen/abpc/v2/types_pb.js";
+import { Code, ChangeKind, KeyChangeSchema } from "../src/gen/abcp/v2/types_pb.js";
 import { reject as mk } from "../src/fake/index.js";
 import { del, set } from "../src/engine/index.js";
 import { goOffline, goOnline, kc, rejectResult } from "./helpers/engine.js";

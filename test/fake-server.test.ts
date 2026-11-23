@@ -6,8 +6,8 @@ import { describe, expect, it } from "vitest";
 import { create } from "@bufbuild/protobuf";
 import { RpcError, StaticManifests, jsonBytes, type RpcStatus } from "../src/engine/index.js";
 import { encodeContent } from "../src/engine/entry.js";
-import { MutateRequestSchema, MutationSchema, type Mutation, type MutateResponse, type MutationResult } from "../src/gen/abpc/v2/sync_pb.js";
-import { ChangeKind, Code, ErrorClass, KeyChangeSchema, Lane, RetryReason, StaleCause, SuccessorRuleSchema, type SuccessorRule } from "../src/gen/abpc/v2/types_pb.js";
+import { MutateRequestSchema, MutationSchema, type Mutation, type MutateResponse, type MutationResult } from "../src/gen/abcp/v2/sync_pb.js";
+import { ChangeKind, Code, ErrorClass, KeyChangeSchema, Lane, RetryReason, StaleCause, SuccessorRuleSchema, type SuccessorRule } from "../src/gen/abcp/v2/types_pb.js";
 import { DEFAULT_CLASS } from "../src/engine/codes.js";
 import { FakeServer, ManualClock, reject as mk, rejectWith } from "../src/fake/index.js";
 import { KS, MANIFEST, rejectResult } from "./helpers/engine.js";
@@ -110,7 +110,7 @@ describe("the fake server: lanes and idempotency (07 §7.4, §7.6)", () => {
     const { t, server } = setup();
     await send(t, mut({ seq: 1, key: "settings/a", value: 1 }));
     const pre = mut({ seq: 2, key: "settings/b" });
-    pre.preconditions = [{ $typeName: "abpc.v2.Precondition", target: { case: "key", value: "settings/a" }, check: { case: "unchangedSince", value: 0n }, logEpoch: 1 }];
+    pre.preconditions = [{ $typeName: "abcp.v2.Precondition", target: { case: "key", value: "settings/a" }, check: { case: "unchangedSince", value: 0n }, logEpoch: 1 }];
     const r = await send(t, pre);
     expect(r.results[0]?.outcome.value).toMatchObject({ code: Code.STALE, stale: { cause: StaleCause.VERSION_MISMATCH } });
     const stale = mut({ seq: 3, baseEpoch: 9 });
@@ -129,14 +129,14 @@ describe("the fake server: results and a restore (07 [MUT-53], [MUT-104], [MUT-1
     const { t, server } = setup();
     const m = mut({ seq: 1 });
     await send(t, m);
-    const known = await t.getMutationResult({ $typeName: "abpc.v2.GetMutationResultRequest", keyspaceId: KS, mutationId: m.mutationId });
+    const known = await t.getMutationResult({ $typeName: "abcp.v2.GetMutationResultRequest", keyspaceId: KS, mutationId: m.mutationId });
     expect(known.known).toBe(true);
     expect(known.result?.duplicate).toBe(true);
     const bob = server.transport(server.principal("bob"));
-    expect((await bob.getMutationResult({ $typeName: "abpc.v2.GetMutationResultRequest", keyspaceId: KS, mutationId: m.mutationId })).known).toBe(false);
-    expect((await t.getMutationResult({ $typeName: "abpc.v2.GetMutationResultRequest", keyspaceId: KS, mutationId: "nope" })).known).toBe(false);
+    expect((await bob.getMutationResult({ $typeName: "abcp.v2.GetMutationResultRequest", keyspaceId: KS, mutationId: m.mutationId })).known).toBe(false);
+    expect((await t.getMutationResult({ $typeName: "abcp.v2.GetMutationResultRequest", keyspaceId: KS, mutationId: "nope" })).known).toBe(false);
     server.restore(KS, 0n);
-    const voided = await t.getMutationResult({ $typeName: "abpc.v2.GetMutationResultRequest", keyspaceId: KS, mutationId: m.mutationId });
+    const voided = await t.getMutationResult({ $typeName: "abcp.v2.GetMutationResultRequest", keyspaceId: KS, mutationId: m.mutationId });
     expect([voided.known, voided.voided]).toEqual([false, true]);
     // a resend of a voided id is recorded as STALE{EPOCH}, never applied (07 [MUT-105])
     const resend = await send(t, create(MutationSchema, { ...m, clientId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", baseLogEpoch: 0 }));
@@ -148,17 +148,17 @@ describe("the fake server: results and a restore (07 [MUT-53], [MUT-104], [MUT-1
   it("a frozen keyspace answers HISTORY_DIVERGED; LoadState pages are consistent at one checkpoint and a resume check says resumed", async () => {
     const { t, server } = setup();
     for (let i = 0; i < 5; i++) server.write(KS, [create(KeyChangeSchema, { key: `settings/k${i}`, kind: ChangeKind.SET, value: jsonBytes(i), encoding: "json/v1" })]);
-    const base = { $typeName: "abpc.v2.LoadStateRequest" as const, clientId: "", pageToken: "", pageSize: 2, supportedFeatures: [] };
-    const p1 = await t.loadState({ ...base, cursor: { $typeName: "abpc.v2.KeyspaceCursor", keyspaceId: KS, afterSeq: 0n, logEpoch: 0, interestPrefixes: [], afterRecordHash: new Uint8Array() } });
+    const base = { $typeName: "abcp.v2.LoadStateRequest" as const, clientId: "", pageToken: "", pageSize: 2, supportedFeatures: [] };
+    const p1 = await t.loadState({ ...base, cursor: { $typeName: "abcp.v2.KeyspaceCursor", keyspaceId: KS, afterSeq: 0n, logEpoch: 0, interestPrefixes: [], afterRecordHash: new Uint8Array() } });
     expect(p1.entries).toHaveLength(2);
     expect(p1.nextPageToken).not.toBe("");
     server.write(KS, [create(KeyChangeSchema, { key: "settings/late", kind: ChangeKind.SET, value: jsonBytes(1), encoding: "json/v1" })]);
-    const p2 = await t.loadState({ ...base, pageToken: p1.nextPageToken, cursor: { $typeName: "abpc.v2.KeyspaceCursor", keyspaceId: KS, afterSeq: 0n, logEpoch: 0, interestPrefixes: [], afterRecordHash: new Uint8Array() } });
+    const p2 = await t.loadState({ ...base, pageToken: p1.nextPageToken, cursor: { $typeName: "abcp.v2.KeyspaceCursor", keyspaceId: KS, afterSeq: 0n, logEpoch: 0, interestPrefixes: [], afterRecordHash: new Uint8Array() } });
     expect(p2.checkpointSeq).toBe(p1.checkpointSeq); // the late write is not in this load
-    const resume = await t.loadState({ ...base, cursor: { $typeName: "abpc.v2.KeyspaceCursor", keyspaceId: KS, afterSeq: 3n, logEpoch: 1, interestPrefixes: [], afterRecordHash: new Uint8Array() } });
+    const resume = await t.loadState({ ...base, cursor: { $typeName: "abcp.v2.KeyspaceCursor", keyspaceId: KS, afterSeq: 3n, logEpoch: 1, interestPrefixes: [], afterRecordHash: new Uint8Array() } });
     expect(resume.resumed).toBe(true);
     server.freeze(KS);
-    await expect(t.loadState({ ...base, cursor: { $typeName: "abpc.v2.KeyspaceCursor", keyspaceId: KS, afterSeq: 0n, logEpoch: 0, interestPrefixes: [], afterRecordHash: new Uint8Array() } })).rejects.toMatchObject({ status: "FailedPrecondition" });
+    await expect(t.loadState({ ...base, cursor: { $typeName: "abcp.v2.KeyspaceCursor", keyspaceId: KS, afterSeq: 0n, logEpoch: 0, interestPrefixes: [], afterRecordHash: new Uint8Array() } })).rejects.toMatchObject({ status: "FailedPrecondition" });
   });
 });
 
@@ -175,7 +175,7 @@ describe("17 [CONF-4] the fake injects every code with every class, and every RP
     }
   });
 
-  it.each(["Cancelled", "Unknown", "InvalidArgument", "DeadlineExceeded", "NotFound", "AlreadyExists", "PermissionDenied", "ResourceExhausted", "FailedPrecondition", "Aborted", "OutOfRange", "Unimplemented", "Internal", "Unavailable", "DataLoss", "Unauthenticated"] as RpcStatus[])("fails a call of each method with the status %s, with an ABPC detail or without", async (status) => {
+  it.each(["Cancelled", "Unknown", "InvalidArgument", "DeadlineExceeded", "NotFound", "AlreadyExists", "PermissionDenied", "ResourceExhausted", "FailedPrecondition", "Aborted", "OutOfRange", "Unimplemented", "Internal", "Unavailable", "DataLoss", "Unauthenticated"] as RpcStatus[])("fails a call of each method with the status %s, with an ABCP detail or without", async (status) => {
     const { t, server } = setup();
     const methods = ["mutate", "getMutationResult", "getMutationResults", "cancelIntent", "createKeyspace", "loadState", "updateSubscription", "refreshSession", "getManifest"] as const;
     for (const method of methods) {
@@ -185,21 +185,21 @@ describe("17 [CONF-4] the fake injects every code with every class, and every RP
           case "mutate":
             return t.mutate(create(MutateRequestSchema, { mutations: [mut()] }));
           case "getMutationResult":
-            return t.getMutationResult({ $typeName: "abpc.v2.GetMutationResultRequest", keyspaceId: KS, mutationId: "x" });
+            return t.getMutationResult({ $typeName: "abcp.v2.GetMutationResultRequest", keyspaceId: KS, mutationId: "x" });
           case "getMutationResults":
-            return t.getMutationResults({ $typeName: "abpc.v2.GetMutationResultsRequest", keyspaceId: KS, mutationIds: ["x"] });
+            return t.getMutationResults({ $typeName: "abcp.v2.GetMutationResultsRequest", keyspaceId: KS, mutationIds: ["x"] });
           case "cancelIntent":
-            return t.cancelIntent({ $typeName: "abpc.v2.CancelIntentRequest", keyspaceId: KS, intentId: "x" });
+            return t.cancelIntent({ $typeName: "abcp.v2.CancelIntentRequest", keyspaceId: KS, intentId: "x" });
           case "createKeyspace":
-            return t.createKeyspace({ $typeName: "abpc.v2.CreateKeyspaceRequest", keyspaceId: "k2", kind: "kind" });
+            return t.createKeyspace({ $typeName: "abcp.v2.CreateKeyspaceRequest", keyspaceId: "k2", kind: "kind" });
           case "loadState":
-            return t.loadState({ $typeName: "abpc.v2.LoadStateRequest", clientId: "", pageToken: "", pageSize: 0, supportedFeatures: [], cursor: { $typeName: "abpc.v2.KeyspaceCursor", keyspaceId: KS, afterSeq: 0n, logEpoch: 0, interestPrefixes: [], afterRecordHash: new Uint8Array() } });
+            return t.loadState({ $typeName: "abcp.v2.LoadStateRequest", clientId: "", pageToken: "", pageSize: 0, supportedFeatures: [], cursor: { $typeName: "abcp.v2.KeyspaceCursor", keyspaceId: KS, afterSeq: 0n, logEpoch: 0, interestPrefixes: [], afterRecordHash: new Uint8Array() } });
           case "updateSubscription":
-            return t.updateSubscription({ $typeName: "abpc.v2.UpdateSubscriptionRequest", sessionId: "s", add: [], remove: [], setInterest: [], clientId: "" });
+            return t.updateSubscription({ $typeName: "abcp.v2.UpdateSubscriptionRequest", sessionId: "s", add: [], remove: [], setInterest: [], clientId: "" });
           case "refreshSession":
-            return t.refreshSession({ $typeName: "abpc.v2.RefreshSessionRequest", sessionId: "s" });
+            return t.refreshSession({ $typeName: "abcp.v2.RefreshSessionRequest", sessionId: "s" });
           case "getManifest":
-            return t.getManifest({ $typeName: "abpc.v2.GetManifestRequest", version: 0 });
+            return t.getManifest({ $typeName: "abcp.v2.GetManifestRequest", version: 0 });
         }
       };
       await expect(call()).rejects.toBeInstanceOf(RpcError);
@@ -208,7 +208,7 @@ describe("17 [CONF-4] the fake injects every code with every class, and every RP
       expect(err.status).toBe(status);
       expect(err.reject).toBeUndefined();
     }
-    const it2 = t.subscribe({ $typeName: "abpc.v2.SubscribeRequest", keyspaces: [], supportedFeatures: [], clientId: "" })[Symbol.asyncIterator]();
+    const it2 = t.subscribe({ $typeName: "abcp.v2.SubscribeRequest", keyspaces: [], supportedFeatures: [], clientId: "" })[Symbol.asyncIterator]();
     server.inject("subscribe", { kind: "status", status });
     await expect(it2.next()).rejects.toBeInstanceOf(RpcError);
   });
@@ -217,7 +217,7 @@ describe("17 [CONF-4] the fake injects every code with every class, and every RP
 describe("17 [CONF-4] the fake drops, reorders, duplicates and delays frames, disconnects, and loses responses", () => {
   async function open(server: FakeServer, t: ReturnType<FakeServer["transport"]>): Promise<{ next: () => Promise<{ kind: string; first?: bigint; prev?: bigint; cursor?: bigint }>; frames: () => { kind: string; prev?: bigint; cursor?: bigint }[] }> {
     const seen: { kind: string; prev?: bigint; cursor?: bigint }[] = [];
-    const it = t.subscribe({ $typeName: "abpc.v2.SubscribeRequest", keyspaces: [{ $typeName: "abpc.v2.KeyspaceCursor", keyspaceId: KS, afterSeq: 0n, logEpoch: 1, interestPrefixes: [], afterRecordHash: new Uint8Array() }], supportedFeatures: [], clientId: "" })[Symbol.asyncIterator]();
+    const it = t.subscribe({ $typeName: "abcp.v2.SubscribeRequest", keyspaces: [{ $typeName: "abcp.v2.KeyspaceCursor", keyspaceId: KS, afterSeq: 0n, logEpoch: 1, interestPrefixes: [], afterRecordHash: new Uint8Array() }], supportedFeatures: [], clientId: "" })[Symbol.asyncIterator]();
     const next = async (): Promise<{ kind: string; prev?: bigint; cursor?: bigint }> => {
       const r = await it.next();
       if (r.done === true) return { kind: "end" };
@@ -303,7 +303,7 @@ function setupWith(manifests: StaticManifests, limits: Record<string, number> = 
 
 const C1 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const C2 = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-const getResult = (t: ReturnType<typeof setup>["t"], id: string): ReturnType<ReturnType<typeof setup>["t"]["getMutationResult"]> => t.getMutationResult({ $typeName: "abpc.v2.GetMutationResultRequest", keyspaceId: KS, mutationId: id });
+const getResult = (t: ReturnType<typeof setup>["t"], id: string): ReturnType<ReturnType<typeof setup>["t"]["getMutationResult"]> => t.getMutationResult({ $typeName: "abcp.v2.GetMutationResultRequest", keyspaceId: KS, mutationId: id });
 const retryReason = (r: MutationResult | undefined): number => (r?.outcome.case === "retry" ? r.outcome.value.reason : -1);
 
 describe("the fake server: the duplicate lookup comes first (07 Table 7-1 step 6; mutate/one.go)", () => {
@@ -389,7 +389,7 @@ describe("the fake server: GATED intents as store/gated.go answers them (07 [MUT
     const done = await getResult(t, q.mutationId);
     expect(done.result?.outcome.case).toBe("decided");
     server.decide(KS, g.mutationId, { status: "COMMITTED" });
-    expect(server.records(KS).at(-1)?.changes.map((c) => c.key)).toEqual(["settings/g", `abpc.intent/${g.mutationId}`]);
+    expect(server.records(KS).at(-1)?.changes.map((c) => c.key)).toEqual(["settings/g", `abcp.intent/${g.mutationId}`]);
   });
 
   it("a GATED action whose lane wait is not satisfied is answered Retry{LANE_NOT_READY} with intent_seq 0 when unlogged, until the lane reaches the slot; a resend of the newest client replaces the wait", async () => {

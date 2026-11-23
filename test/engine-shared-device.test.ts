@@ -5,7 +5,7 @@
 import { describe, expect, it } from "vitest";
 import * as Y from "yjs";
 import { crdtUpdate, draftKey, set, type ExportRecord } from "../src/engine/index.js";
-import { Code, StaleCause } from "../src/gen/abpc/v2/types_pb.js";
+import { Code, StaleCause } from "../src/gen/abcp/v2/types_pb.js";
 import { reject as mk } from "../src/fake/index.js";
 import { kc, KS, rejectResult } from "./helpers/engine.js";
 import { settleAll, tabsRig, typesOf } from "./helpers/tabs.js";
@@ -115,6 +115,6 @@ describe("14 [CLI-28], [CLI-65]: a sign-out that purges the partition hands the 
     expect(typesOf(a, dead.mutationId).filter((t) => t === "dead-lettered")).toHaveLength(2); // once more, before the purge
     expect(typesOf(a, old.mutationId).filter((t) => t === "exported")).toHaveLength(2);
     expect(hook.map((x) => x.mutationId)).toEqual([old.mutationId, old.mutationId]);
-    expect(await r.device.storage.list("https://abpc.test", "app")).toEqual([]);
+    expect(await r.device.storage.list("https://abcp.test", "app")).toEqual([]);
   });
 });

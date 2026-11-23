@@ -3,7 +3,7 @@
 
 import { create } from "@bufbuild/protobuf";
 import { describe, expect, it } from "vitest";
-import { ChangeKind, KeyChangeSchema, RecordKind, RecordSchema, SystemEventSchema, SystemKind, type KeyChange, type Record as RecordMessage } from "../src/gen/abpc/v2/types_pb.js";
+import { ChangeKind, KeyChangeSchema, RecordKind, RecordSchema, SystemEventSchema, SystemKind, type KeyChange, type Record as RecordMessage } from "../src/gen/abcp/v2/types_pb.js";
 import { fromHex, toHex, utf8Encode } from "../src/rules/bytes.js";
 import { applyRecord, ReplicaState, type Rules, type Template } from "../src/rules/fold/index.js";
 

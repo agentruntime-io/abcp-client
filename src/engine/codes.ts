@@ -1,7 +1,7 @@
 // The codes of Appendix A.3 with their default classes (A.2), and how the engine reads a class: by `Reject.error_class`, which
 // the server sets (07 [MUT-22], 14 [CLI-42]), also for a code the client does not know (15 [COMPAT-39]).
 
-import { Code, ErrorClass, RetryReason, StaleCause } from "../gen/abpc/v2/types_pb.js";
+import { Code, ErrorClass, RetryReason, StaleCause } from "../gen/abcp/v2/types_pb.js";
 
 /** The class of a reaction (A.2). */
 export type Reaction = "RETRY" | "HOLD" | "DEAD_LETTER" | "CONFLICT";

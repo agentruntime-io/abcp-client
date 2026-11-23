@@ -9,8 +9,8 @@
 //  - [CLI-7]: an action retires when the cursor has reached the seq of its outcome, in the outcome's epoch;
 //  - [CLI-40]: `overwritten` once per mutation id.
 
-import { type RecordsFrame, type HeartbeatFrame, type LoadStateResponse, type LaneWatermark } from "../gen/abpc/v2/sync_pb.js";
-import { Code, ErrorClass, Lane, RecordKind, ChangeKind, DecisionStatus, type KeyChange, type KeyEntry, type Record as RecordMessage, type Reject, type SuccessorRule, KeyspaceLifecycle } from "../gen/abpc/v2/types_pb.js";
+import { type RecordsFrame, type HeartbeatFrame, type LoadStateResponse, type LaneWatermark } from "../gen/abcp/v2/sync_pb.js";
+import { Code, ErrorClass, Lane, RecordKind, ChangeKind, DecisionStatus, type KeyChange, type KeyEntry, type Record as RecordMessage, type Reject, type SuccessorRule, KeyspaceLifecycle } from "../gen/abcp/v2/types_pb.js";
 import { makeReject, sameBytes } from "./endings.js";
 import { FoldError, installEntry, ReplicaState, StateValue, type Anomaly } from "../rules/fold/index.js";
 import { matchSuccessor } from "./successors.js";
@@ -230,7 +230,7 @@ export abstract class ReplicaLayer extends ReplicaStoreLayer {
   private effectKeysOf(e: OutboxEntry, changes: readonly KeyChange[]): string[] {
     const m = this.content(e);
     if (m === undefined) return [];
-    const effects = changes.slice(m.changes.length).filter((c) => c.key !== `abpc.intent/${e.mutationId}`);
+    const effects = changes.slice(m.changes.length).filter((c) => c.key !== `abcp.intent/${e.mutationId}`);
     const predictor = this.predictors[e.opType];
     let predicted: KeyChange[] = [];
     if (predictor !== undefined) {

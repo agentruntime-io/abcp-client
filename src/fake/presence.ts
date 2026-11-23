@@ -14,8 +14,8 @@
 
 import { create, type MessageInitShape } from "@bufbuild/protobuf";
 import { timestampFromMs } from "@bufbuild/protobuf/wkt";
-import { PresenceEntrySchema, PresenceFrameSchema, SubscribeResponseSchema, type SubscribeResponse } from "../gen/abpc/v2/sync_pb.js";
-import { Code, ErrorClass, RejectSchema, RetryReason, RetrySchema, type AppLimits, type Principal } from "../gen/abpc/v2/types_pb.js";
+import { PresenceEntrySchema, PresenceFrameSchema, SubscribeResponseSchema, type SubscribeResponse } from "../gen/abcp/v2/sync_pb.js";
+import { Code, ErrorClass, RejectSchema, RetryReason, RetrySchema, type AppLimits, type Principal } from "../gen/abcp/v2/types_pb.js";
 import type { Clock } from "../engine/clock.js";
 import { DEFAULT_CLASS } from "../engine/codes.js";
 import { RpcError } from "../engine/errors.js";

@@ -1,12 +1,12 @@
-// ABPC v2.0 — client-facing service. Transport: the binding of spec/02 §2.9 (protocols, codecs, error details,
+// ABCP v2.0 — client-facing service. Transport: the binding of spec/02 §2.9 (protocols, codecs, error details,
 // compression, message sizes); TLS: spec/16 [SEC-45].
 // Browsers cannot open bidirectional streams, so Subscribe is server-streaming and every
 // client→server control message on a live session is a unary call naming the session (spec/09 §9.4).
 syntax = "proto3";
 
-package abpc.v2;
+package abcp.v2;
 
-import "abpc/v2/types.proto";
+import "abcp/v2/types.proto";
 import "google/protobuf/timestamp.proto";
 
 service SyncService {

@@ -12,7 +12,7 @@ import { brig, bytesOf, until } from "./helpers/presence.js";
 
 const dirs: string[] = [];
 const tmp = (): string => {
-  const d = fs.mkdtempSync(path.join(os.tmpdir(), "abpc-stash-"));
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "abcp-stash-"));
   dirs.push(d);
   return d;
 };

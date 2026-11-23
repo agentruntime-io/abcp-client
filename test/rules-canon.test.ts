@@ -4,8 +4,8 @@
 
 import { create } from "@bufbuild/protobuf";
 import { describe, expect, it } from "vitest";
-import { MutationSchema } from "../src/gen/abpc/v2/sync_pb.js";
-import { KeyChangeSchema, KeyEntrySchema, RecordSchema, ChangeKind } from "../src/gen/abpc/v2/types_pb.js";
+import { MutationSchema } from "../src/gen/abcp/v2/sync_pb.js";
+import { KeyChangeSchema, KeyEntrySchema, RecordSchema, ChangeKind } from "../src/gen/abcp/v2/types_pb.js";
 import { contentDigest, contentHashInput, hashRecordFromDigests } from "../src/rules/canon/index.js";
 import { toHex } from "../src/rules/bytes.js";
 

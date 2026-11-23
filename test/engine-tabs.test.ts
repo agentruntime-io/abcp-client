@@ -3,8 +3,8 @@
 import { create } from "@bufbuild/protobuf";
 import { describe, expect, it } from "vitest";
 import { jsonBytes, LocalRefusal, set, type Engine, type EngineEvent, type ExportRecord } from "../src/engine/index.js";
-import type { MutateRequestSchema } from "../src/gen/abpc/v2/sync_pb.js";
-import { ChangeKind, Code, KeyChangeSchema, RetryReason } from "../src/gen/abpc/v2/types_pb.js";
+import type { MutateRequestSchema } from "../src/gen/abcp/v2/sync_pb.js";
+import { ChangeKind, Code, KeyChangeSchema, RetryReason } from "../src/gen/abcp/v2/types_pb.js";
 import { reject as mk } from "../src/fake/index.js";
 import { goOffline, goOnline, KS, rejectResult, retryResult, rig, types } from "./helpers/engine.js";
 import { ORIGIN, settleAll, tabsRig, typesOf, type TabsRig } from "./helpers/tabs.js";
@@ -216,7 +216,7 @@ describe("14 [CLI-61]: the tabs of one engine share one outbox through a single 
     const senders = new Set(mutateRequests2(r).flatMap((q) => q.mutations.map((m) => m.clientId)));
     expect([...senders]).toEqual([a.engine.clientId]);
     ids.forEach((id) => expect(typesOf(a, id)).toEqual(["committed"]));
-    expect(r.device.lockManager.waiting(`abpc.flusher\u0000${ORIGIN}\u0000app\u0000https://issuer.test|ana`)).toBe(2);
+    expect(r.device.lockManager.waiting(`abcp.flusher\u0000${ORIGIN}\u0000app\u0000https://issuer.test|ana`)).toBe(2);
   });
 
   it("a hidden flusher hands its role over to a visible tab, when there is one (and keeps it when there is none)", async () => {

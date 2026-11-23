@@ -22,7 +22,7 @@
 //
 // SPEC-QUESTION (16 [SEC-3] with 03 [ID-47]): "a key whose first segment is reserved but is not defined by this specification or by a module that the manifest in force declares" is refused by a server.
 // A client reads no module list from the manifest, and a later revision adds modules and module versions (15 [COMPAT-25]). Taken: a reserved first segment is judged by the forms of 03 §3.8 that this
-// revision defines (`abpc.intent`, `abpc.lease.v1`, `abpc.saga.v1`, `abpc.escrow.v1`, each with its shapes); a first segment of the form `abpc.<module>.v<N>` that is none of them is a module of
+// revision defines (`abcp.intent`, `abcp.lease.v1`, `abcp.saga.v1`, `abcp.escrow.v1`, each with its shapes); a first segment of the form `abcp.<module>.v<N>` that is none of them is a module of
 // another revision and is not judged; any other reserved first segment is invalid. Reading B: a module that the record's manifest version does not declare makes its keys invalid too.
 //
 // SPEC-QUESTION (16 [SEC-3] with 14 [CLI-5], 16 [SEC-4]): CLI-5 has a change "whose value a client cannot decode locally" enter the confirmed state and be shown as undecodable, "MUST NOT stop the engine
@@ -32,7 +32,7 @@
 // that breaks a limit is structurally invalid whatever other defect the reader reports first (checkLimits; R19 review S5). Reading B: every
 // condition of STATE-7 is a rule that SEC-3 judges, and CLI-5 covers only a value that passed the server's checks and that the client cannot display.
 
-import { ChangeKind, RecordKind, type KeyChange, type Record as RecordMessage } from "../../gen/abpc/v2/types_pb.js";
+import { ChangeKind, RecordKind, type KeyChange, type Record as RecordMessage } from "../../gen/abcp/v2/types_pb.js";
 import { REDACTED_ENCODING } from "../hashes/index.js";
 import { allowsNull, checkLimits, validate, validateBytes, MAX_SAFE_INTEGER } from "../jsonv1/index.js";
 import { refuse, type FoldCode } from "./errors.js";
@@ -41,8 +41,8 @@ import { isSegment } from "./template.js";
 
 const CAUSATION = /^[A-Za-z0-9._:-]{1,128}$/;
 const BLOB_ID = /^[A-Za-z0-9_-]{21,64}$/;
-/** `abpc.<module>.v<N>`: the first segment of a module of 03 §3.8, whichever revision defines it. */
-const MODULE_SEGMENT = /^abpc\.[a-z][a-z0-9-]*(\.[a-z][a-z0-9-]*)*\.v[0-9]+$/;
+/** `abcp.<module>.v<N>`: the first segment of a module of 03 §3.8, whichever revision defines it. */
+const MODULE_SEGMENT = /^abcp\.[a-z][a-z0-9-]*(\.[a-z][a-z0-9-]*)*\.v[0-9]+$/;
 
 const MAX_DELTA = BigInt(MAX_SAFE_INTEGER);
 
@@ -80,20 +80,20 @@ export function isDefinedReservedKey(key: string): boolean {
   const s = key.split("/");
   const first = s[0] as string;
   switch (first) {
-    case "abpc.intent":
+    case "abcp.intent":
       return s.length === 2;
-    case "abpc.lease.v1":
+    case "abcp.lease.v1":
       return s.length >= 3 && CLASS.test(s[1] as string);
-    case "abpc.saga.v1": {
+    case "abcp.saga.v1": {
       if (s.length < 3) return false;
-      if (s[1] === "moved") return true; // `abpc.saga.v1/moved/` and the segments of the entity key
+      if (s[1] === "moved") return true; // `abcp.saga.v1/moved/` and the segments of the entity key
       if (s[1] !== "run") return false;
       if (s.length === 3) return true;
       if (s.length === 4) return s[3] === "open" || s[3] === "resolve";
       if (s.length === 5) return (s[3] === "target" && isDecimal(s[4] as string)) || (s[3] === "step" && (s[4] as string).length <= 64 && STEP.test(s[4] as string));
       return false;
     }
-    case "abpc.escrow.v1": {
+    case "abcp.escrow.v1": {
       if (s.length < 3) return false;
       if (s[1] === "series") return s.length === 4 && CLASS.test(s[2] as string) && s[2] !== "series";
       if (!CLASS.test(s[1] as string)) return false;
@@ -260,7 +260,7 @@ export function judgeChangeKey(rec: RecordMessage, i: number, key: string): void
  */
 export function judgeRequestedChange(rec: RecordMessage, i: number, c: KeyChange, templateOf: (key: string) => Template | undefined): void {
   // SPEC-QUESTION (16 [SEC-3] with 03 [ID-47], R19 review note 4): the segment syntax of the key (03 [ID-1], [ID-2], [ID-13]) and the envelope are judged; the reserved namespace is not. The vector
-  // fold-moved-002 (17 [CONF-9]) carries an INTENT whose requested change names `abpc.saga.v1/saga/s1`, a key that 03 §3.8 does not define, and its expected result is that the record is accepted, so a
+  // fold-moved-002 (17 [CONF-9]) carries an INTENT whose requested change names `abcp.saga.v1/saga/s1`, a key that 03 §3.8 does not define, and its expected result is that the record is accepted, so a
   // client that judged the reserved namespace of a requested change would refuse a record that the vectors accept. Reading B: every key of the record is judged by the same rules as an applied one.
   judgeKey(rec, i, c.key, false);
   if (c.encoding === REDACTED_ENCODING && c.kind !== ChangeKind.DELETE) return; // blanked by a redaction: nothing left to judge

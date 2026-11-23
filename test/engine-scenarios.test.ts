@@ -3,7 +3,7 @@
 import { describe, expect, it } from "vitest";
 import * as Y from "yjs";
 import { cas, del, incr, jsonBytes, set } from "../src/engine/index.js";
-import { Code, StaleCause, type ErrorClass } from "../src/gen/abpc/v2/types_pb.js";
+import { Code, StaleCause, type ErrorClass } from "../src/gen/abcp/v2/types_pb.js";
 import { reject as mk } from "../src/fake/index.js";
 import { goOffline, goOnline, kc, kcCas, KS, mutateRequests, ofType, rejectResult, rig, sentIds, tick, types, text } from "./helpers/engine.js";
 
@@ -124,7 +124,7 @@ describe("scenario: RETRY with backoff bounds (14 [CLI-43], [CLI-24])", () => {
   });
 });
 
-import { RetryReason } from "../src/gen/abpc/v2/types_pb.js";
+import { RetryReason } from "../src/gen/abcp/v2/types_pb.js";
 import { retryResult } from "./helpers/engine.js";
 const retryRes = (m: Parameters<typeof retryResult>[0]): ReturnType<typeof retryResult> => retryResult(m, RetryReason.STORAGE_UNAVAILABLE, 0);
 

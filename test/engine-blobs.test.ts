@@ -19,8 +19,8 @@ import {
   StaticManifests,
 } from "../src/engine/index.js";
 import { FAKE_CHECKSUM_HEADER, FakeServer, ManualClock, reject as mk, SeededRandom } from "../src/fake/index.js";
-import { CreateUploadRequestSchema, CreateUploadResponseSchema, MutationResultSchema } from "../src/gen/abpc/v2/sync_pb.js";
-import { ChangeKind, Code, KeyChangeSchema, RetryReason, RetrySchema, SystemKind } from "../src/gen/abpc/v2/types_pb.js";
+import { CreateUploadRequestSchema, CreateUploadResponseSchema, MutationResultSchema } from "../src/gen/abcp/v2/sync_pb.js";
+import { ChangeKind, Code, KeyChangeSchema, RetryReason, RetrySchema, SystemKind } from "../src/gen/abcp/v2/types_pb.js";
 import { sha256 } from "../src/rules/crypto.js";
 import { goOffline, goOnline, KS, MANIFEST, ofType, rejectResult, retryResult, types } from "./helpers/engine.js";
 import { brig, bytesOf, drive } from "./helpers/presence.js";

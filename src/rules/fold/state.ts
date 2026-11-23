@@ -406,7 +406,7 @@ export class ReplicaState {
     return this.keyNames().map((key) => toKeyState(key, this.keys.get(key) as KeyRow));
   }
 
-  /** The keyspace state hash (05 [STATE-41]) over every present key, the reserved `abpc.*` keys included. */
+  /** The keyspace state hash (05 [STATE-41]) over every present key, the reserved `abcp.*` keys included. */
   keyspaceStateHash(): Uint8Array {
     return keyspaceStateHash(this.keyStates());
   }

@@ -5,8 +5,8 @@ import { create } from "@bufbuild/protobuf";
 import { timestampFromMs } from "@bufbuild/protobuf/wkt";
 import { describe, expect, it } from "vitest";
 import { jsonBytes } from "../src/engine/index.js";
-import { PresenceEntrySchema, PresenceFrameSchema, SubscribeResponseSchema } from "../src/gen/abpc/v2/sync_pb.js";
-import { PrincipalSchema } from "../src/gen/abpc/v2/types_pb.js";
+import { PresenceEntrySchema, PresenceFrameSchema, SubscribeResponseSchema } from "../src/gen/abcp/v2/sync_pb.js";
+import { PrincipalSchema } from "../src/gen/abcp/v2/types_pb.js";
 import { frame, KS, prig, protocolErrors, ROOM } from "./helpers/presence.js";
 
 interface P {

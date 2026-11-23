@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Engine, LocalRefusal, set, StaticManifests, type EngineEvent } from "../src/engine/index.js";
 import { BlobError } from "../src/engine/index.js";
 import { FakeServer, ManualClock, reject as mk, SeededRandom } from "../src/fake/index.js";
-import { Code } from "../src/gen/abpc/v2/types_pb.js";
+import { Code } from "../src/gen/abcp/v2/types_pb.js";
 import { FileStorage } from "../src/platform/file-storage.js";
 import { createWebHost } from "../src/platform/web.js";
 import { FakeIDBFactory, FakeKeyRange } from "./helpers/fake-idb.js";
@@ -50,7 +50,7 @@ async function waitFor(r: { engine: { settle(): Promise<void> }; clock: { advanc
 
 let dir: string;
 beforeEach(() => {
-  dir = mkdtempSync(path.join(tmpdir(), "abpc-redact-"));
+  dir = mkdtempSync(path.join(tmpdir(), "abcp-redact-"));
 });
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
@@ -153,7 +153,7 @@ describe("14 [CLI-76] on the IndexedDB storage: no row of the partition's databa
     await engine.settle();
     server.write(KS, [kc("settings/p", "set", `${SECRET}-2`)]);
     await engine.settle();
-    const db = [...idb.dbs.keys()].find((k) => k.startsWith("abpc:") && k !== "abpc:registry") as string;
+    const db = [...idb.dbs.keys()].find((k) => k.startsWith("abcp:") && k !== "abcp:registry") as string;
     const scan = (): { store: string; key: string }[] => {
       const hits: { store: string; key: string }[] = [];
       for (const [store, rows] of idb.dbs.get(db)?.stores ?? []) for (const [key, v] of rows) if (rowsOf(v).some((b) => b.includes(SECRET))) hits.push({ store, key });

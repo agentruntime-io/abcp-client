@@ -51,11 +51,11 @@ describe("09 [READ-86], [READ-90]: fetchBlobHttp", () => {
 
   it("a PUT carries exactly the headers that it is given, and the length of its body", async () => {
     const h = fetchBlobHttp();
-    const r = await h.put(`${base}/put`, { "x-abpc-checksum-sha256": "AbC+/=" }, new Uint8Array([1, 2, 3, 4, 5]));
+    const r = await h.put(`${base}/put`, { "x-abcp-checksum-sha256": "AbC+/=" }, new Uint8Array([1, 2, 3, 4, 5]));
     expect(r.status).toBe(200);
     const s = seen.at(-1) as Seen;
     expect(s.method).toBe("PUT");
-    expect(s.headers["x-abpc-checksum-sha256"]).toBe("AbC+/="); // opaque: unchanged (03 [ID-27])
+    expect(s.headers["x-abcp-checksum-sha256"]).toBe("AbC+/="); // opaque: unchanged (03 [ID-27])
     expect(s.headers["content-length"]).toBe("5");
     expect(s.headers["cookie"]).toBeUndefined();
     expect([...s.body]).toEqual([1, 2, 3, 4, 5]);

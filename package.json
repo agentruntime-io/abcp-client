@@ -1,11 +1,11 @@
 {
-  "name": "@agentruntime/abpc-client",
+  "name": "@agentruntime/abcp-client",
   "version": "2.0.0-alpha.4",
   "private": true,
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/agentruntime-io/abpc-client"
+    "url": "https://github.com/agentruntime-io/abcp-client"
   },
   "engines": {
     "node": ">=22"
@@ -15,7 +15,7 @@
     "LICENSE",
     "README.md"
   ],
-  "description": "ABPC v2 client engine with its local query layer (spec chapter 14).",
+  "description": "ABCP v2 client engine with its local query layer (spec chapter 14).",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

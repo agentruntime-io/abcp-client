@@ -38,7 +38,7 @@ export function partitionId(k: PartitionKey): string {
 
 /** The name of the lock and the channel of a partition. */
 export function lockName(k: PartitionKey): string {
-  return `abpc.flusher\u0000${k.origin}\u0000${k.appId}\u0000${k.partition}`;
+  return `abcp.flusher\u0000${k.origin}\u0000${k.appId}\u0000${k.partition}`;
 }
 
 /**
@@ -47,7 +47,7 @@ export function lockName(k: PartitionKey): string {
  * the lock of a page that has gone is never taken for the one that replaced it.
  */
 export function tabLockName(k: PartitionKey, tabId: string, incarnation: string): string {
-  return `abpc.tab\u0000${k.origin}\u0000${k.appId}\u0000${k.partition}\u0000${tabId}\u0000${incarnation}`;
+  return `abcp.tab\u0000${k.origin}\u0000${k.appId}\u0000${k.partition}\u0000${tabId}\u0000${incarnation}`;
 }
 
 export function sameKey(a: PartitionKey, b: PartitionKey): boolean {

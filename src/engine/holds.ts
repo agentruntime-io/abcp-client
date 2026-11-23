@@ -2,7 +2,7 @@
 // action, stops sending in its scope (the lane, the keyspace, every keyspace of the app, or the action alone), is shown in the
 // sync status and in a `held` event, and is bounded (14 [CLI-45]).
 
-import type { Reject } from "../gen/abpc/v2/types_pb.js";
+import type { Reject } from "../gen/abcp/v2/types_pb.js";
 import type { LaneName } from "./manifests.js";
 import type { HoldInfo } from "./types.js";
 
@@ -21,7 +21,7 @@ export type HoldKind =
   | "SESSION_CAP"
   | "AUTHORIZER_UNAVAILABLE"
   | "UNKNOWN_HOLD"
-  /** The row of Table 14.1 for a `Mutate` call that fails as a whole with a status and no ABPC detail (14 [CLI-50], A.7); its code is `PROTOCOL_ERROR` (A.11). */
+  /** The row of Table 14.1 for a `Mutate` call that fails as a whole with a status and no ABCP detail (14 [CLI-50], A.7); its code is `PROTOCOL_ERROR` (A.11). */
   | "MUTATE_FAILURE"
   | "UNKNOWN_DROP_REASON"
   | "CONFLICT_WAIT"

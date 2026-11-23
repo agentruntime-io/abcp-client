@@ -1,5 +1,5 @@
-// The test binary of the CONF-6 test profile as a process (17 [CONF-6], docs/S1-DESIGN.md §6, piece P5): `server/cmd/abpc-testserver` is built once into
-// `client/.tmp/` (as `server.ts` builds the production binary: from the working tree, or from git HEAD with ABPC_SERVER_SOURCE=head), started on a configuration
+// The test binary of the CONF-6 test profile as a process (17 [CONF-6], docs/S1-DESIGN.md §6, piece P5): `server/cmd/abcp-testserver` is built once into
+// `client/.tmp/` (as `server.ts` builds the production binary: from the working tree, or from git HEAD with ABCP_SERVER_SOURCE=head), started on a configuration
 // file that the harness writes (the production configuration plus a `test_profile` section), and driven through its control API, which this module gives as a
 // connect-es client (`TestServer.control`, the generated `TestControlService` of `client/test/gen`). The binary writes a ready file when its deployment is up;
 // that file, not a log, tells the harness where the nodes, the issuers and the control listener are.
@@ -25,7 +25,7 @@ import { createConnectTransport } from "@connectrpc/connect-node";
 import { Engine, systemRandom, type EngineConfig, type EngineEvent, type Random } from "../../../src/engine/index.js";
 import { ConnectManifests, TokenStore, type TokenGrant } from "../../../src/net/index.js";
 import { createNodeTransport, type NodeTransport } from "../../../src/net/node.js";
-import { TestControlService, type GetDeploymentResponse, type MintTokenRequest } from "../../gen/abpctest/v1/control_pb.js";
+import { TestControlService, type GetDeploymentResponse, type MintTokenRequest } from "../../gen/abcptest/v1/control_pb.js";
 import type { Grant } from "./issuer.js";
 import { APP, ensureTmp, goAvailable, MANIFEST, SERVER_DIR, TMP_DIR } from "./server.js";
 import { SKIP_NEEDS_SERVER } from "../../helpers/server-dir.js";
@@ -34,19 +34,19 @@ import { SKIP_NEEDS_SERVER } from "../../helpers/server-dir.js";
 export type Control = Client<typeof TestControlService>;
 
 /** Whether the test binary can be built here: a Go toolchain, and the source of the binary (a checkout that has none skips the suites that need it). */
-export const testServerAvailable = goAvailable && SERVER_DIR !== "" && fs.existsSync(path.join(SERVER_DIR, "cmd", "abpc-testserver"));
+export const testServerAvailable = goAvailable && SERVER_DIR !== "" && fs.existsSync(path.join(SERVER_DIR, "cmd", "abcp-testserver"));
 export const TESTSERVER_SKIP_REASON =
-  `integration tests against the test binary are skipped: ${SKIP_NEEDS_SERVER}; they also need a Go toolchain, cmd/abpc-testserver in the checkout, and ABPC_SKIP_INTEGRATION not 1`;
+  `integration tests against the test binary are skipped: ${SKIP_NEEDS_SERVER}; they also need a Go toolchain, cmd/abcp-testserver in the checkout, and ABCP_SKIP_INTEGRATION not 1`;
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 // ---- the build -----------------------------------------------------------------------------------------------------
 
-const BINARY = path.join(TMP_DIR, os.platform() === "win32" ? "abpc-testserver.exe" : "abpc-testserver");
+const BINARY = path.join(TMP_DIR, os.platform() === "win32" ? "abcp-testserver.exe" : "abcp-testserver");
 const LOCK = path.join(TMP_DIR, "build-testserver.lock");
 
 function goBuild(cwd: string): { ok: boolean; output: string } {
-  const r = spawnSync("go", ["build", "-o", BINARY, "./cmd/abpc-testserver"], { cwd, encoding: "utf8", timeout: 10 * 60_000 });
+  const r = spawnSync("go", ["build", "-o", BINARY, "./cmd/abcp-testserver"], { cwd, encoding: "utf8", timeout: 10 * 60_000 });
   return { ok: r.status === 0, output: `${r.stdout}\n${r.stderr}` };
 }
 
@@ -77,7 +77,7 @@ export let testServerBuiltFrom: "worktree" | "head" | undefined;
 /**
  * The path of the test binary, built on the first call of the run (the test files run in parallel, so the build is under a lock that the others wait on). The
  * working tree is built; when it does not build at the moment, the build is tried again every 20 s for up to 8 minutes and then fails with the compiler's words.
- * ABPC_SERVER_SOURCE=head builds the committed tree instead. The server is never edited from here.
+ * ABCP_SERVER_SOURCE=head builds the committed tree instead. The server is never edited from here.
  */
 export async function testServerBinary(): Promise<string> {
   ensureTmp();
@@ -99,7 +99,7 @@ export async function testServerBinary(): Promise<string> {
     if (mine) {
       try {
         if (!fs.existsSync(BINARY)) {
-          if (process.env["ABPC_SERVER_SOURCE"] === "head") {
+          if (process.env["ABCP_SERVER_SOURCE"] === "head") {
             const r = buildFromHead();
             if (!r.ok) throw new Error(`go build of the test binary (git HEAD) failed:\n${r.output}`);
             testServerBuiltFrom = "head";
@@ -226,7 +226,7 @@ process.once("exit", () => {
 });
 
 export class TestServer {
-  /** The control API: the RPCs of `proto/abpctest/v1/control.proto` (those that are not built answer Unimplemented). */
+  /** The control API: the RPCs of `proto/abcptest/v1/control.proto` (those that are not built answer Unimplemented). */
   readonly control: Control;
 
   /** @internal use `startTestServer` */
@@ -303,7 +303,7 @@ export class TestServer {
       sub: o.sub,
       iat: now,
       exp: now + (o.lifetimeS ?? DEFAULT_LIFETIME_S),
-      abpc: { grants: (o.grants ?? ACME).map((g) => ({ ks: g.ks, actions: g.actions })) },
+      abcp: { grants: (o.grants ?? ACME).map((g) => ({ ks: g.ks, actions: g.actions })) },
       ...(o.deviceId !== undefined ? { device_id: o.deviceId } : {}),
       ...(o.claims ?? {}),
     };

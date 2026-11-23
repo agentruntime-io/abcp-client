@@ -2,9 +2,9 @@
 
 import { describe, expect, it } from "vitest";
 import { LocalRefusal, set } from "../src/engine/index.js";
-import type { KeyEntry } from "../src/gen/abpc/v2/types_pb.js";
+import type { KeyEntry } from "../src/gen/abcp/v2/types_pb.js";
 import { create } from "@bufbuild/protobuf";
-import { KeyEntrySchema } from "../src/gen/abpc/v2/types_pb.js";
+import { KeyEntrySchema } from "../src/gen/abcp/v2/types_pb.js";
 import { toHex } from "../src/rules/bytes.js";
 import type { ReplicaState } from "../src/rules/fold/index.js";
 import { kc, KS, ofType, rig, tick, type Rig } from "./helpers/engine.js";
@@ -248,7 +248,7 @@ describe("14 [CLI-72]: narrowing the interest needs no load: the keys outside it
     expect(loadCursors(r)).toHaveLength(loads); // no load
     expect(r.engine.confirmed(KS).has("issues/i2/title")).toBe(false);
     expect(r.engine.confirmed(KS).has("issues/i1/title")).toBe(true);
-    expect(updates(r).at(-1)?.setInterest).toEqual([{ keyspaceId: KS, interestPrefixes: ["issues/i1"], $typeName: "abpc.v2.UpdateSubscriptionRequest.Interest" }]);
+    expect(updates(r).at(-1)?.setInterest).toEqual([{ keyspaceId: KS, interestPrefixes: ["issues/i1"], $typeName: "abcp.v2.UpdateSubscriptionRequest.Interest" }]);
     expect(ofType(r, "interest-changed")).toEqual([expect.objectContaining({ interest: ["issues/i1"], cause: "NARROWED" })]);
     r.server.write(KS, [kc("issues/i2/title", "set", "late")]);
     r.server.write(KS, [kc("issues/i1/title", "set", "kept")]);

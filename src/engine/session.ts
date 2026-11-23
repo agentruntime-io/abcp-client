@@ -26,7 +26,7 @@ import {
   type PresenceFrame,
   type SubscribeResponse,
   type UpdateSubscriptionResponse,
-} from "../gen/abpc/v2/sync_pb.js";
+} from "../gen/abcp/v2/sync_pb.js";
 import {
   Code,
   ErrorClass,
@@ -39,8 +39,8 @@ import {
   type KeyspaceCursor,
   type Reject,
   type SuccessorRule,
-} from "../gen/abpc/v2/types_pb.js";
-import { CloseReason, DropReason } from "../gen/abpc/v2/sync_pb.js";
+} from "../gen/abcp/v2/types_pb.js";
+import { CloseReason, DropReason } from "../gen/abcp/v2/sync_pb.js";
 import { CLIENT_BACKOFF, fullJitter, HOLD_BACKOFF, RECONNECT_BACKOFF, clampAfter, resendDelay } from "./backoff.js";
 import { codeName } from "./codes.js";
 import { MAX_KEYSPACES_PER_SESSION } from "./counts.js";
@@ -585,7 +585,7 @@ export abstract class SessionLayer extends SenderLayer {
         break;
       case "Unimplemented":
         this.sess.fatal = true;
-        this.emit({ type: "protocol-error", what: "Subscribe", detail: "Unimplemented: the server does not speak abpc.v2 (15 [COMPAT-6])", keyspaces: [] });
+        this.emit({ type: "protocol-error", what: "Subscribe", detail: "Unimplemented: the server does not speak abcp.v2 (15 [COMPAT-6])", keyspaces: [] });
         break;
       default:
         break;
@@ -601,7 +601,7 @@ export abstract class SessionLayer extends SenderLayer {
   private async onKeyspaceCap(): Promise<void> {
     const named = this.lastSubscribeNamed;
     // V48 MUST 1: the probe asks a keyspace that the engine follows and may read (not one stopped, revoked, purged or frozen, whose LoadState a
-    // server refuses every time); a probe refused with an ABPC reject tries the next one
+    // server refuses every time); a probe refused with an ABCP reject tries the next one
     const candidates = this.followList().filter((f) => f.loaded && !f.purged && !f.revoked && f.stopped === undefined && f.frozen === undefined);
     for (const probe of candidates) {
       try {
@@ -635,7 +635,7 @@ export abstract class SessionLayer extends SenderLayer {
 
   protected onUnimplemented(_f: Follow): void {
     this.sess.fatal = true;
-    this.emit({ type: "protocol-error", what: "Mutate", detail: "Unimplemented: the server does not speak abpc.v2 (15 [COMPAT-6])", keyspaces: [] });
+    this.emit({ type: "protocol-error", what: "Mutate", detail: "Unimplemented: the server does not speak abcp.v2 (15 [COMPAT-6])", keyspaces: [] });
   }
 
   // ---------------------------------------------------------------------------------------------------------------------

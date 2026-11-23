@@ -1,4 +1,4 @@
-// C5: the client engine on the real network, against the real Go server (server/cmd/abpc-server, started in development mode with a test
+// C5: the client engine on the real network, against the real Go server (server/cmd/abcp-server, started in development mode with a test
 // issuer, 10 §10.1, and the manifest of harness/server.ts): the Connect transport with strict decoding, the manifests adapter over
 // `GetManifest`, and the engine's sync of 09 and 14 through them. The network between a client and the server is a TCP proxy that a test cuts.
 

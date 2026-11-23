@@ -3,8 +3,8 @@
 import { describe, expect, it } from "vitest";
 import { create } from "@bufbuild/protobuf";
 import { RpcError, set } from "../src/engine/index.js";
-import { CloseReason, ControlFrameSchema, SubscribeResponseSchema } from "../src/gen/abpc/v2/sync_pb.js";
-import { Code, SuccessorRuleSchema } from "../src/gen/abpc/v2/types_pb.js";
+import { CloseReason, ControlFrameSchema, SubscribeResponseSchema } from "../src/gen/abcp/v2/sync_pb.js";
+import { Code, SuccessorRuleSchema } from "../src/gen/abcp/v2/types_pb.js";
 import { reject as mk } from "../src/fake/index.js";
 import { goOffline, goOnline, kc, KS, mutateRequests, ofType, rig, sentIds, tick, types, type Rig } from "./helpers/engine.js";
 
@@ -42,7 +42,7 @@ describe("14 [CLI-79] Closing", () => {
     const a = await r.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/a", 1)] });
     await goOnline(r);
     await r.engine.settle();
-    r.server.sendFrame(create(SubscribeResponseSchema, { frame: { case: "control", value: create(ControlFrameSchema, { control: { case: "closing", value: { $typeName: "abpc.v2.ControlFrame.Closing", reason: 99 as CloseReason, message: "" } } }) } }));
+    r.server.sendFrame(create(SubscribeResponseSchema, { frame: { case: "control", value: create(ControlFrameSchema, { control: { case: "closing", value: { $typeName: "abcp.v2.ControlFrame.Closing", reason: 99 as CloseReason, message: "" } } }) } }));
     await r.engine.settle();
     expect(r.engine.status().connection).not.toBe("live");
     await tick(r, 5000);

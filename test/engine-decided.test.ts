@@ -3,7 +3,7 @@
 
 import { describe, expect, it } from "vitest";
 import { set } from "../src/engine/index.js";
-import { Code, ErrorClass } from "../src/gen/abpc/v2/types_pb.js";
+import { Code, ErrorClass } from "../src/gen/abcp/v2/types_pb.js";
 import { reject as mk, rejectWith } from "../src/fake/index.js";
 import { KS, mutateRequests, rig, tick, type Rig } from "./helpers/engine.js";
 
@@ -51,7 +51,7 @@ describe("14 [CLI-34] (V19 SHOULD-3): a REJECTED decision is final whatever the 
 
   it("an undecided reject of the class HOLD is still a hold (the rule is for a decision only)", async () => {
     const r = await rig();
-    r.server.inject("mutate", { kind: "result", recorded: false, result: (m) => (m.changes[0]?.key === "settings/h" ? { $typeName: "abpc.v2.MutationResult", mutationId: m.mutationId, outcome: { case: "rejected", value: rejectWith(901, ErrorClass.HOLD) }, duplicate: false, intentSeq: 0n } as never : undefined) });
+    r.server.inject("mutate", { kind: "result", recorded: false, result: (m) => (m.changes[0]?.key === "settings/h" ? { $typeName: "abcp.v2.MutationResult", mutationId: m.mutationId, outcome: { case: "rejected", value: rejectWith(901, ErrorClass.HOLD) }, duplicate: false, intentSeq: 0n } as never : undefined) });
     await r.engine.submit({ keyspaceId: KS, opType: "Set", changes: [set("settings/h", 1)] });
     await r.engine.settle();
     expect(r.engine.status().holds.map((h) => h.code)).toEqual(["CODE_901"]);

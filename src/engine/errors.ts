@@ -1,7 +1,7 @@
 // The failures that the engine tells apart: an RPC status with its error detail (A.7), a message that breaks 02 [ARC-61]
 // (16 [SEC-3]), and the local refusals of an action (14 [CLI-19], [CLI-21], [CLI-82]).
 
-import type { Reject, Retry } from "../gen/abpc/v2/types_pb.js";
+import type { Reject, Retry } from "../gen/abcp/v2/types_pb.js";
 
 /** The RPC statuses of A.7, by the names of the gRPC codes (02 §2.9 binds every protocol to them). */
 export type RpcStatus =

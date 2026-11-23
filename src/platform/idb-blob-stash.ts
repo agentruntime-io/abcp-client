@@ -2,7 +2,7 @@
 // `BLOB_MISSING`". The outbox is durable (`idb-storage.ts`), so an action that names a blob outlives the page; the bytes that it needs, when the server answers `BLOB_MISSING` or
 // `Retry{BLOB_PENDING}`, or before its first send, must too. A reload finds them here.
 //
-// One database for each partition, `abpc-blobs:<partition>`, beside the partition's own (the provider names and deletes both). Two stores keyed by `<keyspace>\0<blob>`:
+// One database for each partition, `abcp-blobs:<partition>`, beside the partition's own (the provider names and deletes both). Two stores keyed by `<keyspace>\0<blob>`:
 //
 //   bytes   the octets of the blob
 //   facts   { keyspaceId, blobId, size, sha256, contentType, stagedAtMs }

@@ -16,7 +16,7 @@ import {
   DecisionSchema,
   type KeyChange,
   type Record as RecordMessage,
-} from "../src/gen/abpc/v2/types_pb.js";
+} from "../src/gen/abcp/v2/types_pb.js";
 import { fromHex, toHex, utf8Encode } from "../src/rules/bytes.js";
 import {
   applyRecord,
@@ -234,7 +234,7 @@ describe("14 [CLI-3], [CLI-4], 06 [LOG-11] gaps and stops", () => {
 
   it("applies the intent row of an INTENT and of a REJECTED DECISION only (05 [STATE-34])", () => {
     const st = new ReplicaState();
-    const row = "abpc.intent/i-1";
+    const row = "abcp.intent/i-1";
     const intent = create(RecordSchema, { ...op(1, set("k/a", "1"), set(row, '{"status":"PENDING"}')), kind: RecordKind.INTENT, mutationId: "i-1" });
     applyRecord(st, rules, intent);
     expect(st.key("k/a")).toBeUndefined();
@@ -259,7 +259,7 @@ describe("14 [CLI-3], [CLI-4], 06 [LOG-11] gaps and stops", () => {
   });
 
   it("judges the key and the envelope of the requested changes that an INTENT and a REJECTED DECISION do not apply, and nothing else of them (16 [SEC-3], R19 review note 4)", () => {
-    const row = "abpc.intent/i-1";
+    const row = "abcp.intent/i-1";
     const intentOf = (...changes: KeyChange[]): RecordMessage => create(RecordSchema, { ...op(1, ...changes), kind: RecordKind.INTENT, mutationId: "i-1" });
     const rejectedOf = (...changes: KeyChange[]): RecordMessage =>
       create(RecordSchema, { ...op(1, ...changes), kind: RecordKind.DECISION, mutationId: "i-1", decision: create(DecisionSchema, { intentId: "i-1", status: DecisionStatus.REJECTED }) });
@@ -270,7 +270,7 @@ describe("14 [CLI-3], [CLI-4], 06 [LOG-11] gaps and stops", () => {
       expect(() => applyRecord(new ReplicaState(), rules, make(create(KeyChangeSchema, { key: "k/a", kind: ChangeKind.DELETE, value: utf8Encode("1") }), set(row, "{}")))).toThrow(FoldError);
       // a requested change with a key that matches no template, and a value that no schema would take, is not judged: it is not applied
       const st = new ReplicaState();
-      applyRecord(st, rules, make(set("zzz/q", "2"), set("k/a", "not json"), set("abpc.saga.v1/saga/s1", "{}"), set(row, "{}"))); // nor its reserved namespace: vector fold-moved-002
+      applyRecord(st, rules, make(set("zzz/q", "2"), set("k/a", "not json"), set("abcp.saga.v1/saga/s1", "{}"), set(row, "{}"))); // nor its reserved namespace: vector fold-moved-002
       expect(st.key("zzz/q")).toBeUndefined();
     }
   });

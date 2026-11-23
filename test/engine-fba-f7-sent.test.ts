@@ -4,7 +4,7 @@
 import { create } from "@bufbuild/protobuf";
 import { describe, expect, it } from "vitest";
 import { set } from "../src/engine/index.js";
-import { RetryReason, SuccessorRuleSchema } from "../src/gen/abpc/v2/types_pb.js";
+import { RetryReason, SuccessorRuleSchema } from "../src/gen/abcp/v2/types_pb.js";
 import { KS, retryResult, rig, tick } from "./helpers/engine.js";
 
 describe("B3-M7: 14 [CLI-52], [CLI-24] a resend in flight at a crash is an unknown outcome", () => {

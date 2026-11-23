@@ -38,7 +38,7 @@ import {
   UpdateSubscriptionRequestSchema,
   UpdateSubscriptionResponseSchema,
   type SubscribeResponse,
-} from "../../src/gen/abpc/v2/sync_pb.js";
+} from "../../src/gen/abcp/v2/sync_pb.js";
 import type { RawCaller } from "../../src/engine/index.js";
 import { encode, unmarshal } from "../../src/rules/canon/index.js";
 import type { FakeTransport } from "../../src/fake/index.js";

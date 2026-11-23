@@ -1,4 +1,4 @@
-# `npm run gen`: the TypeScript wire code (protoc-gen-es) from proto/abpc into src/gen.
+# `npm run gen`: the TypeScript wire code (protoc-gen-es) from proto/abcp into src/gen.
 # The managed block is the server template's: it fixes the file options that the generated descriptors embed, so that
 # src/gen is byte-for-byte what the server repo generates.
 version: v2
@@ -6,7 +6,7 @@ managed:
   enabled: true
   override:
     - file_option: go_package_prefix
-      value: github.com/agentruntime-io/abpc-server/server/gen
+      value: github.com/agentruntime-io/abcp-server/server/gen
 plugins:
   - local: protoc-gen-es
     out: src/gen

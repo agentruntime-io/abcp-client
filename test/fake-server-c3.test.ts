@@ -13,8 +13,8 @@ import {
   UpdateSubscriptionRequestSchema,
   UpdateSubscriptionRequest_InterestSchema,
   type SubscribeResponse,
-} from "../src/gen/abpc/v2/sync_pb.js";
-import { ChangeKind, Code, KeyChangeSchema, KeyspaceCursorSchema, Lane } from "../src/gen/abpc/v2/types_pb.js";
+} from "../src/gen/abcp/v2/sync_pb.js";
+import { ChangeKind, Code, KeyChangeSchema, KeyspaceCursorSchema, Lane } from "../src/gen/abcp/v2/types_pb.js";
 import { FakeServer, ManualClock, type FakeTransport } from "../src/fake/index.js";
 import { kc, KS, MANIFEST } from "./helpers/engine.js";
 
@@ -77,7 +77,7 @@ describe("10 [AUTH-51] RevokeAccess of a subject", () => {
     server.revokeSubject("ana");
     const refused = async (t: FakeTransport): Promise<{ status: string; cause: string | undefined } | "accepted"> => {
       try {
-        await t.getMutationResult({ $typeName: "abpc.v2.GetMutationResultRequest", keyspaceId: KS, mutationId: "x" });
+        await t.getMutationResult({ $typeName: "abcp.v2.GetMutationResultRequest", keyspaceId: KS, mutationId: "x" });
         return "accepted";
       } catch (e) {
         const err = e as RpcError;
@@ -99,11 +99,11 @@ describe("10 [AUTH-51] RevokeAccess of a subject", () => {
     const { server, clock } = setup();
     const delegated = server.transport({ ...server.principal("ana"), actorChain: ["svc-saga"] });
     expect(server.revokeSubject("svc-saga")).toBe(0);
-    await expect(delegated.getMutationResult({ $typeName: "abpc.v2.GetMutationResultRequest", keyspaceId: KS, mutationId: "x" })).rejects.toMatchObject({ status: "Unauthenticated" });
+    await expect(delegated.getMutationResult({ $typeName: "abcp.v2.GetMutationResultRequest", keyspaceId: KS, mutationId: "x" })).rejects.toMatchObject({ status: "Unauthenticated" });
     const later = server.transport(server.principal("bob"));
     server.revokeSubject("bob", { notBefore: clock.now() + 3_600_000 });
     later.renewToken();
-    await expect(later.getMutationResult({ $typeName: "abpc.v2.GetMutationResultRequest", keyspaceId: KS, mutationId: "x" })).rejects.toMatchObject({ status: "Unauthenticated" });
+    await expect(later.getMutationResult({ $typeName: "abcp.v2.GetMutationResultRequest", keyspaceId: KS, mutationId: "x" })).rejects.toMatchObject({ status: "Unauthenticated" });
   });
 });
 
@@ -148,7 +148,7 @@ describe("09 [READ-39], 10 [AUTH-49] grants", () => {
     await flush();
     expect(controls(a.frames).filter((c) => c.startsWith("dropped"))).toHaveLength(1);
     const sessionId = (a.frames[0]?.frame.case === "control" && a.frames[0].frame.value.control.case === "subscribed" ? a.frames[0].frame.value.control.value.sessionId : "") ?? "";
-    const resp = await ana.refreshSession({ $typeName: "abpc.v2.RefreshSessionRequest", sessionId });
+    const resp = await ana.refreshSession({ $typeName: "abcp.v2.RefreshSessionRequest", sessionId });
     expect(resp.droppedKeyspaceIds).toEqual(["ks2"]);
     await flush();
     expect(controls(a.frames).filter((c) => c.startsWith("dropped"))).toEqual(["dropped:ks1:1", "dropped:ks2:1"]);

@@ -17,7 +17,7 @@
 // fold, so that the restored state is the state that the server's fold gives, whatever a Yjs library would encode (a client never
 // builds a CRDT base, 05 [STATE-74]).
 
-import type { KeyEntry, Record as RecordMessage, Reject, SuccessorRule } from "../gen/abpc/v2/types_pb.js";
+import type { KeyEntry, Record as RecordMessage, Reject, SuccessorRule } from "../gen/abcp/v2/types_pb.js";
 import type { LaneName } from "./manifests.js";
 
 /** The author of an entry (14 [CLI-59]): the principal's issuer, subject and device. */

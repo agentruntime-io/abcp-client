@@ -6,7 +6,7 @@ import { create } from "@bufbuild/protobuf";
 import * as Y from "yjs";
 import { describe, expect, it } from "vitest";
 import { MemoryStorage, set } from "../src/engine/index.js";
-import { ChangeKind, KeyChangeSchema, KeyEntrySchema } from "../src/gen/abpc/v2/types_pb.js";
+import { ChangeKind, KeyChangeSchema, KeyEntrySchema } from "../src/gen/abcp/v2/types_pb.js";
 import { toHex } from "../src/rules/bytes.js";
 import type { ReplicaState } from "../src/rules/fold/index.js";
 import { contentOf, kc, KS, mutateRequests, ofType, rig, tick, types, type Rig } from "./helpers/engine.js";

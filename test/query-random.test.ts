@@ -73,7 +73,7 @@ const QUERIES: Omit<Query, "keyspaceId">[] = [
   { select: { entities: "issue/{i}", subtree: true }, mode: "confirmed" },
 ];
 
-const INTERESTS: string[][] = [[], ["issue"], ["item"], ["issue", "item"], ["issue/1", "item"], ["issue", "abpc.saga.v1"]];
+const INTERESTS: string[][] = [[], ["issue"], ["item"], ["issue", "item"], ["issue/1", "item"], ["issue", "abcp.saga.v1"]];
 
 /** More seeds and steps for a long run: `QUERY_RANDOM_SEEDS=200 npx vitest run test/query-random.test.ts`. */
 const SEEDS = Number(process.env["QUERY_RANDOM_SEEDS"] ?? 12);
@@ -145,13 +145,13 @@ describe("live queries kept by updates equal queries that start from nothing, un
         } else if (x < 0.54) {
           const m = pick(ISSUES.map((i) => `issue/${i}`));
           const status = pick(["moving", "moved", "importing", "purged", "active", undefined]);
-          if (status === undefined) drop(r, `abpc.saga.v1/moved/${m}`);
-          else put(r, { [`abpc.saga.v1/moved/${m}`]: { status, saga_id: "s1", saga: "MoveIssue", to: { keyspace_id: "k2", key: m } } });
+          if (status === undefined) drop(r, `abcp.saga.v1/moved/${m}`);
+          else put(r, { [`abcp.saga.v1/moved/${m}`]: { status, saga_id: "s1", saga: "MoveIssue", to: { keyspace_id: "k2", key: m } } });
           log.push(`moved ${m} ${String(status)}`);
         } else if (x < 0.58) {
           const status = pick(["running", "failed", undefined]);
-          if (status === undefined) drop(r, "abpc.saga.v1/run/s1");
-          else put(r, { "abpc.saga.v1/run/s1": { status } });
+          if (status === undefined) drop(r, "abcp.saga.v1/run/s1");
+          else put(r, { "abcp.saga.v1/run/s1": { status } });
           log.push(`run ${String(status)}`);
         } else if (x < 0.74) {
           const k = pick(POOL);

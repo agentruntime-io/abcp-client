@@ -72,8 +72,8 @@ import {
   GetBlobRequestSchema,
   type CreateUploadResponse,
   type GetBlobResponse,
-} from "../gen/abpc/v2/sync_pb.js";
-import { Code, RecordKind, RetryReason, SystemKind, type Record as RecordMessage } from "../gen/abpc/v2/types_pb.js";
+} from "../gen/abcp/v2/sync_pb.js";
+import { Code, RecordKind, RetryReason, SystemKind, type Record as RecordMessage } from "../gen/abcp/v2/types_pb.js";
 import { parse, getMember } from "../rules/jsonv1/index.js";
 import { fullJitter, HOLD_BACKOFF, resendDelay } from "./backoff.js";
 import type { Runtime } from "./core.js";

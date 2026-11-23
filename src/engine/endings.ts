@@ -7,7 +7,7 @@
 // is one local transaction ([CLI-28], [CLI-53]); the events follow it.
 
 import { create } from "@bufbuild/protobuf";
-import { Code, ErrorClass, RejectSchema, ChangeKind, type KeyChange, type Reject, type Stale } from "../gen/abpc/v2/types_pb.js";
+import { Code, ErrorClass, RejectSchema, ChangeKind, type KeyChange, type Reject, type Stale } from "../gen/abcp/v2/types_pb.js";
 import { codeName } from "./codes.js";
 import { EngineCore } from "./core.js";
 import type { Follow } from "./follow.js";
@@ -463,7 +463,7 @@ export abstract class EndingLayer extends EngineCore {
     const out: string[] = [];
     const st = f.state;
     for (const key of [...st.keyNames(), ...st.tombstoneKeys()]) {
-      if (requested.has(key) || key === `abpc.intent/${e.mutationId}`) continue;
+      if (requested.has(key) || key === `abcp.intent/${e.mutationId}`) continue;
       const row = st.key(key);
       const version = row !== undefined ? row.version : (st.tombstone(key)?.version ?? 0n);
       if (version !== decisionSeq) continue;

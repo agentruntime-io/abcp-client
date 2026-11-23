@@ -2,8 +2,8 @@
 
 import { describe, expect, it } from "vitest";
 import { set, StaticManifests, type EngineEvent, type HeldEvent } from "../src/engine/index.js";
-import { CloseReason } from "../src/gen/abpc/v2/sync_pb.js";
-import { Code, ErrorClass } from "../src/gen/abpc/v2/types_pb.js";
+import { CloseReason } from "../src/gen/abcp/v2/sync_pb.js";
+import { Code, ErrorClass } from "../src/gen/abcp/v2/types_pb.js";
 import { reject as mk, rejectWith } from "../src/fake/index.js";
 import { goOffline, KS, MANIFEST, mutateRequests, ofType, rejectResult, rig, sentIds, tick, types } from "./helpers/engine.js";
 
@@ -199,7 +199,7 @@ describe("14 [CLI-45] a hold keeps the action, stops sending in its scope, emits
   it("Retry{AUTHORIZER_UNAVAILABLE} on Subscribe holds the app; a Subscribe that succeeds clears it", async () => {
     const r = await rig({ start: false });
     r.random.fixed = 0.5;
-    r.server.inject("subscribe", { kind: "status", status: "Unavailable", retry: { $typeName: "abpc.v2.Retry", afterMs: 0, reason: 6 } as never });
+    r.server.inject("subscribe", { kind: "status", status: "Unavailable", retry: { $typeName: "abcp.v2.Retry", afterMs: 0, reason: 6 } as never });
     r.engine.start();
     await r.engine.settle();
     expect(r.engine.status().holds).toEqual([expect.objectContaining({ scope: "app", code: "AUTHORIZER_UNAVAILABLE" })]);
@@ -325,7 +325,7 @@ describe("14 [CLI-46] DEAD_LETTER: the special cases", () => {
 });
 
 import { kc } from "./helpers/engine.js";
-import type { KeyChange } from "../src/gen/abpc/v2/types_pb.js";
+import type { KeyChange } from "../src/gen/abcp/v2/types_pb.js";
 function kcSet(key: string, v: unknown): KeyChange {
   return kc(key, "set", v);
 }

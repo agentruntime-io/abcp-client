@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { set, type ExportRecord } from "../src/engine/index.js";
 import { FakeServer, ManualClock } from "../src/fake/index.js";
 import { StaticManifests } from "../src/engine/index.js";
-import { Code, RetryReason } from "../src/gen/abpc/v2/types_pb.js";
+import { Code, RetryReason } from "../src/gen/abcp/v2/types_pb.js";
 import { contentOf, kc, KS, MANIFEST, mutateRequests, ofType, retryResult, rig, sentIds, tick, types, type Rig } from "./helpers/engine.js";
 
 const DAY = 24 * 3600 * 1000;

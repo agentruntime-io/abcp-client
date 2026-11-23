@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { set } from "../src/engine/index.js";
 import { bound, CLIENT_BACKOFF } from "../src/engine/backoff.js";
 import { DEFAULT_CLASS, codeName } from "../src/engine/codes.js";
-import { Code, ErrorClass, RetryReason } from "../src/gen/abpc/v2/types_pb.js";
+import { Code, ErrorClass, RetryReason } from "../src/gen/abcp/v2/types_pb.js";
 import { rejectWith, reject as mk } from "../src/fake/index.js";
 import { KS, mutateRequests, ofType, rejectResult, retryResult, rig, sentIds, tick, types } from "./helpers/engine.js";
 

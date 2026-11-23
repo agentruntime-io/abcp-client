@@ -1,4 +1,4 @@
-// `describe` for a suite whose data comes from an abpc-server checkout (see server-dir.ts). Kept apart from server-dir.ts, which the global
+// `describe` for a suite whose data comes from an abcp-server checkout (see server-dir.ts). Kept apart from server-dir.ts, which the global
 // setup imports and which therefore must not import vitest.
 
 import { describe, it } from "vitest";

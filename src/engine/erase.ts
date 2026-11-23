@@ -7,7 +7,7 @@
 // reader folds each of these as the server's fold does, so that a replica restored from blanked pages and records is the state that the unblanked ones gave (14 [CLI-2]).
 
 import { create } from "@bufbuild/protobuf";
-import { MutationSchema, type Mutation } from "../gen/abpc/v2/sync_pb.js";
+import { MutationSchema, type Mutation } from "../gen/abcp/v2/sync_pb.js";
 import {
   ChangeKind,
   KeyChangeSchema,
@@ -18,7 +18,7 @@ import {
   type KeyChange,
   type KeyEntry,
   type Record as RecordMessage,
-} from "../gen/abpc/v2/types_pb.js";
+} from "../gen/abcp/v2/types_pb.js";
 import { canonical, parse, type JsonValue } from "../rules/jsonv1/index.js";
 import { bytesEqual } from "../rules/bytes.js";
 import { CanonError, decodeContent, encodeContent } from "./entry.js";
@@ -27,7 +27,7 @@ import { CanonError, decodeContent, encodeContent } from "./entry.js";
 export const REDACTED_ENCODING = "redacted/v1";
 
 /** A saga's run key (11 [COORD-61]): its value holds the start document (11 [COORD-58]). */
-export const isRunKey = (key: string): boolean => /^abpc\.saga\.v1\/run\/[^/]+$/.test(key);
+export const isRunKey = (key: string): boolean => /^abcp\.saga\.v1\/run\/[^/]+$/.test(key);
 
 /** The ways that a client learns of a redaction of a keyspace (14 [CLI-76]). */
 export type RedactionSource = "record" | "mark" | "list";
@@ -122,7 +122,7 @@ function entryHoldsValue(e: KeyEntry): boolean {
 
 /**
  * The start document that a run-key `SET` of a `REDACTED` record holds, in the place of the one that a stored action holds: "replace the start document in every copy of the
- * `abpc.saga.v1.Start` of that run key ... with the blanked one that the `SET`'s value holds" (14 [CLI-76]). The record's `SET` is the run key's whole value, the start document's members and
+ * `abcp.saga.v1.Start` of that run key ... with the blanked one that the `SET`'s value holds" (14 [CLI-76]). The record's `SET` is the run key's whole value, the start document's members and
  * the members that the module writes (11 [COORD-61]: `status`, `initiator`, ...); the stored Start holds the start document alone, so each member of the stored document is the record's.
  * Undefined when the stored document is already the blanked one, or when either is no JSON object.
  */

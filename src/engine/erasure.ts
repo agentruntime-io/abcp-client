@@ -28,8 +28,8 @@
 // does not resend an erased one, and ends it as an action of unknown outcome ([CLI-83]) instead.
 
 import * as Y from "yjs";
-import { ChangeKind } from "../gen/abpc/v2/types_pb.js";
-import type { KeyRedaction } from "../gen/abpc/v2/types_pb.js";
+import { ChangeKind } from "../gen/abcp/v2/types_pb.js";
+import type { KeyRedaction } from "../gen/abcp/v2/types_pb.js";
 import { StateValue } from "../rules/fold/index.js";
 import { bytesEqual } from "../rules/bytes.js";
 import { resendDelay } from "./backoff.js";

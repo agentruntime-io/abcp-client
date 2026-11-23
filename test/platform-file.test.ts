@@ -8,14 +8,14 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { create } from "@bufbuild/protobuf";
-import { KeyEntrySchema } from "../src/gen/abpc/v2/types_pb.js";
+import { KeyEntrySchema } from "../src/gen/abcp/v2/types_pb.js";
 import type { OutboxEntry, ReplicaHead, StorageOp } from "../src/engine/index.js";
 import { FileStorage, FileStorageProvider } from "../src/platform/file-storage.js";
 import { parse, stringify } from "../src/platform/serialize.js";
 
 let dir: string;
 beforeEach(() => {
-  dir = mkdtempSync(path.join(tmpdir(), "abpc-file-"));
+  dir = mkdtempSync(path.join(tmpdir(), "abcp-file-"));
 });
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });

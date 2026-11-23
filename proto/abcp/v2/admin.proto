@@ -1,4 +1,4 @@
-// ABPC v2.0 — administration (spec/12). Callers: principals from the app's admin issuer,
+// ABCP v2.0 — administration (spec/12). Callers: principals from the app's admin issuer,
 // or the deployment operator for the calls spec/12 Table 12.1 gives it. Every call is audited.
 // A refusal because of state, or of a well-formed app config by a cross-field or environment rule, is
 // FailedPrecondition with Reject{ADMIN_REFUSED} and an Appendix A.9 reason. A malformed field, or one out of its
@@ -12,9 +12,9 @@
 // detail that spec/02 §2.9 defines.
 syntax = "proto3";
 
-package abpc.v2;
+package abcp.v2;
 
-import "abpc/v2/types.proto";
+import "abcp/v2/types.proto";
 import "google/protobuf/field_mask.proto";
 import "google/protobuf/timestamp.proto";
 
@@ -58,10 +58,10 @@ message RegisterAppResponse {}
 enum Placement {
   PLACEMENT_UNSPECIFIED = 0;               // = PLACEMENT_A (spec/04 [MAN-90]); an undefined number or JSON name is refused
                                            // (spec/15 [COMPAT-47])
-  PLACEMENT_A = 1;   // ABPC's Postgres
+  PLACEMENT_A = 1;   // ABCP's Postgres
   PLACEMENT_B = 2;   // user's Postgres: full log + values
   PLACEMENT_C = 3;   // A + async read-only copy in the user's Postgres
-  PLACEMENT_D = 4;   // user's Postgres: values + journal; history in ABPC (spec/13)
+  PLACEMENT_D = 4;   // user's Postgres: values + journal; history in ABCP (spec/13)
 }
 
 message Issuer {
@@ -84,7 +84,7 @@ message AuthorizerConfig {
                                            // lifetime (spec/04 [MAN-82])
 }
 
-// Placement B/D: an ABPC-owned read-only SQL table filled from one entity template (spec/13 §13.9).
+// Placement B/D: an ABCP-owned read-only SQL table filled from one entity template (spec/13 §13.9).
 message MappedTable {
   string table = 1;                        // a table name that matches the row of spec/03 Table 3.1 for mapped names (spec/04 [MAN-84])
   string row_template = 2;                 // an entity marker template, e.g. "issue/{id}"
@@ -139,7 +139,7 @@ message OwnerContact {
 
 // A C module the app's admins enable, and the principal it acts under (spec/04 [MAN-89]). RegisterApp accepts none.
 message ModuleConfig {
-  string name = 1;                         // "abpc.lease.v1", "abpc.saga.v1" or "abpc.escrow.v1"; each at most once
+  string name = 1;                         // "abcp.lease.v1", "abcp.saga.v1" or "abcp.escrow.v1"; each at most once
   string host = 2;                         // empty: in process, under the server-stamped module principal (spec/10
                                            // [AUTH-64]); otherwise the policy_hosts[].name it is reached through
   string issuer = 3;                       // out of process: the `issuer_url` of a user issuer (admin: false); empty in process
@@ -174,7 +174,7 @@ message AppConfig {
   repeated MappedTable mapped_tables = 12; // B and D only
   uint32 journal_hot_window_seconds = 13;  // in D, 0 = 3,600 (spec/13 §13.4); in every placement 1 to 299, and outside D 300 or more,
                                            // is refused (spec/13 [PLC-4], spec/04 [MAN-84])
-  string blob_store_ref = 14;              // B and D: optional customer blob store; default ABPC's
+  string blob_store_ref = 14;              // B and D: optional customer blob store; default ABCP's
   AdminRecovery admin_recovery = 15;       // RegisterApp: the default only; then app admins only (spec/04 [MAN-86])
   // At least two and at most 10 (spec/04 Table 4.10a), of at least two different kinds. RegisterApp sets them; then only app admins change
   // them, and a change takes effect after the longer of 72 h and the recovery wait in force before the call, notifying the old and the
@@ -506,7 +506,7 @@ message AuditEntry {
   Principal principal = 3;                 // the caller; unset for the deployment operator and for an entry that
                                              // records an event rather than a call (spec/12 [ADM-4])
   bool by_operator = 4;                      // the caller was the deployment operator
-  string call = 5;                           // a name of spec/12 Table 12.2, e.g. "AdminService.Redact", "Mutate/abpc.Override"
+  string call = 5;                           // a name of spec/12 Table 12.2, e.g. "AdminService.Redact", "Mutate/abcp.Override"
   string app_id = 6;
   string keyspace_id = 7;                    // if the call named one
   string reason = 8;

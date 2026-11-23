@@ -3,7 +3,7 @@
 // is for a browser (fetch). Import the Node one from `net/node.js`, which pulls in `node:http2`: this index leaves it out.
 
 export { ConnectCaller, DEFAULT_UNARY_TIMEOUT_MS, MAX_MESSAGE_BYTES, type ConnectCallerOptions } from "./caller.js";
-export { abpcDetail, statusOfCode, toFailure, type Ending } from "./errors.js";
+export { abcpDetail, statusOfCode, toFailure, type Ending } from "./errors.js";
 export { ConnectManifests, MemoryManifestCache, ParsedManifest, readManifest, type ConnectManifestsOptions, type ManifestCache } from "./manifests.js";
 export { TokenStore, jwtExpiresAt, type TokenGrant, type TokenSource, type TokenStoreOptions } from "./tokens.js";
 export { createBytesTransport, type BytesTransportOptions } from "./transport.js";

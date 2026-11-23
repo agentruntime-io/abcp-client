@@ -6,13 +6,13 @@
 // A client engine compares per-key hashes only (17 [CONF-9]). The replica of this test also keeps prefix versions, so it
 // reaches the keyspace state hash and the metadata hash (05 [STATE-84]) too, and the test checks them: the metadata hash covers
 // every tombstone, mark, override seq, reset seq and `changed_at` of the fold, which no per-key hash does. It also checks the
-// values of the reserved `abpc.*` keys.
+// values of the reserved `abcp.*` keys.
 
 import { describe, expect, it } from "vitest";
 import { toHex } from "../src/rules/bytes.js";
 import { sha256 } from "../src/rules/crypto.js";
 import { applyRecord, ReplicaState, StateValue } from "../src/rules/fold/index.js";
-import { RecordSchema, type Record as RecordMessage } from "../src/gen/abpc/v2/types_pb.js";
+import { RecordSchema, type Record as RecordMessage } from "../src/gen/abcp/v2/types_pb.js";
 import { fromVectorJson } from "./helpers/proto.js";
 import { vectorRules } from "./helpers/rules.js";
 import { HAVE_VECTORS, loadVectors, type Vector } from "./helpers/vectors.js";
@@ -80,7 +80,7 @@ describeNeeds(HAVE_VECTORS, "17 [CONF-9] input mapping on fold.json: per-key sta
       let reserved = 0;
       for (const key of st.keyNames()) {
         const k = st.key(key);
-        if (!key.startsWith("abpc.") || k === undefined || k.state !== StateValue) continue;
+        if (!key.startsWith("abcp.") || k === undefined || k.state !== StateValue) continue;
         reserved++;
         const w = values[key];
         expect(w, `reserved key "${key}" holds a value that the vector does not list`).toBeDefined();

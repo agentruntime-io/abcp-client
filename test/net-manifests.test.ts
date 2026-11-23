@@ -4,7 +4,7 @@
 import { create } from "@bufbuild/protobuf";
 import { describe, expect, it } from "vitest";
 import { ProtocolViolation, RpcError, StaticManifests } from "../src/engine/index.js";
-import { GetManifestResponseSchema, type GetManifestRequest, type GetManifestResponse } from "../src/gen/abpc/v2/sync_pb.js";
+import { GetManifestResponseSchema, type GetManifestRequest, type GetManifestResponse } from "../src/gen/abcp/v2/sync_pb.js";
 import { ConnectManifests, MemoryManifestCache, readManifest } from "../src/net/index.js";
 import { sha256 } from "../src/rules/crypto.js";
 import { jsonv1 } from "../src/rules/index.js";
@@ -16,7 +16,7 @@ const DOC = {
   keys: {
     "issue/{id}": { merge: "lww", entity: true },
     "issue/{x}/title": { merge: "lww" },
-    "issue/{id}/flag": { merge: "lww", fenced_by: "abpc.lease.v1/claim/{id}" },
+    "issue/{id}/flag": { merge: "lww", fenced_by: "abcp.lease.v1/claim/{id}" },
     "issue/{id}/comment/{cid}": { merge: "lww", entity: true },
     "issue/{id}/comment/{cid}/body": { merge: "cas" },
     "count/{id}": { merge: "counter", value_schema: { type: "int", min: 0, max: 100 } },
@@ -80,15 +80,15 @@ describe("what the client reads of a manifest", () => {
     expect(m.counterRange("count/x")).toEqual({ min: 0n, max: 100n });
     expect(m.counterRange("seq/number")).toEqual({ min: -9007199254740991n, max: 9007199254740991n });
     expect(m.counterRange("issue/7")).toBeUndefined();
-    expect(m.fencedBy("issue/7/flag")).toBe("abpc.lease.v1/claim/7");
+    expect(m.fencedBy("issue/7/flag")).toBe("abcp.lease.v1/claim/7");
     expect(m.fencedBy("issue/7/title")).toBeUndefined();
   });
 
-  it("has the op types that no manifest declares: abpc.Override, and the client's op types of the modules that the coordination section enables (11 Table 11.1)", () => {
-    expect(m.opType("abpc.Override")).toMatchObject({ lane: "SEQUENCED" });
-    expect(m.opType("abpc.lease.v1.Acquire")).toMatchObject({ lane: "GATED" });
-    expect(m.opType("abpc.lease.v1.Expire")).toBeUndefined(); // module only
-    expect(m.opType("abpc.saga.v1.Start")).toBeUndefined(); // the saga module is not enabled
+  it("has the op types that no manifest declares: abcp.Override, and the client's op types of the modules that the coordination section enables (11 Table 11.1)", () => {
+    expect(m.opType("abcp.Override")).toMatchObject({ lane: "SEQUENCED" });
+    expect(m.opType("abcp.lease.v1.Acquire")).toMatchObject({ lane: "GATED" });
+    expect(m.opType("abcp.lease.v1.Expire")).toBeUndefined(); // module only
+    expect(m.opType("abcp.saga.v1.Start")).toBeUndefined(); // the saga module is not enabled
     expect(m.app).toBe("tracker");
     expect(m.requiredFeatures).toEqual(["escrow.v1"]);
   });

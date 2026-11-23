@@ -2,7 +2,7 @@
 
 import { describe, expect, it } from "vitest";
 import { set, type RpcStatus } from "../src/engine/index.js";
-import { Code, RetryReason, RetrySchema } from "../src/gen/abpc/v2/types_pb.js";
+import { Code, RetryReason, RetrySchema } from "../src/gen/abcp/v2/types_pb.js";
 import { create } from "@bufbuild/protobuf";
 import { reject as mk } from "../src/fake/index.js";
 import { goOffline, goOnline, KS, mutateRequests, ofType, rig, sentIds, tick, types } from "./helpers/engine.js";
@@ -102,7 +102,7 @@ describe("14 [CLI-50] transport errors", () => {
 
 describe("17 [CONF-33] the statuses that A.7 gives no row are treated as Unavailable, for Mutate, LoadState and Subscribe", () => {
   const statuses: RpcStatus[] = ["Unknown", "Internal", "Cancelled", "DataLoss", "OutOfRange"];
-  it.each(statuses)("%s with no ABPC detail: a sent action is resent with the identical content until the stored outcome comes; a load and a subscribe are repeated", async (status) => {
+  it.each(statuses)("%s with no ABCP detail: a sent action is resent with the identical content until the stored outcome comes; a load and a subscribe are repeated", async (status) => {
     const r = await rig({ start: false });
     r.server.inject("loadState", { kind: "status", status });
     r.server.inject("subscribe", { kind: "status", status });

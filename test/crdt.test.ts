@@ -46,7 +46,7 @@ const KNOWN_LIBRARY_DIFFERENCES: Record<string, { library: "yjs" | "yrs"; shows?
 };
 
 /**
- * The vectors of the pinned spec (draft 22, the v2.0-rc.5, omniview 715f597) that the client's rules do not pass yet, with the work that will
+ * The vectors of the pinned spec (draft 22, the v2.0-rc.6: rc.5 renamed ABCP, tag spec-v2.0-rc.6) that the client's rules do not pass yet, with the work that will
  * make them pass (the twin of the server's `vectors.SkipPending`). Remove an id when its work lands. Empty: the nesting vectors of round 18
  * (`crdt-type-depth-002`, `-003`, `-004`, `-006`, `-009`, R18-B1) and of round 19 (`-010` to `-022`, R19-B1) pass.
  */

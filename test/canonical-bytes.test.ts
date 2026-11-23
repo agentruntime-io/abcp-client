@@ -20,8 +20,8 @@ import {
   unmarshal,
   unmarshalJson,
 } from "../src/rules/canon/index.js";
-import { MutationSchema } from "../src/gen/abpc/v2/sync_pb.js";
-import { KeyChangeSchema, RecordSchema, type Record as RecordMessage } from "../src/gen/abpc/v2/types_pb.js";
+import { MutationSchema } from "../src/gen/abcp/v2/sync_pb.js";
+import { KeyChangeSchema, RecordSchema, type Record as RecordMessage } from "../src/gen/abcp/v2/types_pb.js";
 import { extendMessage, fromVectorJson, messageDesc, type FieldAddition } from "./helpers/proto.js";
 import { HAVE_VECTORS, loadVectors, utf8, type Vector } from "./helpers/vectors.js";
 import { describeNeeds } from "./helpers/describe-needs.js";
@@ -52,7 +52,7 @@ describeNeeds(HAVE_VECTORS, "07 [MUT-45] content hash and the refusals of 02 [AR
   for (const v of ofKind("content-hash")) {
     it(`${v.id}: ${v.title.slice(0, 100)}`, () => {
       // the type that the receiver holds: this version's, or, at an upgraded server, one that knows more fields
-      const additions = (v.schema_additions as Record<string, FieldAddition[]> | undefined)?.["abpc.v2.Mutation"];
+      const additions = (v.schema_additions as Record<string, FieldAddition[]> | undefined)?.["abcp.v2.Mutation"];
       const desc = additions !== undefined ? extendMessage(MutationSchema, additions) : MutationSchema;
 
       let m: ReturnType<typeof unmarshal> | undefined;
@@ -156,7 +156,7 @@ describe("12 [ADM-94] the personal keys of a request digest, beyond the vectors"
     fromVectorJson(MutationSchema, {
       mutation_id: "0579af62-c045-42bc-a979-5a9ce8f2e400",
       keyspace_id: "acme/clinic",
-      op_type: "abpc.Override",
+      op_type: "abcp.Override",
       lane: 1,
       reason: "fix",
       changes: keys.map((key) => ({ key, kind, value: { hex: "31" }, encoding: "json/v1", seen_version: "3" })),
@@ -183,13 +183,13 @@ describe("12 [ADM-94] the personal keys of a request digest, beyond the vectors"
 
 describe("12 [ADM-94] (J7) the split and archive prefixes of a request digest, beyond the vectors", () => {
   const split = (reason: string, ...rules: [string, string][]) =>
-    fromVectorJson(messageDesc("abpc.v2.SplitKeyspaceRequest"), {
+    fromVectorJson(messageDesc("abcp.v2.SplitKeyspaceRequest"), {
       keyspace_id: "acme/crm",
       reason,
       rules: rules.map(([prefix, id]) => ({ prefix, new_keyspace_id: id })),
     });
   const archive = (prefix: string) =>
-    fromVectorJson(messageDesc("abpc.v2.ArchiveKeyspaceRequest"), {
+    fromVectorJson(messageDesc("abcp.v2.ArchiveKeyspaceRequest"), {
       keyspace_id: "acme/crm-old",
       reason: "old",
       successors: [{ prefix, keyspace_id: "acme/crm-ana" }, { keyspace_id: "acme/crm-archive" }],
@@ -197,19 +197,19 @@ describe("12 [ADM-94] (J7) the split and archive prefixes of a request digest, b
   const digest = (type: string, m: Parameters<typeof requestDigest>[1]) => requestDigest(messageDesc(type), m);
 
   it("no prefix of a rule or of a successor is in the digest, the keyspace ids, their number and the reason are", () => {
-    const base = digest("abpc.v2.SplitKeyspaceRequest", split("by owner", ["user/ana@example.com/", "acme/crm-ana"], ["", "acme/crm-rest"]));
-    const prefixes = digest("abpc.v2.SplitKeyspaceRequest", split("by owner", ["user/bob@example.com/", "acme/crm-ana"], ["rest/", "acme/crm-rest"]));
+    const base = digest("abcp.v2.SplitKeyspaceRequest", split("by owner", ["user/ana@example.com/", "acme/crm-ana"], ["", "acme/crm-rest"]));
+    const prefixes = digest("abcp.v2.SplitKeyspaceRequest", split("by owner", ["user/bob@example.com/", "acme/crm-ana"], ["rest/", "acme/crm-rest"]));
     expect(toHex(prefixes.digest)).toBe(toHex(base.digest));
     expect(toHex(base.canonical)).not.toContain(toHex(utf8("user/")));
-    const successor = digest("abpc.v2.SplitKeyspaceRequest", split("by owner", ["user/ana@example.com/", "acme/crm-bob"], ["", "acme/crm-rest"]));
+    const successor = digest("abcp.v2.SplitKeyspaceRequest", split("by owner", ["user/ana@example.com/", "acme/crm-bob"], ["", "acme/crm-rest"]));
     expect(toHex(successor.digest)).not.toBe(toHex(base.digest));
-    const fewer = digest("abpc.v2.SplitKeyspaceRequest", split("by owner", ["user/ana@example.com/", "acme/crm-ana"]));
+    const fewer = digest("abcp.v2.SplitKeyspaceRequest", split("by owner", ["user/ana@example.com/", "acme/crm-ana"]));
     expect(toHex(fewer.digest)).not.toBe(toHex(base.digest));
-    const reason = digest("abpc.v2.SplitKeyspaceRequest", split("another", ["user/ana@example.com/", "acme/crm-ana"], ["", "acme/crm-rest"]));
+    const reason = digest("abcp.v2.SplitKeyspaceRequest", split("another", ["user/ana@example.com/", "acme/crm-ana"], ["", "acme/crm-rest"]));
     expect(toHex(reason.digest)).not.toBe(toHex(base.digest));
 
-    const a1 = digest("abpc.v2.ArchiveKeyspaceRequest", archive("user/ana@example.com/"));
-    const a2 = digest("abpc.v2.ArchiveKeyspaceRequest", archive(""));
+    const a1 = digest("abcp.v2.ArchiveKeyspaceRequest", archive("user/ana@example.com/"));
+    const a2 = digest("abcp.v2.ArchiveKeyspaceRequest", archive(""));
     expect(toHex(a1.digest)).toBe(toHex(a2.digest));
     expect(toHex(a1.canonical)).not.toContain(toHex(utf8("user/")));
   });

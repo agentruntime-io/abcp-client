@@ -5,7 +5,7 @@
 
 import { describe, expect, it } from "vitest";
 import { create } from "@bufbuild/protobuf";
-import { KeyEntrySchema, RecordSchema } from "../src/gen/abpc/v2/types_pb.js";
+import { KeyEntrySchema, RecordSchema } from "../src/gen/abcp/v2/types_pb.js";
 import { lockName, StoreFull, tabLockName, type OutboxEntry, type ReplicaHead, type StorageOp } from "../src/engine/index.js";
 import { MemoryStorage } from "../src/engine/memory-storage.js";
 import { BroadcastTabChannel, type BroadcastChannelConstructor } from "../src/platform/channel.js";
@@ -74,9 +74,9 @@ describe.skipIf(nodeLocks === undefined)("WebLocks over Node's navigator.locks",
 describe("the BroadcastChannel of a tab", () => {
   const ctor = globalThis.BroadcastChannel as unknown as BroadcastChannelConstructor;
   it("reaches the other channels of the name, never the one that posted, and not after it is closed", async () => {
-    const a = new BroadcastTabChannel(ctor, "abpc-test-channel");
-    const b = new BroadcastTabChannel(ctor, "abpc-test-channel");
-    const other = new BroadcastTabChannel(ctor, "abpc-test-other");
+    const a = new BroadcastTabChannel(ctor, "abcp-test-channel");
+    const b = new BroadcastTabChannel(ctor, "abcp-test-channel");
+    const other = new BroadcastTabChannel(ctor, "abcp-test-other");
     const gotA: unknown[] = [];
     const gotB: unknown[] = [];
     const gotO: unknown[] = [];
@@ -103,8 +103,8 @@ describe("the BroadcastChannel of a tab", () => {
   });
 
   it("does not stop on a listener that throws, and does not throw for a message that cannot be cloned", async () => {
-    const a = new BroadcastTabChannel(ctor, "abpc-test-throw");
-    const b = new BroadcastTabChannel(ctor, "abpc-test-throw");
+    const a = new BroadcastTabChannel(ctor, "abcp-test-throw");
+    const b = new BroadcastTabChannel(ctor, "abcp-test-throw");
     const got: unknown[] = [];
     b.onMessage(() => {
       throw new Error("a bad listener");
@@ -194,7 +194,7 @@ describe("the web host", () => {
   });
 
   it("names the lock of a tab by the tab and the engine that holds it: a reload is the same tab id and another engine, and the lock of the page that went is not the one of the page that replaced it", () => {
-    const k = { origin: "https://abpc.test", appId: "app", partition: "i|ana" };
+    const k = { origin: "https://abcp.test", appId: "app", partition: "i|ana" };
     expect(tabLockName(k, "tab1", "e1")).not.toBe(tabLockName(k, "tab1", "e2"));
     expect(tabLockName(k, "tab1", "e1")).not.toBe(tabLockName(k, "tab2", "e1"));
     expect(tabLockName(k, "tab1", "e1")).not.toBe(lockName(k)); // never the flusher's lock

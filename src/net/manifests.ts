@@ -9,14 +9,14 @@
 //  - for the engine: for each op type its dispatch, `optimistic`, `barrier`, `offline_mode`, whether it is a spend op type (`escrow`), the
 //    declared templates that its `writes` select (03 [ID-21]); the `crdt_roots` of a CRDT template; the range of a counter; the owning key of a
 //    fenced key (`fenced_by`, 04 [MAN-24]).
-//  - the op types that no manifest declares: `abpc.Override` (03 [ID-51]) and the client-emittable op types of the modules that the
+//  - the op types that no manifest declares: `abcp.Override` (03 [ID-51]) and the client-emittable op types of the modules that the
 //    coordination section enables (11 Table 11.1), all GATED but the first.
 //
 // What it checks of the answer, because a client does not trust a document it cannot verify: the encoding is json/v1, the version is the one
 // asked for, the document reads as a manifest document (04 [MAN-3]), and its SHA-256 is the `sha256` that the answer carries.
 
 import { create } from "@bufbuild/protobuf";
-import { GetManifestRequestSchema, GetManifestResponseSchema, type GetManifestResponse } from "../gen/abpc/v2/sync_pb.js";
+import { GetManifestRequestSchema, GetManifestResponseSchema, type GetManifestResponse } from "../gen/abcp/v2/sync_pb.js";
 import { pushBounded } from "../engine/bounded.js";
 import type { EngineManifest, Manifests, OpTypeInfo } from "../engine/manifests.js";
 import { ProtocolViolation, RpcError } from "../engine/errors.js";
@@ -32,9 +32,9 @@ const ROOT_TYPES: ReadonlySet<string> = new Set(["text", "map", "array", "xml_fr
 
 /** The op types of the modules that a client emits (11 Table 11.1), by the module of the coordination section that enables them. */
 const MODULE_OP_TYPES: Readonly<Record<string, readonly string[]>> = {
-  lease: ["abpc.lease.v1.Acquire", "abpc.lease.v1.Renew", "abpc.lease.v1.Release"],
-  saga: ["abpc.saga.v1.Start", "abpc.saga.v1.Abandon", "abpc.saga.v1.ResolveMove"],
-  escrow: ["abpc.escrow.v1.Grant", "abpc.escrow.v1.Return"],
+  lease: ["abcp.lease.v1.Acquire", "abcp.lease.v1.Renew", "abcp.lease.v1.Release"],
+  saga: ["abcp.saga.v1.Start", "abcp.saga.v1.Abandon", "abcp.saga.v1.ResolveMove"],
+  escrow: ["abcp.escrow.v1.Grant", "abcp.escrow.v1.Return"],
 };
 
 const FETCHES_KEPT = 1000;
@@ -106,8 +106,8 @@ export class ParsedManifest implements EngineManifest {
     }
     const ops = getMember(doc, "op_types");
     if (ops instanceof Map) for (const [name, o] of ops) this.ops.set(name, opInfo(name, o, this.index));
-    // 03 [ID-51]: `abpc.Override` exists in every manifest version, SEQUENCED
-    this.ops.set("abpc.Override", { name: "abpc.Override", lane: "SEQUENCED", optimistic: true, barrier: false, offlineMode: "queue_recheck", spend: false, logIntent: false });
+    // 03 [ID-51]: `abcp.Override` exists in every manifest version, SEQUENCED
+    this.ops.set("abcp.Override", { name: "abcp.Override", lane: "SEQUENCED", optimistic: true, barrier: false, offlineMode: "queue_recheck", spend: false, logIntent: false });
     const coordination = getMember(doc, "coordination");
     if (coordination instanceof Map) {
       for (const [module, names] of Object.entries(MODULE_OP_TYPES)) {

@@ -5,7 +5,7 @@
 import { describe, expect, it } from "vitest";
 import { jsonBytes, LocalRefusal, set, del } from "../src/engine/index.js";
 import { create } from "@bufbuild/protobuf";
-import { ChangeKind, KeyChangeSchema } from "../src/gen/abpc/v2/types_pb.js";
+import { ChangeKind, KeyChangeSchema } from "../src/gen/abcp/v2/types_pb.js";
 import { createQueries } from "../src/query/index.js";
 import { goOffline, goOnline, KS, ofType, types } from "./helpers/engine.js";
 import { jsonOf, keysOf, qrig, watch } from "./helpers/query.js";

@@ -1,7 +1,7 @@
 // The SYSTEM records (06 §6.7): which of a record's changes the fold applies and what each kind does besides (05 [STATE-34]).
 
-import type { KeyChange, Record as RecordMessage } from "../../gen/abpc/v2/types_pb.js";
-import { ChangeKind, SystemKind } from "../../gen/abpc/v2/types_pb.js";
+import type { KeyChange, Record as RecordMessage } from "../../gen/abcp/v2/types_pb.js";
+import { ChangeKind, SystemKind } from "../../gen/abcp/v2/types_pb.js";
 import { JsonV1Error } from "../jsonv1/errors.js";
 import { type JsonValue, isInteger } from "../jsonv1/value.js";
 import { parse } from "../jsonv1/parse.js";

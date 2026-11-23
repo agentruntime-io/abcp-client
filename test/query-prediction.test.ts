@@ -3,7 +3,7 @@
 // (the events of an outcome), [CLI-11] (a CAS that was predicted to have no effect).
 
 import { describe, expect, it } from "vitest";
-import { Code } from "../src/gen/abpc/v2/types_pb.js";
+import { Code } from "../src/gen/abcp/v2/types_pb.js";
 import { reject as mk } from "../src/fake/index.js";
 import { cas, del, incr, jsonBytes, set } from "../src/engine/index.js";
 import { goOffline, goOnline, kc, kcCas, ofType, rejectResult, types } from "./helpers/engine.js";
