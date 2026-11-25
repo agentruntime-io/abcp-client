@@ -86,6 +86,7 @@ export const BOUNDS: Readonly<Record<string, Bound>> = {
   "abcp.v2.LoadStateResponse.successors": MAX_SUCCESSORS,
   "abcp.v2.LoadStateResponse.lane_watermarks": MAX_KEYSPACES_PER_SESSION * LANES,
   "abcp.v2.LoadStateResponse.redactions": MAX_REDACTIONS_PER_PAGE,
+  "abcp.v2.ListKeyspacesResponse.keyspaces": 1000, // spec/09 §9.11 [XKS-6], experimental: a larger `page_size` counts as 1,000 (the request's `page_size` applies)
   "abcp.v2.UpdateSubscriptionResponse.rejected": 2 * MAX_KEYSPACES_PER_SESSION, // 09 [READ-62]: bounded by the request's `add` and `set_interest`
   "abcp.v2.RefreshSessionResponse.dropped_keyspace_ids": MAX_KEYSPACES_PER_SESSION,
   // -- the stream --
@@ -117,6 +118,12 @@ export type DecodeLimits = Readonly<Record<string, number>>;
 export function pageBound(pageSize: number): number {
   if (pageSize === 0) return DEFAULT_PAGE_SIZE;
   return Math.min(pageSize, MAX_PAGE_SIZE);
+}
+
+/** The count of the keyspaces that a `ListKeyspaces` of this `page_size` may return (spec/09 [XKS-6], experimental): 0 is 100, a larger value counts as 1,000. */
+export function listKeyspacesPageBound(pageSize: number): number {
+  if (pageSize === 0) return 100;
+  return Math.min(pageSize, 1000);
 }
 
 interface Plan {

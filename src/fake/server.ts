@@ -107,6 +107,8 @@ import {
   type GetMutationResultsResponse,
   type LoadStateRequest,
   type LoadStateResponse,
+  type ListKeyspacesRequest,
+  type ListKeyspacesResponse,
   type MutateRequest,
   type MutateResponse,
   type Mutation,
@@ -1473,6 +1475,11 @@ export class FakeServer {
     }
   }
 
+  /** `ListKeyspaces` (spec/09 §9.11, experimental): the fake does not list keyspaces, and lists no `x-list-keyspaces.v1`: Unimplemented (15 [COMPAT-28]). */
+  async listKeyspaces(_principal: Principal, _req: ListKeyspacesRequest): Promise<ListKeyspacesResponse> {
+    throw new RpcError("Unimplemented", "ListKeyspaces is experimental and not served by the fake (spec/09 §9.11)");
+  }
+
   async loadState(principal: Principal, req: LoadStateRequest): Promise<LoadStateResponse> {
     const inj = await this.prologue("loadState", req, principal);
     const resp = this.loadStateNow(principal, req);
@@ -2262,5 +2269,8 @@ export class FakeTransport implements Transport {
   }
   deleteBlob(req: DeleteBlobRequest): Promise<DeleteBlobResponse> {
     return this.server.deleteBlob(this.principal, req);
+  }
+  listKeyspaces(req: ListKeyspacesRequest): Promise<ListKeyspacesResponse> {
+    return this.server.listKeyspaces(this.principal, req);
   }
 }
