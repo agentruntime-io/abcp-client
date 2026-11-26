@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { create } from "@bufbuild/protobuf";
 import { timestampFromMs } from "@bufbuild/protobuf/wkt";
 import { BytesTransport, ProtocolViolation, RpcError, type RawCaller } from "../src/engine/index.js";
-import { ListKeyspacesRequestSchema, ListKeyspacesResponseSchema, ListedKeyspaceSchema } from "../src/gen/abcp/v2/sync_pb.js";
+import { ListKeyspacesRequestSchema, ListKeyspacesResponseSchema, ListedKeyspaceSchema, type ListKeyspacesRequest } from "../src/gen/abcp/v2/sync_pb.js";
 import { KeyspaceLifecycle } from "../src/gen/abcp/v2/types_pb.js";
 import { encode, unmarshal } from "../src/rules/canon/index.js";
 import { FakeServer, ManualClock } from "../src/fake/index.js";
@@ -47,7 +47,7 @@ describe("spec/09 §9.11 ListKeyspaces over bytes (experimental)", () => {
     expect(got.nextPageToken).toBe("tok");
     expect(raw.sent).toHaveLength(1);
     expect(raw.sent[0]?.method).toBe("ListKeyspaces");
-    const back = unmarshal(ListKeyspacesRequestSchema, raw.sent[0]?.bytes as Uint8Array);
+    const back = unmarshal(ListKeyspacesRequestSchema, raw.sent[0]?.bytes as Uint8Array) as ListKeyspacesRequest;
     expect(back.kind).toBe("doc");
     expect(back.keyspacePattern).toBe("acme/*");
     expect(back.includeArchived).toBe(true);

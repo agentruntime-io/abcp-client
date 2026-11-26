@@ -206,6 +206,7 @@ function spy(t: Transport, calls: Calls, refreshed: TestClient["refreshed"]): Tr
     createUpload: count("createUpload", (r, o) => t.createUpload(r, o)),
     commitBlob: count("commitBlob", (r, o) => t.commitBlob(r, o)),
     getBlob: count("getBlob", (r, o) => t.getBlob(r, o)),
+    listKeyspaces: count("listKeyspaces", (r, o) => t.listKeyspaces(r, o)),
     deleteBlob: count("deleteBlob", (r, o) => t.deleteBlob(r, o)),
     refreshSession: count("refreshSession", async (r, o) => {
       const resp = await t.refreshSession(r, o);
