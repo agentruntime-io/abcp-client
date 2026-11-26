@@ -5,7 +5,7 @@ The ABCP v2 client engine and its local query layer, in TypeScript, for browsers
 The engine keeps a local replica of the keyspaces an app follows, sends the app's changes as actions, folds the records the server
 serves, and tells the app what it shows. The query layer answers live queries over that replica.
 
-**Status: alpha, for testing.** The version is `2.0.0-alpha.5`. The package is **not on npm yet**; `package.json` is marked
+**Status: alpha, for testing.** The version is `2.0.0-alpha.6`. The package is **not on npm yet**; `package.json` is marked
 `"private": true` until that is decided. Licensed under the Apache License 2.0 (see `LICENSE`).
 
 ## Build and test
