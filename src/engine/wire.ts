@@ -31,6 +31,8 @@ import {
   LeavePresenceResponseSchema,
   LoadStateRequestSchema,
   LoadStateResponseSchema,
+  ListKeyspacesRequestSchema,
+  ListKeyspacesResponseSchema,
   MutateRequestSchema,
   MutateResponseSchema,
   PublishPresenceRequestSchema,
@@ -65,6 +67,8 @@ import {
   type LeavePresenceResponse,
   type LoadStateRequest,
   type LoadStateResponse,
+  type ListKeyspacesRequest,
+  type ListKeyspacesResponse,
   type MutateRequest,
   type MutateResponse,
   type PublishPresenceRequest,
@@ -77,7 +81,7 @@ import {
   type UpdateSubscriptionResponse,
 } from "../gen/abcp/v2/sync_pb.js";
 import { CanonError, checkTimestamps, encode, unmarshal } from "../rules/canon/index.js";
-import { checkCounts, pageBound, type DecodeLimits } from "./counts.js";
+import { checkCounts, listKeyspacesPageBound, pageBound, type DecodeLimits } from "./counts.js";
 import { ProtocolViolation } from "./errors.js";
 import type { CallOptions, Transport } from "./transport.js";
 
@@ -177,6 +181,10 @@ export class BytesTransport implements Transport {
   }
   deleteBlob(req: DeleteBlobRequest, o?: CallOptions): Promise<DeleteBlobResponse> {
     return this.unary("DeleteBlob", DeleteBlobRequestSchema, DeleteBlobResponseSchema, req, o);
+  }
+  listKeyspaces(req: ListKeyspacesRequest, o?: CallOptions): Promise<ListKeyspacesResponse> {
+    // spec/09 §9.11 [XKS-6], experimental: `page_size` is an upper bound on the keyspaces of a page (0 is 100, a larger value counts as 1,000)
+    return this.unary("ListKeyspaces", ListKeyspacesRequestSchema, ListKeyspacesResponseSchema, req, o, { "abcp.v2.ListKeyspacesResponse.keyspaces": listKeyspacesPageBound(req.pageSize) });
   }
 
   async *subscribe(req: SubscribeRequest, o?: CallOptions): AsyncIterable<SubscribeResponse> {

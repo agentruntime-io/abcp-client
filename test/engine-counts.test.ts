@@ -12,6 +12,7 @@ import {
   GetMutationResultsResponseSchema,
   LoadStateRequestSchema,
   LoadStateResponseSchema,
+  ListKeyspacesResponseSchema,
   MutateRequestSchema,
   MutateResponseSchema,
   MutationSchema,
@@ -223,6 +224,8 @@ describe("16 [SEC-1]: the counts of a received message are bounded on its octets
       CommitBlobResponseSchema,
       GetBlobResponseSchema,
       DeleteBlobResponseSchema,
+      // 09 §9.11 (experimental): the answer of ListKeyspaces
+      ListKeyspacesResponseSchema,
     ];
     const seen = new Set<string>();
     const missing: string[] = [];

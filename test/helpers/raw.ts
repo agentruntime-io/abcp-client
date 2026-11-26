@@ -29,6 +29,8 @@ import {
   GetMutationResultsResponseSchema,
   LoadStateRequestSchema,
   LoadStateResponseSchema,
+  ListKeyspacesRequestSchema,
+  ListKeyspacesResponseSchema,
   MutateRequestSchema,
   MutateResponseSchema,
   RefreshSessionRequestSchema,
@@ -62,6 +64,7 @@ const UNARY: Record<string, Unary> = {
   CommitBlob: [CommitBlobRequestSchema, CommitBlobResponseSchema, (t, r) => t.commitBlob(r)],
   GetBlob: [GetBlobRequestSchema, GetBlobResponseSchema, (t, r) => t.getBlob(r)],
   DeleteBlob: [DeleteBlobRequestSchema, DeleteBlobResponseSchema, (t, r) => t.deleteBlob(r)],
+  ListKeyspaces: [ListKeyspacesRequestSchema, ListKeyspacesResponseSchema, (t, r) => t.listKeyspaces(r)],
 };
 
 export class FakeRaw implements RawCaller {

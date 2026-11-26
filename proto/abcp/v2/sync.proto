@@ -37,6 +37,10 @@ service SyncService {
   rpc CommitBlob(CommitBlobRequest) returns (CommitBlobResponse);   // likewise for a pending blob (spec/09 [READ-88])
   rpc GetBlob(GetBlobRequest) returns (GetBlobResponse);   // a withheld blob: Unavailable and Retry{BLOB_WITHHELD}, through any keyspace (spec/09 [READ-90]); a mutation that names it is accepted (spec/09 [READ-89])
   rpc DeleteBlob(DeleteBlobRequest) returns (DeleteBlobResponse);   // served on an archived or split keyspace, and on a deleted keyspace that still holds retained data (spec/09 [READ-91]); a withheld blob, through a keyspace that is not frozen: Unavailable and Retry{BLOB_WITHHELD}; an id with no row: NotFound to admin, PermissionDenied to every other caller
+  // Discovery (spec/09 §9.11), EXPERIMENTAL: not part of v2.0, behind the feature x-list-keyspaces.v1, and served only
+  // when ServerInfo.features lists it; otherwise Unimplemented (spec/15 [COMPAT-28]). SERVICE and admin-issuer principals
+  // only; it lists only the keyspaces that the caller may read (spec/09 [XKS-2], [XKS-4]).
+  rpc ListKeyspaces(ListKeyspacesRequest) returns (ListKeyspacesResponse);
 }
 
 // A body over 64 KiB, counted as it inflates, is refused with InvalidArgument (spec/02 [ARC-63]).
@@ -427,3 +431,33 @@ message DeleteBlobRequest {
                                           // data (spec/12 [ADM-72])
 }
 message DeleteBlobResponse {}
+
+// ───────────────────────────── ListKeyspaces (experimental, spec/09 §9.11) ─────────────────────────────
+
+// The filters and pages of spec/09 [XKS-3] to [XKS-6]. A result matches every filter given.
+message ListKeyspacesRequest {
+  string kind = 1;                              // a keyspace kind (spec/03 Table 3.1); empty = every kind
+  string keyspace_pattern = 2;                  // an id pattern (spec/03 §3.7); empty = "**"; invalid: InvalidArgument and
+                                                // Reject{INVALID_ENVELOPE}
+  google.protobuf.Timestamp created_after = 3;  // exclusive; unset = from the oldest
+  bool include_archived = 4;                    // also list ARCHIVED keyspaces and split sources (SPLIT); deleted ones never
+  string page_token = 5;                        // a next_page_token: it fixes the filters and the caller's subject; a request
+                                                // whose filters or caller differ fails with InvalidArgument and
+                                                // Reject{INVALID_ENVELOPE}; past its validity, FailedPrecondition (spec/09 [XKS-6])
+  uint32 page_size = 6;                         // 0 = 100; a larger value counts as 1,000; a page may hold fewer, and also stops
+                                                // before 16 MiB (spec/09 [XKS-6])
+}
+
+// One listed keyspace: its id, kind, creation time and lifecycle, and nothing else (spec/09 [XKS-9]).
+message ListedKeyspace {
+  string keyspace_id = 1;
+  string kind = 2;
+  google.protobuf.Timestamp created_at = 3;     // the server time of its creation, or of the split that made it (spec/12 [ADM-41])
+  KeyspaceLifecycle lifecycle = 4;              // ACTIVE; ARCHIVED or SPLIT only with include_archived
+}
+
+message ListKeyspacesResponse {
+  repeated ListedKeyspace keyspaces = 1;        // ordered by created_at (seconds, then nanos), then keyspace_id in byte order
+  string next_page_token = 2;                   // empty: the listing is complete; set: more may follow, even after a short or
+                                                // empty page (spec/09 [XKS-6])
+}

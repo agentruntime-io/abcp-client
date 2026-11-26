@@ -33,6 +33,8 @@ import type {
   LeavePresenceResponse,
   LoadStateRequest,
   LoadStateResponse,
+  ListKeyspacesRequest,
+  ListKeyspacesResponse,
   MutateRequest,
   MutateResponse,
   PublishPresenceRequest,
@@ -80,4 +82,17 @@ export interface Transport {
   commitBlob(req: CommitBlobRequest, o?: CallOptions): Promise<CommitBlobResponse>;
   getBlob(req: GetBlobRequest, o?: CallOptions): Promise<GetBlobResponse>;
   deleteBlob(req: DeleteBlobRequest, o?: CallOptions): Promise<DeleteBlobResponse>;
+  // -- discovery (spec/09 §9.11) --
+  /**
+   * Lists the keyspaces that the caller may read. EXPERIMENTAL: spec/09 §9.11, not part of v2.0. Call it only when `ServerInfo.features`
+   * lists `x-list-keyspaces.v1` (15 [COMPAT-28]); otherwise the server answers Unimplemented. The engine does not call it; service code does.
+   *
+   * To follow new keyspaces (spec/09 [XKS-8]; creation order is not visibility order):
+   * - tail with `createdAfter` = the newest `createdAt` seen minus 60 s, so that a keyspace that committed late, with an earlier `createdAt`, is still found;
+   * - dedupe by `keyspaceId`, because that overlap lists the same keyspaces again;
+   * - treat the listing as advisory: it may lag, and it shows only what the caller may read.
+   * When the server refuses a page token (another node's, or a forged one: InvalidArgument; past its validity: FailedPrecondition),
+   * start again from your own `createdAfter` cursor, without a token.
+   */
+  listKeyspaces(req: ListKeyspacesRequest, o?: CallOptions): Promise<ListKeyspacesResponse>;
 }
