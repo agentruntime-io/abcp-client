@@ -46,6 +46,19 @@ After `npm run build`, apps import from `dist/`:
 | `dist/platform/` | storage for browsers (IndexedDB) and Node (files), tab coordination |
 | `dist/fake/index.js` | an in-process fake server, for tests of an app |
 
+## `listKeyspaces` (experimental)
+
+The transport has `listKeyspaces(req, opts)` for the server's experimental `SyncService.ListKeyspaces` (spec 09 §9.11, not part of
+ABCP v2.0; abcp-server `v2.0.0-alpha.6`, behind its `x-list-keyspaces.v1` switch).
+
+- It lists the keyspaces of the app that the caller may read, in creation order.
+- The caller is a SERVICE principal or a principal of the app's admin issuer; a USER or DEVICE token gets PermissionDenied.
+- A server without the feature, or with its switch off, answers `Unimplemented`, and so does the fake server. Check that
+  `ServerInfo.features` lists `x-list-keyspaces.v1` before calling it.
+- The response is decoded strictly: a page with more keyspaces than the request's `page_size` allows is refused ([XKS-6]).
+- The engine does not call it; service code does. To follow new keyspaces, list again with `createdAfter` set to the newest
+  `createdAt` seen minus 60 s, and dedupe by `keyspaceId` (spec 09 [XKS-8]).
+
 ## The wire code
 
 `src/gen` is generated from `proto/abcp` (the ABCP v2 wire protos) with `buf` and `protoc-gen-es`. To regenerate it, run
