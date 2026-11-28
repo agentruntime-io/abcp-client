@@ -1,11 +1,15 @@
 {
   "name": "@agentruntime/abcp-client",
-  "version": "2.0.0-alpha.6",
-  "private": true,
+  "version": "2.0.0-alpha.7",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/agentruntime-io/abcp-client"
+    "url": "git+https://github.com/agentruntime-io/abcp-client.git"
+  },
+  "homepage": "https://github.com/agentruntime-io/abcp-client#readme",
+  "publishConfig": {
+    "access": "public",
+    "tag": "alpha"
   },
   "engines": {
     "node": ">=22"
@@ -19,8 +23,24 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./engine": "./dist/engine/index.js",
+    "./net": "./dist/net/index.js",
+    "./net/node": "./dist/net/node.js",
+    "./net/web": "./dist/net/web.js",
+    "./platform": "./dist/platform/index.js",
+    "./platform/node": "./dist/platform/node.js",
+    "./platform/web": "./dist/platform/web.js",
+    "./query": "./dist/query/index.js",
+    "./fake": "./dist/fake/index.js",
+    "./dist/*": "./dist/*",
+    "./package.json": "./package.json"
+  },
   "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run clean && npm run build && npm run typecheck && npm test",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p test/tsconfig.json",
     "test": "vitest run",
     "gen": "buf generate"
